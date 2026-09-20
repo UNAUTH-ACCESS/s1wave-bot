@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S1Wave — Bot Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:      #080C0B;
+    --surface: #0E1512;
+    --border:  #1A2620;
+    --accent:  #00FF87;
+    --accent2: #00C896;
+    --warn:    #FFB800;
+    --danger:  #FF4444;
+    --muted:   #3D5449;
+    --text:    #C8DDD5;
+    --bright:  #E8F5EE;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:var(--bg); color:var(--text);
+    font-family:'Syne',sans-serif; min-height:100vh;
+  }
+  body::before {
+    content:''; position:fixed; inset:0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size:40px 40px; opacity:0.4;
+    pointer-events:none; z-index:0;
+  }
+  .wrap { max-width:1400px; margin:0 auto; padding:24px; position:relative; z-index:1; }
+
+  header {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-bottom:28px; padding-bottom:18px; border-bottom:1px solid var(--border);
+  }
+  .logo { display:flex; align-items:center; gap:12px; }
+  .logo-mark {
+    width:36px; height:36px; background:var(--accent); border-radius:8px;
+    display:flex; align-items:center; justify-content:center;
+    font-family:'Space Mono',monospace; font-size:14px; font-weight:700; color:var(--bg);
+  }
+  .logo-name { font-size:20px; font-weight:800; color:var(--bright); letter-spacing:-0.5px; }
+  .logo-sub  { font-family:'Space Mono',monospace; font-size:9px; color:var(--muted); letter-spacing:2px; }
+  .hdr-right { display:flex; align-items:center; gap:14px; }
+  .ts { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); }
+  .btn {
+    background:var(--surface); border:1px solid var(--border); color:var(--text);
+    padding:7px 14px; border-radius:6px; font-family:'Space Mono',monospace;
+    font-size:10px; cursor:pointer; transition:all 0.2s; letter-spacing:1px;
+  }
+  .btn:hover { border-color:var(--accent); color:var(--accent); }
+
+  /* grid */
+  .row { display:grid; gap:14px; margin-bottom:14px; }
+  .r4 { grid-template-columns:repeat(4,1fr); }
+  .r21{ grid-template-columns:1fr 2fr; }
+  .r1 { grid-template-columns:1fr; }
+
+  /* card */
+  .card {
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    padding:20px; position:relative; overflow:hidden;
+    animation:fi 0.4s ease forwards; opacity:0;
+  }
+  .card::before {
+    content:''; position:absolute; top:0; left:0; right:0; height:1px;
+    background:linear-gradient(90deg,transparent,var(--accent),transparent); opacity:0.25;
+  }
+  @keyframes fi { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
+  .card:nth-child(1){animation-delay:.05s} .card:nth-child(2){animation-delay:.1s}
+  .card:nth-child(3){animation-delay:.15s} .card:nth-child(4){animation-delay:.2s}
+
+  .clabel {
+    font-family:'Space Mono',monospace; font-size:9px; letter-spacing:2px;
+    text-transform:uppercase; color:var(--muted); margin-bottom:10px;
+  }
+  .ctitle {
+    font-size:13px; font-weight:600; color:var(--text); margin-bottom:14px;
+    display:flex; align-items:center; gap:8px;
+  }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); }
+
+  /* badge */
+  .badge {
+    display:inline-flex; align-items:center; gap:6px;
+    padding:3px 10px; border-radius:20px;
+    font-family:'Space Mono',monospace; font-size:9px; font-weight:700;
+    letter-spacing:1px; margin-bottom:14px;
+  }
+  .badge.running { background:rgba(0,255,135,.1); border:1px solid rgba(0,255,135,.3); color:var(--accent); }
+  .badge.paused  { background:rgba(255,184,0,.1);  border:1px solid rgba(255,184,0,.3);  color:var(--warn); }
+  .badge.error   { background:rgba(255,68,68,.1);  border:1px solid rgba(255,68,68,.3);  color:var(--danger); }
+  .pulse { width:6px; height:6px; border-radius:50%; background:currentColor; animation:pu 2s infinite; }
+  @keyframes pu { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* stat row */
+  .sr {
+    display:flex; justify-content:space-between; align-items:center;
+    padding:5px 0; border-bottom:1px solid var(--border);
+  }
+  .sr:last-child { border-bottom:none; }
+  .sl { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); }
+  .sv { font-family:'Space Mono',monospace; font-size:11px; color:var(--bright); font-weight:700; }
+  .sv.g { color:var(--accent); } .sv.y { color:var(--warn); } .sv.r { color:var(--danger); }
+
+  /* big number */
+  .bn { font-size:34px; font-weight:800; color:var(--bright); line-height:1; letter-spacing:-1px; }
+  .bn.g { color:var(--accent); } .bn.r { color:var(--danger); } .bn.y { color:var(--warn); }
+  .bu { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); margin-top:4px; margin-bottom:12px; }
+
+  /* perf grid */
+  .pg { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .pi { background:rgba(0,255,135,.03); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .pil { font-family:'Space Mono',monospace; font-size:9px; color:var(--muted); letter-spacing:1px; margin-bottom:4px; }
+  .piv { font-size:18px; font-weight:800; color:var(--bright); letter-spacing:-0.3px; }
+  .piv.g{color:var(--accent)} .piv.r{color:var(--danger)} .piv.y{color:var(--warn)}
+
+  /* filter chips */
+  .chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:10px; }
+  .chip {
+    background:rgba(0,255,135,.06); border:1px solid rgba(0,255,135,.2);
+    color:var(--accent2); padding:2px 7px; border-radius:4px;
+    font-family:'Space Mono',monospace; font-size:9px;
+  }
+
+  /* activity */
+  .feed { display:flex; flex-direction:column; gap:5px; max-height:300px; overflow-y:auto; }
+  .feed::-webkit-scrollbar { width:3px; }
+  .feed::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+  .sig {
+    display:flex; align-items:center; gap:8px; padding:7px 10px;
+    border-radius:6px; background:rgba(255,255,255,.02);
+    border:1px solid var(--border); font-family:'Space Mono',monospace; font-size:10px;
+  }
+  .stype {
+    padding:2px 5px; border-radius:3px; font-size:8px; font-weight:700;
+    letter-spacing:1px; white-space:nowrap;
+  }
+  .stype.e { background:rgba(0,255,135,.15); color:var(--accent); }
+  .stype.s { background:rgba(255,68,68,.1);  color:var(--danger); }
+  .smint { color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sdim  { color:var(--muted); font-size:9px; }
+
+  /* CB */
+  .cb {
+    display:flex; align-items:center; gap:8px; padding:8px 12px;
+    border-radius:8px; margin-top:10px;
+    font-family:'Space Mono',monospace; font-size:10px;
+  }
+  .cb.ok     { background:rgba(0,255,135,.05); border:1px solid rgba(0,255,135,.2); color:var(--accent); }
+  .cb.paused { background:rgba(255,184,0,.05);  border:1px solid rgba(255,184,0,.2);  color:var(--warn); }
+
+  /* open position */
+  .op {
+    background:rgba(0,255,135,.04); border:1px solid rgba(0,255,135,.2);
+    border-radius:8px; padding:12px; margin-top:10px;
+  }
+  .optitle { font-size:10px; font-family:'Space Mono',monospace; color:var(--accent); margin-bottom:8px; }
+
+  /* trades table */
+  .tbl { width:100%; border-collapse:collapse; font-family:'Space Mono',monospace; font-size:10px; }
+  .tbl th {
+    text-align:left; padding:8px 10px; color:var(--muted);
+    font-size:9px; letter-spacing:1px; text-transform:uppercase;
+    border-bottom:1px solid var(--border); background:rgba(0,0,0,.2);
+  }
+  .tbl td { padding:9px 10px; border-bottom:1px solid var(--border); color:var(--text); }
+  .tbl tr:last-child td { border-bottom:none; }
+  .tbl tr:hover td { background:rgba(0,255,135,.02); }
+  .tp { color:var(--accent); font-weight:700; }
+  .tn { color:var(--danger); font-weight:700; }
+  .etag {
+    padding:2px 5px; border-radius:3px; font-size:8px;
+    background:rgba(255,255,255,.05); color:var(--muted);
+  }
+  .wb { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:3px; }
+  .wb.w{background:var(--accent)} .wb.l{background:var(--danger)}
+
+  /* loading / error */
+  .ld {
+    display:flex; align-items:center; justify-content:center;
+    padding:32px; color:var(--muted); font-family:'Space Mono',monospace;
+    font-size:10px; gap:8px;
+  }
+  .sp {
+    width:14px; height:14px; border:2px solid var(--border);
+    border-top-color:var(--accent); border-radius:50%;
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin { to{transform:rotate(360deg)} }
+  .err {
+    color:var(--danger); font-family:'Space Mono',monospace; font-size:10px;
+    padding:10px; background:rgba(255,68,68,.05);
+    border:1px solid rgba(255,68,68,.2); border-radius:6px; margin-top:6px;
+  }
+
+  @media(max-width:900px){
+    .r4{grid-template-columns:repeat(2,1fr)}
+    .r21{grid-template-columns:1fr}
+  }
+  @media(max-width:500px){
+    .r4{grid-template-columns:1fr}
+    .wrap{padding:12px} .bn{font-size:26px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">
+      <div class="logo-mark">S1</div>
+      <div>
+        <div class="logo-name">S1Wave</div>
+        <div class="logo-sub">Solana Trading Bot</div>
+      </div>
+    </div>
+    <div class="hdr-right">
+      <span class="ts" id="ts">—</span>
+      <button class="btn" onclick="loadAll()">↻ REFRESH</button>
+    </div>
+  </header>
+
+  <!-- Row 1: 4 status cards -->
+  <div class="row r4" id="r1">
+    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 2: Performance + Activity -->
+  <div class="row r21">
+    <div class="card" id="perf"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="act"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 3: Trades table -->
+  <div class="row r1">
+    <div class="card" id="trades"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+</div>
+<script>
+// ── CONFIG ─────────────────────────────────────────────────────────
+// Change this to your server IP if accessing remotely
+// e.g. const BASE = 'http://139.162.181.164:8000'
+const BASE = '';
+
+const get = path => fetch(BASE + path).then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
+
+const ago = s => {
+  if (!s) return '—';
+  const d = Math.floor((Date.now() - new Date(s)) / 1000);
+  if (d < 60) return d + 's ago';
+  if (d < 3600) return Math.floor(d/60) + 'm ago';
+  if (d < 86400) return Math.floor(d/3600) + 'h ago';
+  return Math.floor(d/86400) + 'd ago';
+};
+const short = m => m ? m.slice(0,6)+'…'+m.slice(-4) : '—';
+const pc = (v, pos='tp', neg='tn') => parseFloat(v) >= 0 ? pos : neg;
+
+// ── ROW 1: STATUS ──────────────────────────────────────────────────
+async function loadStatus() {
+  const r1 = document.getElementById('r1');
+  try {
+    const [h, b] = await Promise.all([get('/health'), get('/balance')]);
+    const mode = false; // false = LIVE, true = PAPER
+    const cb = b.circuit_breaker;
+    const sc = cb.is_paused ? 'paused' : 'running';
+    const modeStr = mode ? "PAPER" : "LIVE";
+
+    r1.innerHTML = `
+      <div class="card">
+        <div class="clabel">Bot Status</div>
+        <div class="badge ${sc}"><span class="pulse"></span>${sc.toUpperCase()}</div>
+        <div class="sr"><span class="sl">VERSION</span><span class="sv">${h.version}</span></div>
+        <div class="sr"><span class="sl">UPTIME</span><span class="sv g">${h.uptime}</span></div>
+        <div class="sr"><span class="sl">TIMESTAMP</span><span class="sv">${ago(h.timestamp)}</span></div>
+      </div>
+
+      <div class="card">
+        <div class="clabel">Balance</div>
+        <div class="bn g">${parseFloat(b.available_balance).toFixed(4)}</div>
+        <div class="bu">SOL AVAILABLE</div>
+        <div class="sr"><span class="sl">TOTAL PNL</span>
+          <span class="sv ${pc(b.total_pnl_usd)}">${parseFloat(b.total_pnl_usd)>=0?'+':''}$${parseFloat(b.total_pnl_usd).toFixed(2)}</span></div>
+        <div class="sr"><span class="sl">RETURN</span>
+          <span class="sv ${pc(b.total_return_pct)}">${parseFloat(b.total_return_pct)>=0?'+':''}${parseFloat(b.total_return_pct).toFixed(2)}%</span></div>
+        <div class="sr"><span class="sl">OPEN POSITIONS</span><span class="sv">${b.open_positions}</span></div>
+      </div>
+
+      <div class="card">
+        <div class="clabel">Today</div>
+        <div class="bn ${pc(b.daily.pnl_usd)}">${parseFloat(b.daily.pnl_usd)>=0?'+':''}$${parseFloat(b.daily.pnl_usd).toFixed(2)}</div>
+        <div class="bu">DAILY PNL</div>
+        <div class="sr"><span class="sl">DATE</span><span class="sv">${b.daily.date_utc}</span></div>
+        <div class="sr"><span class="sl">HALTED</span>
+          <span class="sv ${b.daily.is_halted?'r':'g'}">${b.daily.is_halted?'YES':'NO'}</span></div>
+      </div>
+
+      <div class="card">
+        <div class="clabel">Circuit Breaker</div>
+        <div class="bn ${cb.is_paused?'y':'g'}">${cb.is_paused?'PAUSED':'ACTIVE'}</div>
+        <div class="bu">MODE: ${modeStr}</div>
+        <div class="sr"><span class="sl">CONSEC. LOSSES</span>
+          <span class="sv ${cb.consecutive_losses>=4?'r':cb.consecutive_losses>=2?'y':'g'}">${cb.consecutive_losses}/6</span></div>
+        ${cb.resume_at?`<div class="sr"><span class="sl">RESUMES</span><span class="sv y">${ago(cb.resume_at)}</span></div>`:''}
+        <div class="sr"><span class="sl">CLOSED TRADES</span><span class="sv">${b.closed_trades}</span></div>
+      </div>
+    `;
+  } catch(e) {
+    r1.innerHTML = `<div class="card"><div class="err">Failed to load: ${e.message}<br>Is the bot running on port 8000?</div></div>`;
+  }
+}
+
+// ── PERFORMANCE ────────────────────────────────────────────────────
+async function loadPerf() {
+  const card = document.getElementById('perf');
+  try {
+    const s = await get('/stats');
+    if (s.message) {
+      card.innerHTML = `<div class="ctitle"><span class="dot"></span>Trade Performance</div>
+        <div style="color:var(--muted);font-family:'Space Mono',monospace;font-size:11px;padding:20px;text-align:center;">No trades yet</div>`;
+      return;
+    }
+
+    const evApprox = s.total_pnl_usd / s.total_trades;
+    const wl = Math.abs(s.avg_pnl_usd); // approximation
+
+    const filters = [
+      'bp ≥ 0.80', 'wash ≥ 6', 'liq ≥ $20k',
+      'liq < $35k', '1m == 0%', '5m < 80%'
+    ].map(f => `<span class="chip">${f}</span>`).join('');
+
+    card.innerHTML = `
+      <div class="ctitle"><span class="dot"></span>Trade Performance</div>
+      <div class="pg">
+        <div class="pi">
+          <div class="pil">WIN RATE</div>
+          <div class="piv ${s.win_rate_pct>=40?'g':s.win_rate_pct>=30?'y':'r'}">${s.win_rate_pct}%</div>
+        </div>
+        <div class="pi">
+          <div class="pil">NET PNL</div>
+          <div class="piv ${pc(s.total_pnl_usd)}">${s.total_pnl_usd>=0?'+':''}$${s.total_pnl_usd.toFixed(2)}</div>
+        </div>
+        <div class="pi">
+          <div class="pil">BEST TRADE</div>
+          <div class="piv g">+$${s.best_trade_usd.toFixed(2)}</div>
+        </div>
+        <div class="pi">
+          <div class="pil">WORST TRADE</div>
+          <div class="piv r">$${s.worst_trade_usd.toFixed(2)}</div>
+        </div>
+      </div>
+      <div style="margin-top:14px;">
+        <div class="sr"><span class="sl">TOTAL TRADES</span><span class="sv">${s.total_trades}</span></div>
+        <div class="sr"><span class="sl">WINS / LOSSES</span>
+          <span class="sv"><span style="color:var(--accent)">${s.wins}W</span> / <span style="color:var(--danger)">${s.losses}L</span></span></div>
+        <div class="sr"><span class="sl">AVG PNL/TRADE</span>
+          <span class="sv ${pc(s.avg_pnl_usd)}">${s.avg_pnl_usd>=0?'+':''}$${s.avg_pnl_usd.toFixed(4)}</span></div>
+        <div class="sr"><span class="sl">AVG HOLD</span><span class="sv">${s.avg_hold_human}</span></div>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="clabel" style="margin-bottom:6px;">ACTIVE FILTERS V2</div>
+        <div class="chips">${filters}</div>
+      </div>
+    `;
+  } catch(e) {
+    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Trade Performance</div><div class="err">${e.message}</div>`;
+  }
+}
+
+// ── ACTIVITY ───────────────────────────────────────────────────────
+async function loadActivity() {
+  const card = document.getElementById('act');
+  try {
+    const [open, bal] = await Promise.all([get('/trades/open'), get('/balance')]);
+    const cb = bal.circuit_breaker;
+
+    // Recent closed trades as signal proxy
+    const hist = await get('/trades/history?limit=10');
+    const signals = hist.trades.map(t => {
+      const win = parseFloat(t.pnl_usd) > 0;
+      return `
+        <div class="sig">
+          <span class="stype ${win?'e':'s'}">${win?'WIN':'LOSS'}</span>
+          <span class="smint">${short(t.mint)}</span>
+          <span class="sdim">${t.hold_human}</span>
+          <span class="sdim ${win?'tp':'tn'}">${parseFloat(t.pnl_pct)>=0?'+':''}${parseFloat(t.pnl_pct).toFixed(2)}%</span>
+          <span class="sdim">${ago(t.exit_time)}</span>
+        </div>`;
+    }).join('') || `<div style="color:var(--muted);font-family:'Space Mono',monospace;font-size:10px;padding:20px;text-align:center;">No recent trades</div>`;
+
+    const openHTML = open.length ? open.map(p => `
+      <div class="op">
+        <div class="optitle">⚡ OPEN POSITION</div>
+        <div class="sr"><span class="sl">TOKEN</span><span class="sv">${short(p.mint)}</span></div>
+        <div class="sr"><span class="sl">ENTRY</span><span class="sv">$${parseFloat(p.entry_price).toExponential(3)}</span></div>
+        <div class="sr"><span class="sl">HOLD</span><span class="sv">${p.hold_human}</span></div>
+        <div class="sr"><span class="sl">UNREALISED</span>
+          <span class="sv ${p.unrealised_pnl_pct>=0?'g':'r'}">${p.unrealised_pnl_pct>=0?'+':''}${(p.unrealised_pnl_pct||0).toFixed(2)}%</span></div>
+      </div>`).join('') : '';
+
+    card.innerHTML = `
+      <div class="ctitle"><span class="dot"></span>Live Activity</div>
+      <div class="clabel" style="margin-bottom:6px;">RECENT TRADES</div>
+      <div class="feed">${signals}</div>
+      ${openHTML}
+      <div class="cb ${cb.is_paused?'paused':'ok'}">
+        ${cb.is_paused
+          ? `⚠ CB PAUSED — ${cb.consecutive_losses}/6 losses — resumes ${ago(cb.resume_at)}`
+          : `✓ CB ACTIVE — ${cb.consecutive_losses}/6 consecutive losses`}
+      </div>
+    `;
+  } catch(e) {
+    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Live Activity</div><div class="err">${e.message}</div>`;
+  }
+}
+
+// ── TRADES TABLE ───────────────────────────────────────────────────
+async function loadTrades() {
+  const card = document.getElementById('trades');
+  try {
+    const d = await get('/trades/history?limit=20');
+    const rows = d.trades.map(t => {
+      const win = parseFloat(t.pnl_usd) > 0;
+      return `<tr>
+        <td><span class="wb ${win?'w':'l'}"></span>${short(t.mint)}</td>
+        <td>${t.symbol||'—'}</td>
+        <td>${t.entry_time ? new Date(t.entry_time).toLocaleString() : '—'}</td>
+        <td>$${parseFloat(t.entry_price).toExponential(3)}</td>
+        <td class="${win?'tp':'tn'}">${parseFloat(t.pnl_usd)>=0?'+':''}$${parseFloat(t.pnl_usd).toFixed(4)}</td>
+        <td class="${win?'tp':'tn'}">${parseFloat(t.pnl_pct)>=0?'+':''}${parseFloat(t.pnl_pct).toFixed(2)}%</td>
+        <td>${t.hold_human}</td>
+        <td><span class="etag">${t.exit_reason||'—'}</span></td>
+      </tr>`;
+    }).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">No trades yet</td></tr>`;
+
+    card.innerHTML = `
+      <div class="ctitle">
+        <span class="dot"></span>Recent Trades
+        <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);font-weight:400;margin-left:auto;">${d.total} total</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="tbl">
+          <thead><tr>
+            <th>TOKEN</th><th>SYMBOL</th><th>ENTRY TIME</th>
+            <th>ENTRY PRICE</th><th>PNL USD</th><th>PNL %</th>
+            <th>HOLD</th><th>EXIT</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  } catch(e) {
+    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Recent Trades</div><div class="err">${e.message}</div>`;
+  }
+}
+
+// ── LOAD ALL ───────────────────────────────────────────────────────
+async function loadAll() {
+  document.getElementById('ts').textContent = 'Refreshing…';
+  await Promise.all([loadStatus(), loadPerf(), loadActivity(), loadTrades()]);
+  document.getElementById('ts').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+loadAll();
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>
