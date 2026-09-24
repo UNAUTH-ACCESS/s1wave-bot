@@ -133,6 +133,7 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.execution import ExecutionEngine
+from engine.sell_coordination import finish_sell, try_start_sell
 from engine.live_equity import (
     compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
 )
@@ -224,27 +225,26 @@ class ConfluenceLiveWorker:
         self._pending_tick: dict = {}
         self._equity_cache: tuple[float, Decimal | None] | None = None
         # Edge-trigger state for halt notifications — None means "not observed
-        # yet"; a transition FROM None still notifies once at startup so the
-        # in-app feed always reflects current reality, not just changes since
-        # boot. _safe_to_enter() re-checks these every ~1s and must NOT notify
+        # yet". _safe_to_enter() re-checks these every ~1s and must NOT notify
         # on every check, only when the value actually changes.
+        #
+        # Real bug found 2026-09-24, from a code-reading audit (not a live
+        # incident this time): because these start as None, and `bool != None`
+        # is always True, the very FIRST _refresh_halt_notifications() call
+        # after ANY restart looked like a transition even when nothing
+        # changed, firing "Wallet funded"/"Daily loss limit no longer in
+        # effect" as if something had just recovered, purely because the
+        # process restarted. With how many restarts happen during active
+        # development, this had been spamming misleading recovery
+        # notifications into the feed all session. Fixed via
+        # self._halt_state_initialized below: the "recovered" notifications
+        # (the announcement that something is fine) are suppressed on the
+        # first check after a restart — only a genuinely bad state (halted)
+        # still announces immediately on first check, since that IS worth
+        # knowing right away; "everything is normal" is not news just
+        # because the process restarted.
         self._last_permanently_halted: bool | None = None
         self._last_daily_halted: bool | None = None
-        # Real bug found 2026-09-24, from a code-reading audit (not a live
-        # incident this time): _last_permanently_halted/_last_daily_halted
-        # both start as None, and bool != None is always True — so the
-        # very FIRST _refresh_halt_notifications() call after ANY restart
-        # looked like a transition even when nothing changed, firing
-        # "Wallet funded"/"Daily loss limit no longer in effect" as if
-        # something had just recovered, purely because the process
-        # restarted. With how many restarts happen during active
-        # development, this had been spamming misleading recovery
-        # notifications into the feed all session. Fixed: the "recovered"
-        # notifications (the announcement that something is fine) are
-        # suppressed on the first check after a restart — only a genuinely
-        # bad state (halted) still announces immediately on first check,
-        # since that IS worth knowing right away; "everything is normal"
-        # is not news just because the process restarted.
         self._halt_state_initialized = False
         # A stuck-exit (execution.py's sell() already exhausts all retries
         # internally before ever returning failure, so every result.success
@@ -488,9 +488,12 @@ class ConfluenceLiveWorker:
     async def _compute_position_usd(self) -> Decimal:
         """
         Exposure-percentage sizing against LIVE wallet equity (2026-09-24) —
-        see engine/live_equity.py's compute_position_usd() for the formula,
-        unchanged since 2026-09-23 (10% exposure / 3 slots = ~3.33% of
-        equity per trade, capped at CONFLUENCE_LIVE_MAX_POSITION_USD).
+        see engine/live_equity.py's compute_position_usd() for the actual
+        formula (equity * CONFLUENCE_LIVE_EXPOSURE_PCT / CONFLUENCE_LIVE_MAX_CONCURRENT,
+        capped at CONFLUENCE_LIVE_MAX_POSITION_USD). Deliberately not
+        restating the current percentages here — they've already changed
+        twice today (config/settings.py is the source of truth); read the
+        settings file directly rather than trusting a number in this comment.
         Returns 0 if equity is currently unknown (RPC hiccup) rather than
         raising — _maybe_enter() already treats position_usd <= 0 as
         "nothing to do this cycle".
@@ -791,11 +794,23 @@ class ConfluenceLiveWorker:
                                     "token amount. MANUAL INTERVENTION NEEDED.", trade_id=trade["id"])
             return
 
-        log.info("confluence_live.exit_attempted", trade_id=str(trade["id"]), reason=reason)
-        result = await self._execution.sell(
-            trade["mint"], Decimal(str(trade["entry_token_lamports"])),
-            trade_id=str(trade["id"]), symbol=trade.get("symbol"),
-        )
+        # See engine/sell_coordination.py — a manual dashboard close can be
+        # mid-flight for this exact trade right now. Skip this cycle's sell
+        # entirely rather than racing it; the next cycle (~1s later) will
+        # either see the position already closed (manual close won) or
+        # retry normally (manual close failed/wasn't for this trade).
+        trade_id_str = str(trade["id"])
+        if not try_start_sell(trade_id_str):
+            log.info("confluence_live.exit_skipped_concurrent_sell", trade_id=trade_id_str)
+            return
+        try:
+            log.info("confluence_live.exit_attempted", trade_id=trade_id_str, reason=reason)
+            result = await self._execution.sell(
+                trade["mint"], Decimal(str(trade["entry_token_lamports"])),
+                trade_id=trade_id_str, symbol=trade.get("symbol"),
+            )
+        finally:
+            finish_sell(trade_id_str)
 
         if not result.success:
             log.error("confluence_live.exit_failed", trade_id=str(trade["id"]),

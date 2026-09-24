@@ -17,9 +17,18 @@ manual close is recorded identically to an automated one, just with
 exit_reason='MANUAL_CLOSE' and no dependency on the worker's own
 in-memory state — this creates its own ExecutionEngine, safe to do
 alongside the worker's (a wallet keypair + RPC client, no shared
-mutable state), and the two can never double-process the same trade
-since both check `status == 'open'` immediately before acting and this
-one holds that check right up to the DB write.
+mutable state).
+
+CORRECTION, 2026-09-24: this docstring used to claim the two "can never
+double-process the same trade since both check status == 'open' ...
+right up to the DB write" — that protects the DATABASE ROW (only one
+writer's status update ever lands), but it does NOT stop both paths from
+submitting a REAL on-chain sell swap at the same time, which is a much
+worse problem: found live the same day when the worker's own automatic
+exit loop and a manual dashboard close both tried to sell the same
+position within the same second. See engine/sell_coordination.py, which
+this function now uses to make sure only one real sell is ever in flight
+for a given trade at a time.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.execution import ExecutionEngine
+from engine.sell_coordination import finish_sell, try_start_sell
 from models.orm import ConfluenceLiveTrade, ConfluenceNotification, Token
 
 log = get_logger(__name__)
@@ -87,27 +97,48 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         entry_token_lamports = trade.entry_token_lamports
         position_usd = trade.position_usd
 
-    engine = ExecutionEngine(
-        paper_override=False,
-        wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
-        rpc_url_override=settings.HELIUS_RPC_URL,
-    )
+    # See engine/sell_coordination.py — confluence_live_worker.py's own
+    # ~1s automatic exit loop can be mid-sell for this exact trade right
+    # now (e.g. it just independently tripped TIME_EXIT/HARD_FLOOR). Real
+    # incident 2026-09-24: without this guard, both paths submitted a real
+    # swap for the same token balance; whichever landed second was
+    # rejected on-chain (custom program error 0x1788/0x1789) and reported
+    # a scary SELL_FAILED_CRITICAL to the dashboard for a position that,
+    # a moment later, the worker's own loop had already closed out fine.
+    canonical_id = str(trade_uuid)
+    if not try_start_sell(canonical_id):
+        return ManualCloseResult(
+            success=False, symbol=symbol,
+            error="The bot's own exit logic is already closing this position right now "
+                  "(likely tripped its own stop/target at the same moment) — check back "
+                  "in a few seconds, it's very likely already closed.",
+        )
 
-    # Read decimals BEFORE selling (the balance still exists) so exit_price
-    # can be computed in real USD-per-whole-token terms afterward — added
-    # 2026-09-24 after finding this method's exit_price was silently using
-    # execution.py's known-wrong-unit sell-side actual_price (SOL-lamports
-    # per raw-token-unit, documented there as "informational only... fix
-    # before anything starts relying on it"). Nothing financial ever read
-    # this field (pnl_usd is computed straight from real on-chain SOL
-    # received, unaffected either way), but a manually-closed trade's
-    # recorded exit_price was showing a nonsense multiple of entry_price
-    # (a real one: $0.0000178 exit vs $0.0000021 entry on a trade that
-    # actually closed near breakeven) — confirmed on Robinhood and FOMOCAT.
-    balance_before_sell = await engine.get_token_balance_raw(mint)
+    try:
+        engine = ExecutionEngine(
+            paper_override=False,
+            wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
+            rpc_url_override=settings.HELIUS_RPC_URL,
+        )
 
-    log.info("manual_actions.close_attempted", trade_id=trade_id, symbol=symbol, mint=mint)
-    result = await engine.sell(mint, Decimal(str(entry_token_lamports)), trade_id=trade_id, symbol=symbol)
+        # Read decimals BEFORE selling (the balance still exists) so exit_price
+        # can be computed in real USD-per-whole-token terms afterward — added
+        # 2026-09-24 after finding this method's exit_price was silently using
+        # execution.py's known-wrong-unit sell-side actual_price (SOL-lamports
+        # per raw-token-unit, documented there as "informational only... fix
+        # before anything starts relying on it"). Nothing financial ever read
+        # this field (pnl_usd is computed straight from real on-chain SOL
+        # received, unaffected either way), but a manually-closed trade's
+        # recorded exit_price was showing a nonsense multiple of entry_price
+        # (a real one: $0.0000178 exit vs $0.0000021 entry on a trade that
+        # actually closed near breakeven) — confirmed on Robinhood and FOMOCAT.
+        balance_before_sell = await engine.get_token_balance_raw(mint)
+
+        log.info("manual_actions.close_attempted", trade_id=trade_id, symbol=symbol, mint=mint)
+        result = await engine.sell(mint, Decimal(str(entry_token_lamports)), trade_id=trade_id, symbol=symbol)
+    finally:
+        finish_sell(canonical_id)
+
     if not result.success:
         log.error("manual_actions.close_failed", trade_id=trade_id, symbol=symbol,
                   error_type=result.error_type, error_detail=result.error_detail)

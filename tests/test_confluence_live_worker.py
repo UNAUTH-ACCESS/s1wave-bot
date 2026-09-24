@@ -1054,6 +1054,98 @@ class TestUnsellablePositions:
         assert row.pnl_usd == Decimal("7.50") - Decimal("10.0")
 
 
+class TestSellCoordinationWithManualClose:
+    """
+    Real incident, 2026-09-24 (user: 'there are positions active but cant
+    close there'): this worker's own automatic exit loop and the
+    dashboard's manual close endpoint both submitted a real sell for the
+    same trade within the same second — whichever landed second got
+    rejected on-chain (real custom program errors, e.g. 0x1788/6024).
+    See engine/sell_coordination.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skips_the_sell_when_a_manual_close_already_holds_the_lock(self, session, monkeypatch):
+        from engine.sell_coordination import finish_sell, try_start_sell
+
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(
+            side_effect=AssertionError("must not submit a second, competing sell")
+        )
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        assert try_start_sell(str(trade.id)) is True  # simulates a manual close in flight
+        try:
+            ctx = patched_session(session)
+            try:
+                floor = Decimal(str(settings.HARD_FLOOR_PCT))
+                exit_price = trade.entry_price * (1 + floor)
+                await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+            finally:
+                ctx.stop()
+        finally:
+            finish_sell(str(trade.id))
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "open"  # untouched — the manual close owns this trade right now
+
+    @pytest.mark.asyncio
+    async def test_releases_the_lock_after_its_own_sell_completes(self, session, monkeypatch):
+        from engine.sell_coordination import try_start_sell
+
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="sig", actual_amount=Decimal("5000000"),
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        assert try_start_sell(str(trade.id)) is True  # lock released, not leaked
+        from engine.sell_coordination import finish_sell
+        finish_sell(str(trade.id))
+
+
 class TestExposurePercentageSizing:
     """config/settings.py's CONFLUENCE_LIVE_EXPOSURE_PCT formula
     (2026-09-23, replacing an earlier fixed-stake-plus-profit-share

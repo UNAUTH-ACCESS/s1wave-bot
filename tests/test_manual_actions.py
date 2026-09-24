@@ -29,6 +29,7 @@ from sqlalchemy import select
 
 from engine.execution import ExecutionResult
 from engine.manual_actions import close_trade_manually
+from engine.sell_coordination import finish_sell, try_start_sell
 from models.orm import ConfluenceLiveTrade, ConfluenceNotification, Token, TokenStatus
 
 
@@ -213,3 +214,72 @@ async def test_sell_failure_leaves_trade_open_with_real_error(session):
 
     row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
     assert row.status == "open"  # never fabricated a close
+
+
+@pytest.mark.asyncio
+async def test_refuses_to_double_sell_when_the_worker_is_already_closing_it(session):
+    """Real incident, 2026-09-24 (user: 'there are positions active but
+    cant close there'): confluence_live_worker.py's own automatic exit
+    loop and this exact function both tried to sell the same trade within
+    the same second, and whichever landed second was rejected on-chain.
+    Simulates the worker already holding the lock for this trade — the
+    manual close must refuse cleanly, never call ExecutionEngine.sell()
+    (which would submit a second real, competing swap), and leave the
+    trade untouched for the in-flight sell to finish on its own."""
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    trade = ConfluenceLiveTrade(
+        token_id=token.id, n_rules_cofiring=2, status="open",
+        entry_time=datetime.now(timezone.utc) - timedelta(hours=1), entry_price=Decimal("0.0001"),
+        entry_token_lamports=500_000_000, position_usd=Decimal("0.05"),
+    )
+    session.add(trade)
+    await session.flush()
+    trade_id = str(trade.id)
+
+    assert try_start_sell(trade_id) is True  # the worker's loop "got there first"
+    try:
+        with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
+             patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+            MockEngine.return_value.sell = AsyncMock(
+                side_effect=AssertionError("must not submit a second, competing sell")
+            )
+            result = await close_trade_manually(trade_id, sol_price_usd=Decimal("116.0"))
+    finally:
+        finish_sell(trade_id)
+
+    assert result.success is False
+    assert "already closing" in result.error.lower()
+
+    row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+    assert row.status == "open"  # untouched — the in-flight sell owns this trade now
+
+
+@pytest.mark.asyncio
+async def test_releases_the_lock_after_a_successful_close(session):
+    """The lock must not leak — a later close attempt (e.g. a retry after
+    a transient failure) must be able to proceed once this one finishes."""
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    trade = ConfluenceLiveTrade(
+        token_id=token.id, n_rules_cofiring=2, status="open",
+        entry_time=datetime.now(timezone.utc) - timedelta(hours=1), entry_price=Decimal("0.0001"),
+        entry_token_lamports=500_000_000, position_usd=Decimal("0.05"),
+    )
+    session.add(trade)
+    await session.flush()
+    trade_id = str(trade.id)
+
+    with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
+         patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+        MockEngine.return_value.get_token_balance_raw = AsyncMock(return_value=(500_000_000, 6))
+        MockEngine.return_value.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="closesig", actual_amount=Decimal("400000"),
+        ))
+        result = await close_trade_manually(trade_id, sol_price_usd=Decimal("116.0"))
+
+    assert result.success is True
+    assert try_start_sell(trade_id) is True  # lock was released, not leaked
+    finish_sell(trade_id)
