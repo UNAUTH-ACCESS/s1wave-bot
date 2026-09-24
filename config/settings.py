@@ -133,7 +133,22 @@ class Settings(BaseSettings):
     # stayed at 2% total, so raising this back to 3 automatically shrinks
     # each individual trade to ~0.67% of equity (2% / 3), not a separate
     # change — see that setting's comment for the exact math.
-    CONFLUENCE_LIVE_MAX_CONCURRENT: Annotated[int, Field(ge=1)] = 3
+    #
+    # 2026-09-24, later the same day: raised 3 -> 5 per the user's explicit
+    # instruction to "slightly decrease position sizing then increase
+    # concurrent trades to 5" — after a live "why are we losing" review
+    # found the two live entry filters (workers/entry_filters.py) don't
+    # yet have enough post-deploy live volume to judge (1 real closed
+    # trade), and the user chose to lean on the shadow benchmark (302+
+    # closed paper trades, zero capital/overhead distortion) as the primary
+    # study dataset going forward, using live trading mainly to validate
+    # real execution at reduced per-trade size. NOTE: the 2026-09-23
+    # concurrency sweep (analysis/sl_tp_and_concurrency_sweep.py, above)
+    # found 5+ slots captured more signals than 3 but did NOT reduce
+    # drawdown or improve the final replayed result any further — this
+    # change is explicitly for signal coverage/data volume, not because
+    # new evidence overturned that finding.
+    CONFLUENCE_LIVE_MAX_CONCURRENT: Annotated[int, Field(ge=1)] = 5
     # Exposure-percentage sizing (2026-09-23, replacing the earlier fixed-
     # stake-plus-profit-share formula the same day; 2026-09-24, lowered
     # 10% -> 2% per the user's instruction "each trade 2% of available
@@ -150,7 +165,11 @@ class Settings(BaseSettings):
     # i.e. never more than this fraction of CURRENT total capital is at
     # risk across every open position combined, split evenly across the
     # concurrent slots — at MAX_CONCURRENT=3, 1.5% total / 3 slots = 0.5%
-    # of equity per trade. This compounds automatically (equity moves with
+    # of equity per trade; left unchanged at 1.5% total when
+    # MAX_CONCURRENT went 3->5 (2026-09-24), so each slot's real size
+    # dropped to 0.3% of equity (1.5% / 5) as a direct, intended
+    # consequence of that change, not a separate edit here.
+    # This compounds automatically (equity moves with
     # the wallet's real balance — deposits, withdrawals, and realized P&L
     # all show up in it for free) without a separate profit-redeployment
     # knob, and is inherently protective: after a loss, equity is smaller,
