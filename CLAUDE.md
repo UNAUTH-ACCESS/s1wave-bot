@@ -34,6 +34,7 @@ As of 2026-09-24 ~18:30 UTC: wallet ~$6.19, all-time realized P&L ~-$1.27 (see a
 | `workers/entry_filters.py` | Two data-backed skip conditions checked before either worker opens a position — **read this file's docstring first**, it has the full analysis behind both filters. |
 | `engine/execution.py` | Real Jupiter swaps (buy/sell), token balance reads, `get_sell_quote()` (read-only liquidity check), `close_token_account()` (auto rent reclaim). |
 | `engine/manual_actions.py` | `close_trade_manually()` — real on-chain sell, backs the dashboard's Close/Close All buttons. |
+| `engine/sell_coordination.py` | In-process guard (2026-09-24) so the worker's automatic exit loop and a manual close can never both submit a real sell for the same trade at once — see "Real race" note below. |
 | `engine/live_equity.py` | Equity = **live wallet SOL balance only**, deliberately excludes open-position value. This is why "wallet + realized P&L" will never exactly equal a deposit while positions are open — see the balance-reconciliation section of NOTEBOOK.md if this confuses a future session again. |
 | `engine/trailing_stop.py` | The 10%-step trailing-stop staircase. `_INITIAL_STOP_PCT = 0.12` here is the ONLY real enforcement point — `settings.STOP_LOSS_PCT` is a separate, must-match-by-hand field used only for a validator, not actual behavior. |
 | `api/app.py` | Dashboard backend — status, trades, SSE stream, toggle, manual close(s). |
@@ -52,6 +53,10 @@ Skipped candidates are recorded (`status='wash_skipped'` / `'high_liq_skip'` / `
 ## Unsellable positions (as of 2026-09-24)
 
 A position whose real sell keeps failing (confirmed real on-chain rejection, e.g. a fully-drained pool — not a bug on our end) gets downgraded from `status='open'` to `status='unsellable'` after `_UNSELLABLE_AFTER_S` (10 min) of continuous failure. This frees its `CONFLUENCE_LIVE_MAX_CONCURRENT` slot for a new trade (`_open_trade_count()` only counts `'open'`) while it keeps being priced and keeps getting real sell attempts every cycle (`_load_open_trades()` includes both). The **only** way out is a real successful sell — never a fabricated close. Surfaced on the dashboard as a red "⛔ STUCK" badge and a separate `unsellable_trades` count on `/confluence/status`, so stuck money is never just invisible. **Known limitation**: the failure-duration clock lives in-process memory, so a service restart resets it for any currently-stuck position — acceptable for now, but worth remembering if a stuck position seems to "reset" after a deploy.
+
+## Fixed: manual close vs. automatic exit could race (2026-09-24)
+
+User report: "there are positions active but cant close there." Real cause, found live: the worker's own ~1s exit loop and the dashboard's manual close endpoint could both submit a real sell for the same trade at the same instant (a position tripping TIME_EXIT/HARD_FLOOR right as a human clicks Close). Whichever swap landed second was rejected on-chain (real custom program errors) and reported a scary failure for a position that, a moment later, usually wasn't actually stuck — the other path had already closed it fine. Fixed with `engine/sell_coordination.py`, a simple in-process claim both paths check before calling `ExecutionEngine.sell()`. If you ever see a manual close return "the bot's own exit logic is already closing this position," that's this guard working as intended — wait a few seconds and re-check status, don't retry immediately.
 
 ## Known live issue: sampling worker's API key is out of credits (2026-09-24, urgent, needs a human)
 
