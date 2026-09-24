@@ -66,6 +66,40 @@ So a second, independent skip condition was added: liquidity_usd >=
 check already looks at. Same permissive-when-unknown policy — a token
 with no TIER1 row, or no recorded liquidity_usd, is not skipped by this
 check.
+
+Buy-pressure floor (2026-09-24, added the same day after the user asked
+to re-run analysis on the shadow dataset specifically to find why the
+account was still losing): inside the liquidity+wash-trading "good"
+bucket (144 trades), the exit reason breakdown showed the real damage is
+almost entirely concentrated in HARD_FLOOR exits — and of the 73
+HARD_FLOOR exits in the full 304-trade dataset, 45% closed between -90%
+and -100% (near-total wipeouts, not gentle -15% stops: these are
+essentially real rug pulls, confirmed rather than filtered by the
+bad-tick guard needing 2 consecutive ticks to act). Comparing HARD_FLOOR
+trades against everything else in the good bucket found `buy_pressure`
+(from the originating MomentumSignalEvent — buy volume / total volume at
+the moment the signal fired) was the cleanest, most monotonic
+discriminator found in this whole analysis:
+
+  - buy_pressure < 0.90: 43.8% HARD_FLOOR rate, 43.8% win rate (n=32)
+  - buy_pressure 0.90-0.97: 33.3% HARD_FLOOR rate, 66.7% win rate (n=9)
+  - buy_pressure >= 0.97: 11.7% HARD_FLOOR rate, 86.4% win rate, +22.1%
+    capped mean (n=103)
+
+Checked for confound and ruled out: the low-buy_pressure trades are
+spread across both liquidity sub-ranges and both LP_NOT_BURNED/no-TIER1-
+row populations — not a restatement of either existing filter.
+`trailing_return_3min` looked promising on a raw median comparison
+(HARD_FLOOR trades had roughly double the trailing return of clean ones)
+but did NOT hold up under proper bucketing (non-monotonic, and the 25%+
+bucket actually had a good win rate) — not implemented as a filter;
+buy_pressure was the real driver behind that raw comparison.
+
+Third skip condition: buy_pressure < `BUY_PRESSURE_FLOOR` (0.97) at the
+signal that triggered the candidate — permissive-when-unknown as always.
+Unlike the other two, this reads straight from the MomentumSignalEvent
+row the caller already has (no extra query needed), so it's a plain,
+synchronous function, not async.
 """
 
 from __future__ import annotations
@@ -81,6 +115,7 @@ from models.orm import TokenEvaluation
 
 WASH_TRADING_REASON = "WASH_TRADING"
 LIQUIDITY_CEILING_USD = Decimal("30000")
+BUY_PRESSURE_FLOOR = Decimal("0.97")
 
 
 async def is_wash_trading_rejected(
@@ -145,3 +180,26 @@ async def is_liquidity_too_high(
     if liquidity is None:
         return False
     return Decimal(str(liquidity)) >= ceiling_usd
+
+
+def is_buy_pressure_too_low(
+    buy_pressure: Decimal | None, floor: Decimal = BUY_PRESSURE_FLOOR,
+) -> bool:
+    """
+    True if `buy_pressure` (from the MomentumSignalEvent that triggered
+    this candidate — buy volume / total volume at that moment) is below
+    `floor`. See this module's docstring for the data: within the
+    liquidity+wash-trading "good" bucket, buy_pressure >= 0.97 cut the
+    HARD_FLOOR rate from ~34-44% down to 11.7% and lifted win rate to
+    86.4%, cleanly and monotonically — the strongest single discriminator
+    found in the whole analysis.
+
+    Synchronous and pure (unlike the other two filters) — the caller
+    already has this value from the same MomentumSignalEvent row it used
+    to find the candidate in the first place, no extra query needed.
+    None (missing data) returns False — same permissive-when-unknown
+    policy as the other two filters.
+    """
+    if buy_pressure is None:
+        return False
+    return buy_pressure < floor

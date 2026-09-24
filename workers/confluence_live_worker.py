@@ -139,7 +139,7 @@ from engine.trailing_stop import initial_floor, update_trailing_stop
 from models.orm import (
     ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification, MomentumSignalEvent, Token,
 )
-from workers.entry_filters import is_liquidity_too_high, is_wash_trading_rejected
+from workers.entry_filters import is_buy_pressure_too_low, is_liquidity_too_high, is_wash_trading_rejected
 from workers.http_queue import RateLimitedQueue
 from workers.dexscreener_client import _DEXSCREENER_BASE, _best_pair
 
@@ -459,7 +459,7 @@ class ConfluenceLiveWorker:
             result = await session.execute(
                 select(
                     MomentumSignalEvent.token_id, MomentumSignalEvent.n_rules_cofiring,
-                    MomentumSignalEvent.triggered_at,
+                    MomentumSignalEvent.triggered_at, MomentumSignalEvent.buy_pressure,
                 )
                 .where(
                     MomentumSignalEvent.experiment_version == SOURCE_EXPERIMENT_VERSION,
@@ -476,7 +476,7 @@ class ConfluenceLiveWorker:
             already_traded = set(existing.scalars().all())
 
             chosen = None
-            for token_id, n_cofiring, triggered_at in candidates:
+            for token_id, n_cofiring, triggered_at, buy_pressure in candidates:
                 if token_id in already_traded:
                     continue
 
@@ -515,6 +515,23 @@ class ConfluenceLiveWorker:
                     ))
                     already_traded.add(token_id)
                     log.info("confluence_live.entry_high_liq_skipped", token_id=str(token_id))
+                    continue
+
+                # Buy-pressure floor (2026-09-24) — see workers/entry_filters.py
+                # for the full data: within the liquidity+wash-trading "good"
+                # bucket, buy_pressure >= 0.97 cut the HARD_FLOOR rate from
+                # ~34-44% to 11.7% and lifted win rate to 86.4% — the
+                # cleanest, most monotonic discriminator found in the whole
+                # analysis. Pure/synchronous check, no extra query needed.
+                if is_buy_pressure_too_low(buy_pressure):
+                    session.add(ConfluenceLiveTrade(
+                        token_id=token_id, n_rules_cofiring=n_cofiring, status="low_bp_skip",
+                        entry_time=datetime.now(timezone.utc), entry_price=Decimal("0"),
+                        position_usd=Decimal("0"),
+                        error_detail="Entry-quality filter: buy_pressure at signal time was below the 0.97 floor.",
+                    ))
+                    already_traded.add(token_id)
+                    log.info("confluence_live.entry_low_bp_skipped", token_id=str(token_id))
                     continue
 
                 chosen = (token_id, n_cofiring)

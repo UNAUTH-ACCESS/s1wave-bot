@@ -108,7 +108,7 @@ from models.orm import (
 )
 from workers.http_queue import RateLimitedQueue
 from workers.dexscreener_client import _DEXSCREENER_BASE, _best_pair
-from workers.entry_filters import is_liquidity_too_high, is_wash_trading_rejected
+from workers.entry_filters import is_buy_pressure_too_low, is_liquidity_too_high, is_wash_trading_rejected
 
 log = get_logger(__name__)
 
@@ -273,6 +273,7 @@ class ConfluenceShadowWorker:
                 select(
                     MomentumSignalEvent.token_id, MomentumSignalEvent.trigger_price,
                     MomentumSignalEvent.triggered_at, MomentumSignalEvent.n_rules_cofiring,
+                    MomentumSignalEvent.buy_pressure,
                 )
                 .where(
                     MomentumSignalEvent.experiment_version == SOURCE_EXPERIMENT_VERSION,
@@ -291,7 +292,7 @@ class ConfluenceShadowWorker:
             )
             already_open = set(existing.scalars().all())
 
-            for token_id, entry_price, entry_time, n_cofiring in candidates:
+            for token_id, entry_price, entry_time, n_cofiring, buy_pressure in candidates:
                 if token_id in already_open:
                     continue
                 token_result = await session.execute(select(Token).where(Token.id == token_id))
@@ -342,6 +343,28 @@ class ConfluenceShadowWorker:
                     already_open.add(token_id)
                     log.info(
                         "confluence_shadow.entry_high_liq_skipped",
+                        token_id=str(token_id), symbol=token.symbol,
+                    )
+                    continue
+
+                # Buy-pressure floor (2026-09-24) — see workers/entry_filters.py
+                # for the full data: within the liquidity+wash-trading "good"
+                # bucket, buy_pressure >= 0.97 cut the HARD_FLOOR rate from
+                # ~34-44% to 11.7% and lifted win rate to 86.4% — the
+                # cleanest, most monotonic discriminator found in the whole
+                # analysis. Pure/synchronous check, no extra query needed.
+                if is_buy_pressure_too_low(buy_pressure):
+                    session.add(ConfluenceShadowPosition(
+                        token_id=token_id,
+                        experiment_version=EXPERIMENT_VERSION,
+                        entry_price=entry_price,
+                        entry_time=entry_time,
+                        n_rules_cofiring=n_cofiring,
+                        status="low_bp_skip",
+                    ))
+                    already_open.add(token_id)
+                    log.info(
+                        "confluence_shadow.entry_low_bp_skipped",
                         token_id=str(token_id), symbol=token.symbol,
                     )
                     continue

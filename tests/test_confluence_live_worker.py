@@ -302,6 +302,78 @@ async def test_low_liquidity_token_still_enters(session, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_low_buy_pressure_token_is_skipped_no_real_money_spent(session, monkeypatch):
+    """Buy-pressure floor (2026-09-24, workers/entry_filters.py) — a
+    signal with buy_pressure below 0.97 must never reach execution.buy(),
+    even when it clears both other filters, and gets recorded as
+    'low_bp_skip' so it's never reconsidered."""
+    monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
+    monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    worker = make_worker(session)
+    mock_wallet_balance(worker, monkeypatch, equity_usd=10.0)
+    worker._execution.buy = AsyncMock()
+    signal = make_signal(token, n_rules_cofiring=2, buy_pressure=Decimal("0.85"))
+    session.add(signal)
+    session.add(TokenEvaluation(
+        token_id=token.id, gate="TIER1", passed=False, reason_code="LP_NOT_BURNED",
+        evaluated_at=signal.triggered_at - timedelta(seconds=5), inputs_json={"liquidity_usd": "12000"},
+    ))
+    await session.flush()
+
+    ctx = patched_session(session)
+    try:
+        await worker._maybe_enter()
+        await worker._maybe_enter()  # must stay skipped, not retried
+    finally:
+        ctx.stop()
+
+    result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.token_id == token.id))
+    trades = result.scalars().all()
+    assert len(trades) == 1
+    assert trades[0].status == "low_bp_skip"
+    worker._execution.buy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_high_buy_pressure_token_still_enters(session, monkeypatch):
+    """A signal at or above the buy-pressure floor, clearing both other
+    filters, must enter normally."""
+    monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
+    monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    worker = make_worker(session)
+    mock_wallet_balance(worker, monkeypatch, equity_usd=10.0)
+    worker._execution.buy = AsyncMock(return_value=ExecutionResult(
+        success=True, tx_signature="sig999", actual_price=Decimal("0.001"),
+        actual_amount=Decimal("10000000"),
+    ))
+    signal = make_signal(token, n_rules_cofiring=2, buy_pressure=Decimal("0.99"))
+    session.add(signal)
+    session.add(TokenEvaluation(
+        token_id=token.id, gate="TIER1", passed=False, reason_code="LP_NOT_BURNED",
+        evaluated_at=signal.triggered_at - timedelta(seconds=5), inputs_json={"liquidity_usd": "12000"},
+    ))
+    await session.flush()
+
+    ctx = patched_session(session)
+    try:
+        await worker._maybe_enter()
+    finally:
+        ctx.stop()
+
+    result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.token_id == token.id))
+    trades = result.scalars().all()
+    assert len(trades) == 1
+    assert trades[0].status == "open"
+    worker._execution.buy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_non_qualifying_signal_never_enters(session, monkeypatch):
     monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
     monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)

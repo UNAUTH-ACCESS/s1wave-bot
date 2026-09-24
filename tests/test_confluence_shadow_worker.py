@@ -278,6 +278,67 @@ async def test_low_liquidity_token_still_opens(session):
     assert positions[0].status == "open"
 
 
+@pytest.mark.asyncio
+async def test_low_buy_pressure_token_is_skipped_not_opened(session):
+    """Buy-pressure floor (2026-09-24, workers/entry_filters.py) — a
+    signal with buy_pressure below 0.97 must not open a real position,
+    even when it clears both other filters, and must be recorded so it's
+    never reconsidered on a later cycle."""
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    worker = ConfluenceShadowWorker(asyncio.Event())
+    signal = make_signal(token, n_rules_cofiring=2, buy_pressure=Decimal("0.85"))
+    session.add(signal)
+    session.add(TokenEvaluation(
+        token_id=token.id, gate="TIER1", passed=False, reason_code="LP_NOT_BURNED",
+        evaluated_at=signal.triggered_at - timedelta(seconds=5), inputs_json={"liquidity_usd": "12000"},
+    ))
+    await session.flush()
+
+    with patch("workers.confluence_shadow_worker.get_session") as mock_gs:
+        mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+        mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+        await worker._open_new_positions()
+        await worker._open_new_positions()  # must stay skipped, not retried
+
+    result = await session.execute(
+        select(ConfluenceShadowPosition).where(ConfluenceShadowPosition.token_id == token.id)
+    )
+    positions = result.scalars().all()
+    assert len(positions) == 1
+    assert positions[0].status == "low_bp_skip"
+
+
+@pytest.mark.asyncio
+async def test_high_buy_pressure_token_still_opens(session):
+    """A signal at or above the buy-pressure floor, clearing both other
+    filters, must open normally."""
+    token = make_token()
+    session.add(token)
+    await session.flush()
+    worker = ConfluenceShadowWorker(asyncio.Event())
+    signal = make_signal(token, n_rules_cofiring=2, buy_pressure=Decimal("0.99"))
+    session.add(signal)
+    session.add(TokenEvaluation(
+        token_id=token.id, gate="TIER1", passed=False, reason_code="LP_NOT_BURNED",
+        evaluated_at=signal.triggered_at - timedelta(seconds=5), inputs_json={"liquidity_usd": "12000"},
+    ))
+    await session.flush()
+
+    with patch("workers.confluence_shadow_worker.get_session") as mock_gs:
+        mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+        mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+        await worker._open_new_positions()
+
+    result = await session.execute(
+        select(ConfluenceShadowPosition).where(ConfluenceShadowPosition.token_id == token.id)
+    )
+    positions = result.scalars().all()
+    assert len(positions) == 1
+    assert positions[0].status == "open"
+
+
 class TestLayeredExitPriority:
     """Velocity breaker -> HARD_FLOOR -> trailing-stop staircase -> TIME_EXIT
     (2026-09-23, replacing the old fixed STOP_LOSS_PCT/TAKE_PROFIT_PCT pair

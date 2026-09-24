@@ -30,8 +30,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from decimal import Decimal
+
 from models.orm import TokenEvaluation
-from workers.entry_filters import is_liquidity_too_high, is_wash_trading_rejected
+from workers.entry_filters import is_buy_pressure_too_low, is_liquidity_too_high, is_wash_trading_rejected
 
 
 def make_evaluation(token_id, evaluated_at, passed, reason_code=None, inputs_json=None) -> TokenEvaluation:
@@ -187,3 +189,30 @@ async def test_independent_of_wash_trading_reason(session):
 
     assert await is_wash_trading_rejected(session, token_id, now) is False
     assert await is_liquidity_too_high(session, token_id, now) is True
+
+
+# ── is_buy_pressure_too_low() — buy-pressure floor (2026-09-24) ─────────────
+#
+# See workers/entry_filters.py's docstring for the data: within the
+# liquidity+wash-trading "good" bucket, buy_pressure >= 0.97 cut the
+# HARD_FLOOR rate from ~34-44% to 11.7% and lifted win rate to 86.4% —
+# the cleanest, most monotonic discriminator found in the whole analysis.
+# Synchronous and pure, unlike the other two — no DB access at all.
+
+def test_flags_buy_pressure_below_the_floor():
+    assert is_buy_pressure_too_low(Decimal("0.85")) is True
+
+
+def test_does_not_flag_buy_pressure_at_or_above_the_floor():
+    assert is_buy_pressure_too_low(Decimal("0.97")) is False
+    assert is_buy_pressure_too_low(Decimal("0.995")) is False
+
+
+def test_does_not_flag_missing_buy_pressure():
+    """Permissive-when-unknown — same policy as the other two filters."""
+    assert is_buy_pressure_too_low(None) is False
+
+
+def test_respects_a_custom_floor():
+    assert is_buy_pressure_too_low(Decimal("0.92"), floor=Decimal("0.90")) is False
+    assert is_buy_pressure_too_low(Decimal("0.88"), floor=Decimal("0.90")) is True
