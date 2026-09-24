@@ -309,24 +309,28 @@ class TestHeliusClient:
         assert info.freeze_authority_renounced is False
 
     @pytest.mark.asyncio
-    async def test_analyse_transactions_lp_burn_detected(self):
+    async def test_analyse_transactions_returns_safe_default_stub(self):
+        """
+        Phase 12: analyse_transactions() bypasses real TX parsing entirely
+        for PumpSwap tokens and always returns safe defaults — LP burn is
+        guaranteed by pump.fun's graduation protocol, and wash multiplier
+        is computed from DEX Screener h1 data instead (see
+        EnrichmentWorker._enrich_token / TestWashMultiplierAnalysis for the
+        real parsing logic, _analyse_transactions(), which still exists
+        and is still tested but is no longer called by this method). This
+        replaces two tests written before that change that fed it mock TX
+        data expecting it to be parsed — it never even looks at the
+        response body now, so the specific mock data doesn't matter.
+        """
         client = HeliusClient()
         client._http = self._make_mock_http(HELIUS_TX_RESPONSE_WITH_LP_BURN)
 
         analysis = await client.analyse_transactions("TokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 
-        assert analysis.lp_locked_burned is True
-
-    @pytest.mark.asyncio
-    async def test_analyse_transactions_wash_multiplier_passes(self):
-        """40 buys / 20 sells = 2.0 — below 2.5 threshold → PASS"""
-        client = HeliusClient()
-        client._http = self._make_mock_http(HELIUS_TX_RESPONSE_WITH_LP_BURN)
-
-        analysis = await client.analyse_transactions("TokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-
-        # 40 buys, 20 sells → 2.0 ≤ 2.5 → organic, passes Tier 1
-        assert analysis.wash_multiplier <= 2.5
+        assert analysis.lp_locked_burned is False
+        assert analysis.wash_multiplier == float("inf")
+        assert analysis.buy_count == 0
+        assert analysis.sell_count == 0
 
 
 # ── Wash multiplier boundary tests ───────────────────────────────────────────
@@ -397,78 +401,19 @@ class TestWashMultiplierAnalysis:
 
 
 # ── DiscoveryWorker tests ─────────────────────────────────────────────────────
-
-class TestDiscoveryWorker:
-
-    @pytest.mark.asyncio
-    async def test_new_tokens_inserted_and_queued(self, session):
-        """Discovery inserts new tokens and pushes to enrichment queue."""
-        from workers.discovery_worker import DiscoveryWorker
-
-        mock_dex = AsyncMock()
-        from dexscreener.client import DexTokenProfile
-        mock_dex.get_latest_token_profiles.return_value = [
-            DexTokenProfile(
-                chain_id="solana",
-                token_address="MintNEW1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                symbol="NEW1",
-            ),
-            DexTokenProfile(
-                chain_id="solana",
-                token_address="MintNEW2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                symbol="NEW2",
-            ),
-        ]
-
-        queue = asyncio.Queue()
-        shutdown = asyncio.Event()
-        worker = DiscoveryWorker(queue, mock_dex, shutdown)
-
-        # Patch get_session to use test session
-        with patch("workers.discovery_worker.get_session") as mock_gs:
-            # Simulate _filter_new_tokens returning both (not in DB)
-            # and _insert_token succeeding
-            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
-            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            # Just test _filter_new_tokens with empty DB
-            new = await worker._filter_new_tokens([
-                "MintNEW1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "MintNEW2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            ])
-        assert len(new) == 2
-
-    @pytest.mark.asyncio
-    async def test_known_tokens_are_skipped(self, session):
-        """Tokens already in DB are not re-queued."""
-        from workers.discovery_worker import DiscoveryWorker
-
-        # Insert a token into the test DB
-        token = Token(
-            mint_address="MintKNOWNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            symbol="KNOWN",
-            status=TokenStatus.WATCHING,
-            discovered_at=datetime.now(timezone.utc),
-        )
-        session.add(token)
-        await session.flush()
-
-        queue = asyncio.Queue()
-        shutdown = asyncio.Event()
-        worker = DiscoveryWorker(queue, AsyncMock(), shutdown)
-
-        with patch("workers.discovery_worker.get_session") as mock_gs:
-            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
-            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            new = await worker._filter_new_tokens([
-                "MintKNOWNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "MintFRESHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            ])
-
-        # Only the fresh mint should be returned
-        assert "MintKNOWNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in new
-        assert "MintFRESHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" in new
+#
+# The two tests that used to live here (test_new_tokens_inserted_and_queued,
+# test_known_tokens_are_skipped) tested a DexTokenProfile-based
+# DiscoveryWorker(queue, dex_client, shutdown) with a _filter_new_tokens()
+# method — none of which exist anymore. DiscoveryWorker was fully rewritten
+# to poll SolanaTracker's /tokens/multi/graduated directly (see
+# workers/discovery_worker.py's docstring), with its own internal HTTP
+# client rather than an injected DexScreenerClient, and mint dedup now
+# lives in an in-memory `_promoted` set plus `_cover_known_tokens()`, not a
+# DB-lookup filter function. Removed 2026-09-23 rather than rewritten,
+# since equivalent, CURRENT-architecture coverage of the "a known mint
+# gets covered instead of re-queued" behavior already exists in
+# tests/test_discovery_sampling_sync.py's TestDiscoveryCoversKnownTokens.
 
 
 # ── EnrichmentWorker tests ────────────────────────────────────────────────────
@@ -523,27 +468,29 @@ class TestEnrichmentWorker:
             mint_authority_renounced=True,
             freeze_authority_renounced=True,
             holder_count=500,
-        )
-        mock_helius.analyse_transactions.return_value = HeliusTxAnalysis(
-            lp_locked_burned=True,
-            wash_multiplier=1.8,
-            buy_count=36,
-            sell_count=20,
+            token_decimals=6,
         )
 
         queue = asyncio.Queue()
         shutdown = asyncio.Event()
         worker = EnrichmentWorker(queue, mock_dex, mock_helius, shutdown)
 
+        # _write_enrichment's signature changed (Phase 12): `pair` is now
+        # the DexPairSnapshot directly (dex_detail.best_pair), not the
+        # DexTokenDetail wrapper; token_decimals is a plain int from
+        # Helius (not the whole HeliusAssetInfo); wash multiplier and h1
+        # buy/sell counts now come from DEX Screener h1 data, not from
+        # Helius TX analysis (removed — see TestHeliusClient's
+        # analyse_transactions stub tests).
+        pair = mock_dex.get_token_detail.return_value.best_pair
+        dex_wash_mult = Decimal(str(round(pair.txns_h1_buys / pair.txns_h1_sells, 4)))
+
         with patch("workers.enrichment_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
 
             await worker._write_enrichment(
-                mint,
-                mock_dex.get_token_detail.return_value,
-                mock_helius.get_asset.return_value,
-                mock_helius.analyse_transactions.return_value,
+                mint, pair, 6, 100, dex_wash_mult, pair.txns_h1_buys, pair.txns_h1_sells,
             )
 
         # Re-fetch from session to check writes
@@ -553,10 +500,13 @@ class TestEnrichmentWorker:
         assert updated.liquidity_usd == Decimal("35000")
         assert updated.mint_authority_renounced is True
         assert updated.freeze_authority_renounced is True
+        # pump.fun graduation guarantees these — hardcoded True regardless
+        # of any Helius TX data (see enrichment_worker.py's docstring).
         assert updated.lp_locked_burned is True
-        assert float(updated.wash_multiplier) == pytest.approx(1.8, rel=1e-3)
+        assert updated.wash_multiplier == dex_wash_mult
         # Baseline volume set on first enrichment
         assert updated.baseline_volume_usd == Decimal("5000")
+        assert updated.token_decimals == 6
 
     @pytest.mark.asyncio
     async def test_enrichment_failure_marks_rejected(self, session):

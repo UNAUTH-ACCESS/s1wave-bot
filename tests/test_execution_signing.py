@@ -1,0 +1,450 @@
+"""
+tests/test_execution_signing.py
+=================================
+engine/execution.py's real-money execution path — regression coverage for
+THREE real bugs found live on 2026-09-24, in order, during the first real
+confluence_live trade (each one only surfaced after fixing the last):
+
+1. _sign_and_submit(): solders.VersionedTransaction has no in-place .sign()
+   method in the installed version (0.29.0) — every submission failed with
+   "'VersionedTransaction' object has no attribute 'sign'". Fixed by
+   building a NEW VersionedTransaction from the unsigned one's .message and
+   the real signer, rather than mutating the (immutable, Rust-backed)
+   deserialized object.
+
+2. _confirm_tx(): get_transaction() requires a solders.Signature object,
+   not a plain str — every poll attempt raised TypeError, silently
+   swallowed by a bare `except: pass` (a second bug on its own — this was
+   invisible in the logs). The real transaction had ALREADY succeeded
+   on-chain the whole time; the loop just never once successfully checked,
+   and reported a false "not confirmed within 60s" after a real fill —
+   leaving actual purchased tokens with no ConfluenceLiveTrade row tracking
+   them. Fixed by converting to Signature.from_string() first, and the
+   silent except now logs.
+
+3. actual_price: computed as sol_lamports/out_amount (SOL-lamports per raw
+   token unit) — not the same unit as the USD-per-whole-token price
+   (DexScreener's price_usd) the exit-decision logic compares it against.
+   Confirmed on the real trade: produced 0.00427 against that token's real
+   $0.0005419 DexScreener price. Fixed by querying the real post-trade
+   wallet balance (raw amount + decimals) and computing
+   position_usd / (raw_amount / 10**decimals) instead.
+
+All three use a REAL throwaway keypair and REAL, well-formed solders
+objects (not pure mocks) wherever the bug was in how this codebase used
+the library, so these tests exercise the actual API surface this session
+hit rather than an idealized mock that could hide the same bug again.
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from unittest.mock import AsyncMock
+
+import pytest
+from solders.hash import Hash
+from solders.keypair import Keypair
+from solders.message import MessageV0
+from solders.signature import Signature
+from solders.system_program import TransferParams, transfer
+from solders.transaction import VersionedTransaction
+
+from engine.execution import ExecutionEngine
+
+
+def make_jupiter_shaped_tx_bytes(fee_payer: Keypair) -> bytes:
+    """A real, well-formed VersionedTransaction serialized to bytes, shaped
+    the way Jupiter's /swap endpoint response is: a compiled message with a
+    placeholder signature, not yet signed by the real wallet — exactly what
+    _sign_and_submit() receives as its tx_bytes argument."""
+    ix = transfer(TransferParams(from_pubkey=fee_payer.pubkey(), to_pubkey=fee_payer.pubkey(), lamports=0))
+    msg = MessageV0.try_compile(fee_payer.pubkey(), [ix], [], Hash.default())
+    placeholder = VersionedTransaction.populate(msg, [Keypair().sign_message(bytes(msg))])
+    return bytes(placeholder)
+
+
+@pytest.mark.asyncio
+async def test_sign_and_submit_produces_a_validly_signed_transaction(monkeypatch):
+    """The core regression: this must not raise
+    AttributeError("'VersionedTransaction' object has no attribute 'sign'")
+    and must submit a transaction actually signed by OUR wallet, with our
+    pubkey as fee payer — not the placeholder from the unsigned bytes."""
+    wallet = Keypair()
+    engine = ExecutionEngine(
+        paper_override=False,
+        wallet_private_key_override=str(wallet),  # base58 secret, matches settings' format
+        rpc_url_override="http://127.0.0.1:1",  # never actually dialed — send_transaction is mocked below
+    )
+
+    submitted = {}
+
+    async def fake_send_transaction(tx, opts=None):
+        submitted["tx"] = tx
+        class _Resp:
+            value = "FAKESIGNATURE111"
+        return _Resp()
+
+    engine._rpc.send_transaction = fake_send_transaction
+
+    tx_bytes = make_jupiter_shaped_tx_bytes(wallet)
+    sig = await engine._sign_and_submit(tx_bytes)
+
+    assert sig == "FAKESIGNATURE111"
+    submitted_tx = submitted["tx"]
+    assert str(submitted_tx.message.account_keys[0]) == str(wallet.pubkey())
+    assert len(submitted_tx.signatures) == 1
+    # Signed by our real wallet, not the placeholder keypair the "Jupiter" fixture used.
+    assert submitted_tx.signatures[0] != VersionedTransaction.from_bytes(tx_bytes).signatures[0]
+
+
+@pytest.mark.asyncio
+async def test_sign_and_submit_returns_none_on_rpc_error(monkeypatch):
+    """A real submission failure (RPC rejects it) must still return None,
+    not raise — _execute_buy()/_execute_sell() rely on this to report a
+    clean submit_failed rather than crashing the cycle."""
+    wallet = Keypair()
+    engine = ExecutionEngine(
+        paper_override=False,
+        wallet_private_key_override=str(wallet),
+        rpc_url_override="http://127.0.0.1:1",
+    )
+
+    async def failing_send_transaction(tx, opts=None):
+        raise RuntimeError("simulated RPC rejection")
+
+    engine._rpc.send_transaction = failing_send_transaction
+
+    tx_bytes = make_jupiter_shaped_tx_bytes(wallet)
+    sig = await engine._sign_and_submit(tx_bytes)
+    assert sig is None
+
+
+def make_engine() -> ExecutionEngine:
+    return ExecutionEngine(
+        paper_override=False,
+        wallet_private_key_override=str(Keypair()),
+        rpc_url_override="http://127.0.0.1:1",
+    )
+
+
+class FakeTxMeta:
+    def __init__(self, err=None):
+        self.err = err
+
+
+class FakeTxResp:
+    def __init__(self, err=None):
+        self.transaction = type("T", (), {"meta": FakeTxMeta(err)})()
+
+
+class FakeGetTxResult:
+    def __init__(self, value):
+        self.value = value
+
+
+@pytest.mark.asyncio
+async def test_confirm_tx_calls_rpc_with_a_real_signature_object_not_a_string():
+    """The core regression: get_transaction() must be called with a
+    solders.Signature, not the plain str tx_sig — that TypeError was the
+    real bug, previously invisible because the except swallowed it silently."""
+    engine = make_engine()
+    sig_str = str(Keypair().sign_message(b"x"))
+    seen_args = {}
+
+    async def fake_get_transaction(sig_arg, commitment=None, max_supported_transaction_version=None):
+        seen_args["sig"] = sig_arg
+        return FakeGetTxResult(FakeTxResp(err=None))
+
+    engine._rpc.get_transaction = fake_get_transaction
+    result = await engine._confirm_tx(sig_str)
+
+    assert result is True
+    assert isinstance(seen_args["sig"], Signature)
+    assert str(seen_args["sig"]) == sig_str
+
+
+@pytest.mark.asyncio
+async def test_confirm_tx_returns_false_on_real_onchain_error():
+    engine = make_engine()
+    sig_str = str(Keypair().sign_message(b"x"))
+
+    async def fake_get_transaction(sig_arg, commitment=None, max_supported_transaction_version=None):
+        return FakeGetTxResult(FakeTxResp(err={"InstructionError": [0, "Custom"]}))
+
+    engine._rpc.get_transaction = fake_get_transaction
+    result = await engine._confirm_tx(sig_str)
+    assert result is False
+
+
+class FakeTokenAmount:
+    def __init__(self, amount: str, decimals: int):
+        self.amount = amount
+        self.decimals = decimals
+
+
+class FakeParsedAccount:
+    def __init__(self, amount: str, decimals: int):
+        self.account = type("Acc", (), {
+            "data": type("Data", (), {"parsed": {"info": {"tokenAmount": {"amount": amount, "decimals": decimals}}}})()
+        })()
+
+
+class FakeTokenAccountsResp:
+    def __init__(self, rows):
+        self.value = rows
+
+
+@pytest.mark.asyncio
+async def test_get_token_balance_raw_returns_real_amount_and_decimals():
+    engine = make_engine()
+
+    async def fake_get_accounts(owner, opts, commitment=None):
+        return FakeTokenAccountsResp([FakeParsedAccount("2167016274", 6)])
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_get_accounts
+    result = await engine.get_token_balance_raw("8m1yzDofuxPyG6qn8MNny3nQJT1Cqq3r1qTzWnTpump")
+    assert result == (2167016274, 6)
+
+
+@pytest.mark.asyncio
+async def test_get_token_balance_raw_retries_once_then_returns_none(monkeypatch):
+    import engine.execution as exec_module
+    monkeypatch.setattr(exec_module.asyncio, "sleep", AsyncMock())  # skip the real 2s wait in tests
+    engine = make_engine()
+    calls = {"n": 0}
+
+    async def always_empty(owner, opts, commitment=None):
+        calls["n"] += 1
+        return FakeTokenAccountsResp([])
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = always_empty
+    result = await engine.get_token_balance_raw(str(Keypair().pubkey()))  # valid-format mint, just never returns a row
+    assert result is None
+    assert calls["n"] == 2  # one retry, per the docstring
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_computes_dimensionally_correct_price_from_real_balance(monkeypatch):
+    """End-to-end: with a mocked quote/build/submit/confirm all succeeding,
+    actual_price must come from position_usd / (real_raw_amount /
+    10**decimals) — NOT sol_lamports/out_amount (the old, wrong formula)."""
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "1709821287"})
+    engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
+    engine._confirm_tx = AsyncMock(return_value=True)
+    engine.get_token_balance_raw = AsyncMock(return_value=(2167016274, 6))  # the real LUCKYCATT numbers
+
+    result = await engine._execute_buy(
+        mint="8m1yzDofuxPyG6qn8MNny3nQJT1Cqq3r1qTzWnTpump",
+        sol_lamports=9277473,
+        position_usd=Decimal("1.05"),
+    )
+
+    assert result.success is True
+    assert result.actual_amount == Decimal("2167016274")
+    expected_price = Decimal("1.05") / (Decimal("2167016274") / Decimal(10 ** 6))
+    assert result.actual_price == expected_price
+    # The old, wrong formula would have given ~0.0054 — sanity-check we're nowhere near it.
+    wrong_old_formula = Decimal("9277473") / Decimal("1709821287")
+    assert abs(result.actual_price - wrong_old_formula) > Decimal("0.0001")
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_falls_back_when_real_balance_unavailable(monkeypatch):
+    """If the post-trade balance lookup fails (rare), a real on-chain-
+    confirmed purchase must still be recorded with SOME usable price rather
+    than silently dropped — using the quoted out_amount with the documented
+    6-decimals assumption."""
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "1709821287"})
+    engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
+    engine._confirm_tx = AsyncMock(return_value=True)
+    engine.get_token_balance_raw = AsyncMock(return_value=None)
+
+    result = await engine._execute_buy(
+        mint="SomeMint",
+        sol_lamports=9277473,
+        position_usd=Decimal("1.05"),
+    )
+
+    assert result.success is True
+    assert result.actual_amount == Decimal("1709821287")
+    expected_price = Decimal("1.05") / (Decimal("1709821287") / Decimal(10 ** 6))
+    assert result.actual_price == expected_price
+
+
+# ── close_token_account() — rent-reclaim fix (2026-09-24) ───────────────────
+#
+# Real bug found live: every entry creates a token account (~0.0015-0.0021
+# SOL rent), and nothing ever closed it after the matching exit sold the
+# position to zero. Confirmed on-chain: 5 already-exited positions had left
+# 5 dead, still-rent-bearing accounts behind (~$0.86 total) that showed up
+# in none of equity_usd, open-position value, or realized P&L. These tests
+# cover the reclaim method itself and its wiring into _execute_sell().
+
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+
+class FakeCloseableAccountEntry:
+    def __init__(self, pubkey, amount: str, owner_program: str):
+        from solders.pubkey import Pubkey
+        self.pubkey = pubkey
+        self.account = type("Acc", (), {
+            "data": type("Data", (), {"parsed": {"info": {"tokenAmount": {"amount": amount, "decimals": 6}}}})(),
+            "owner": Pubkey.from_string(owner_program),
+        })()
+
+
+@pytest.mark.asyncio
+async def test_close_token_account_closes_a_zero_balance_account():
+    """Core path: a fully-drained account gets a real CloseAccount
+    instruction submitted, addressed to the account's own owning program
+    (Token-2022 here), with the wallet as both rent destination and signer."""
+    engine = make_engine()
+    dead_account = Keypair().pubkey()
+
+    async def fake_get_accounts(owner, opts, commitment=None):
+        return FakeTokenAccountsResp([FakeCloseableAccountEntry(dead_account, "0", TOKEN_2022_PROGRAM_ID)])
+
+    class FakeBlockhashResp:
+        value = type("V", (), {"blockhash": Hash.default()})()
+
+    submitted = {}
+
+    async def fake_send_transaction(tx, opts=None):
+        submitted["tx"] = tx
+        return type("R", (), {"value": "CLOSESIG111"})()
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_get_accounts
+    engine._rpc.get_latest_blockhash = AsyncMock(return_value=FakeBlockhashResp())
+    engine._rpc.send_transaction = fake_send_transaction
+    engine._confirm_tx = AsyncMock(return_value=True)
+
+    sig = await engine.close_token_account(str(Keypair().pubkey()))
+
+    assert sig == "CLOSESIG111"
+    ix = submitted["tx"].message.instructions[0]
+    assert str(submitted["tx"].message.account_keys[ix.program_id_index]) == TOKEN_2022_PROGRAM_ID
+    assert bytes(ix.data) == bytes([9])  # CloseAccount opcode
+
+
+@pytest.mark.asyncio
+async def test_close_token_account_refuses_a_nonzero_balance():
+    """CloseAccount fails on-chain for a nonzero balance — must not even
+    attempt the transaction, since that would waste a real fee on a
+    guaranteed-to-fail submission."""
+    engine = make_engine()
+
+    async def fake_get_accounts(owner, opts, commitment=None):
+        return FakeTokenAccountsResp([FakeCloseableAccountEntry(Keypair().pubkey(), "42", TOKEN_2022_PROGRAM_ID)])
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_get_accounts
+    engine._rpc.send_transaction = AsyncMock(side_effect=AssertionError("must not submit"))
+
+    sig = await engine.close_token_account(str(Keypair().pubkey()))
+    assert sig is None
+
+
+@pytest.mark.asyncio
+async def test_close_token_account_returns_none_when_no_account_exists():
+    engine = make_engine()
+
+    async def fake_get_accounts(owner, opts, commitment=None):
+        return FakeTokenAccountsResp([])
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_get_accounts
+    sig = await engine.close_token_account(str(Keypair().pubkey()))
+    assert sig is None
+
+
+@pytest.mark.asyncio
+async def test_close_token_account_swallows_failures_and_returns_none():
+    """A close failure must never bubble up — it runs right after an
+    already-successful sell and must not turn that into a reported error."""
+    engine = make_engine()
+
+    async def fake_get_accounts(owner, opts, commitment=None):
+        raise RuntimeError("simulated RPC outage")
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_get_accounts
+    sig = await engine.close_token_account(str(Keypair().pubkey()))
+    assert sig is None
+
+
+@pytest.mark.asyncio
+async def test_execute_sell_reclaims_rent_after_a_confirmed_sell(monkeypatch):
+    """Wiring check: a successful _execute_sell() must call
+    close_token_account() with the sold mint exactly once."""
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "142280"})
+    engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
+    engine._confirm_tx = AsyncMock(return_value=True)
+    engine.close_token_account = AsyncMock(return_value="CLOSESIG")
+
+    result = await engine._execute_sell(mint="SoldOutMint", token_lamports=1746290)
+
+    assert result.success is True
+    engine.close_token_account.assert_awaited_once_with("SoldOutMint")
+
+
+
+# ── get_sell_quote() — liquidity guard fix (2026-09-24) ─────────────────────
+#
+# Real bug found live: a DexScreener-sourced "current price" showed BLK
+# +19.5% unrealized, while a real Jupiter quote for the exact held size —
+# routed through the pool actually trading now — showed 100% price impact
+# and a real -76.5% loss. get_sell_quote() is the read-only building block
+# workers/confluence_live_worker.py's liquidity guard uses to catch this.
+
+@pytest.mark.asyncio
+async def test_get_sell_quote_returns_real_impact_and_amount():
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "79842", "priceImpactPct": "1"})
+
+    quote = await engine.get_sell_quote("SomeMint", 565147983)
+
+    assert quote == {"out_lamports": 79842, "price_impact_pct": Decimal("1")}
+
+
+@pytest.mark.asyncio
+async def test_get_sell_quote_returns_none_when_no_route():
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value=None)
+
+    quote = await engine.get_sell_quote("SomeMint", 1000)
+    assert quote is None
+
+
+@pytest.mark.asyncio
+async def test_get_sell_quote_returns_none_in_paper_mode():
+    engine = ExecutionEngine(paper_override=True)
+    quote = await engine.get_sell_quote("SomeMint", 1000)
+    assert quote is None
+
+
+@pytest.mark.asyncio
+async def test_get_sell_quote_swallows_errors():
+    engine = make_engine()
+    engine._get_quote = AsyncMock(side_effect=RuntimeError("network blip"))
+    quote = await engine.get_sell_quote("SomeMint", 1000)
+    assert quote is None
+
+
+@pytest.mark.asyncio
+async def test_execute_sell_succeeds_even_if_reclaim_raises(monkeypatch):
+    """A rent-reclaim failure must never turn a real, confirmed sell into a
+    reported failure — close_token_account() already swallows its own
+    errors, but the call site in _execute_sell() guards it too in case
+    that ever changes."""
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "142280"})
+    engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
+    engine._confirm_tx = AsyncMock(return_value=True)
+    engine.close_token_account = AsyncMock(side_effect=RuntimeError("should not happen, but must not break the sell"))
+
+    result = await engine._execute_sell(mint="SoldOutMint", token_lamports=1746290)
+    assert result.success is True

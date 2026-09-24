@@ -53,6 +53,7 @@ from typing import Any
 
 import httpx
 from solders.keypair import Keypair               # type: ignore
+from solders.signature import Signature           # type: ignore
 from solders.transaction import VersionedTransaction  # type: ignore
 from solana.rpc.async_api import AsyncClient       # type: ignore
 from solana.rpc.commitment import Confirmed        # type: ignore
@@ -95,21 +96,36 @@ class ExecutionEngine:
     """
     Jupiter swap execution with paper/live toggle.
 
-    Parameters are read from settings at construction time.
+    Parameters are read from settings at construction time, UNLESS an
+    override is passed — added 2026-09-23 so a second, fully isolated
+    execution path (workers/confluence_live_worker.py) can run live
+    against its own dedicated wallet without ever touching the global
+    settings.PAPER_TRADING flag or settings.WALLET_PRIVATE_KEY that every
+    other caller (CapitalEngine, RiskEngine, S1WaveWorker, TradeRiskWorker
+    — all of which call ExecutionEngine() with no arguments) relies on.
+    Passing no arguments reproduces the exact original behavior; this is
+    purely additive.
+
     Call buy() to open a position, sell() to close one.
     """
 
-    def __init__(self) -> None:
-        self._paper = settings.PAPER_TRADING
+    def __init__(
+        self,
+        paper_override: bool | None = None,
+        wallet_private_key_override: str | None = None,
+        rpc_url_override: str | None = None,
+    ) -> None:
+        self._paper = settings.PAPER_TRADING if paper_override is None else paper_override
         self._slippage_bps = settings.SLIPPAGE_BPS
         self._jupiter_base = settings.JUPITER_API_URL.rstrip("/")
         self._http_timeout = httpx.Timeout(timeout=30.0, connect=10.0)
 
         if not self._paper:
-            raw_key = settings.WALLET_PRIVATE_KEY
+            raw_key = settings.WALLET_PRIVATE_KEY if wallet_private_key_override is None else wallet_private_key_override
             key_bytes = base58.b58decode(raw_key)
             self._keypair = Keypair.from_bytes(key_bytes)
-            self._rpc = AsyncClient(settings.SOLANA_RPC_URL, commitment=Confirmed)
+            rpc_url = settings.SOLANA_RPC_URL if rpc_url_override is None else rpc_url_override
+            self._rpc = AsyncClient(rpc_url, commitment=Confirmed)
             log.info("execution.live_mode",
                      wallet=str(self._keypair.pubkey())[:8] + "...",
                      slippage_bps=self._slippage_bps)
@@ -119,6 +135,180 @@ class ExecutionEngine:
             log.info("execution.paper_mode")
 
     # ── Public API ─────────────────────────────────────────────────────────
+
+    async def get_wallet_balance_sol(self) -> Decimal | None:
+        """
+        Live on-chain SOL balance of this engine's own wallet — the ground
+        truth for equity-based position sizing (2026-09-24, see
+        workers/confluence_live_worker.py's _get_equity_usd()). Returns
+        None in paper mode (no real wallet) or on an RPC error; callers
+        must treat None as "unknown balance", never as zero — a transient
+        RPC hiccup must not read as "wallet is empty" and trip a halt.
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            return None
+        try:
+            resp = await self._rpc.get_balance(self._keypair.pubkey())
+            return Decimal(resp.value) / Decimal(1_000_000_000)
+        except Exception as exc:
+            log.warning("execution.get_balance_failed", error=str(exc))
+            return None
+
+    async def get_sell_quote(self, mint: str, token_lamports: int) -> dict | None:
+        """
+        A real, executable Jupiter sell quote for `token_lamports` of
+        `mint` — read-only, submits and signs nothing. Added 2026-09-24
+        after finding live that a DexScreener-sourced "current price" can
+        be badly stale (reflecting a pool the market has already
+        abandoned) while showing an unrealistic paper gain: BLK's
+        dashboard showed +19.5% unrealized off a stale pumpswap-pool
+        price, while a real Jupiter quote for the exact held size —
+        routed through the pool actually trading now (Meteora DAMM v2) —
+        showed 100% price impact and a real -76.5% loss. The snapshot
+        price a position is monitored against can diverge arbitrarily
+        from what the market will actually pay for the size actually
+        held; this is the only way to know the difference before
+        committing to a real sell.
+
+        Returns {"out_lamports": int, "price_impact_pct": Decimal} or
+        None on any failure (no route, network error) — callers must
+        treat None as "unknown", never as "safe".
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=self._http_timeout) as client:
+                quote = await self._get_quote(
+                    client, input_mint=mint, output_mint=_SOL_MINT, amount=token_lamports,
+                )
+            if not quote:
+                return None
+            return {
+                "out_lamports": int(quote["outAmount"]),
+                "price_impact_pct": Decimal(str(quote.get("priceImpactPct", "0"))),
+            }
+        except Exception as exc:
+            log.warning("execution.liquidity_quote_failed", mint=mint, error=str(exc))
+            return None
+
+    async def get_token_balance_raw(self, mint: str) -> tuple[int, int] | None:
+        """
+        Real, on-chain (raw_amount, decimals) for this wallet's holding of
+        `mint` — added 2026-09-24 to fix a real bug found live: the fill
+        price used to be derived from swap-execution math (SOL lamports in
+        / raw token units out), which is NOT the same unit as the USD-per-
+        whole-token price everything else (DexScreener, the exit-decision
+        logic) uses — confirmed on a real trade: the old formula produced
+        0.00427 against that token's real $0.0005419 DexScreener price, 8x
+        off and dimensionally meaningless. Querying the actual post-trade
+        balance (whatever program owns the mint — Token or Token-2022, this
+        filters by mint, not program, so both resolve) gives a real amount
+        and its real decimals to compute price = position_usd / (raw_amount
+        / 10**decimals), which IS in the same units as everything else.
+        Retries once after a short delay — a brief post-confirmation read
+        lag is more likely than the amount genuinely not being there yet.
+        Returns None (not zero) on failure; callers must not treat that as
+        "received nothing".
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            return None
+        from solana.rpc.models import TokenAccountOpts
+        from solders.pubkey import Pubkey
+        for attempt in (1, 2):
+            try:
+                resp = await self._rpc.get_token_accounts_by_owner_json_parsed(
+                    self._keypair.pubkey(), TokenAccountOpts(mint=Pubkey.from_string(mint)),
+                )
+                if resp.value:
+                    info = resp.value[0].account.data.parsed["info"]["tokenAmount"]
+                    return int(info["amount"]), int(info["decimals"])
+            except Exception as exc:
+                log.warning("execution.get_token_balance_failed", mint=mint, attempt=attempt, error=str(exc))
+            if attempt == 1:
+                await asyncio.sleep(2.0)
+        return None
+
+    async def close_token_account(self, mint: str) -> str | None:
+        """
+        Reclaim the ~0.0015-0.0021 SOL rent locked in a fully-drained token
+        account by closing it back to this wallet's main SOL balance.
+
+        Added 2026-09-24 after finding, live, that every entry creates a
+        token account (rent-exempt, ~0.0015-0.0021 SOL) via Jupiter's swap
+        builder, and nothing ever closed it after the matching exit sold
+        the position to zero — confirmed on-chain: 5 already-fully-sold
+        positions had left 5 dead, still-rent-bearing accounts behind,
+        totaling ~$0.86 that never showed up in equity_usd, in open-
+        position value, or in realized P&L, because none of those three
+        fields track token-account rent at all. This closes the loop for
+        every future exit; the 5 pre-existing stranded accounts needed a
+        one-off reclaim script instead, since this method only ever runs
+        right after a sell this engine itself just executed.
+
+        Deliberately best-effort: queries the real on-chain balance right
+        before closing (refuses if it isn't exactly zero — CloseAccount
+        fails on-chain for a nonzero balance, but checking first avoids
+        wasting a transaction and gives a clearer log line), and any
+        failure here is logged and swallowed, never raised — this is a
+        bonus recovery on top of an already-successful sell, not a
+        condition of one. Returns the closing tx signature, or None if
+        there was nothing to close, the balance wasn't zero, or the close
+        itself failed.
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            return None
+        from solana.rpc.models import TokenAccountOpts
+        from solders.pubkey import Pubkey
+        from solders.instruction import Instruction, AccountMeta
+        from solders.message import MessageV0
+
+        try:
+            resp = await self._rpc.get_token_accounts_by_owner_json_parsed(
+                self._keypair.pubkey(), TokenAccountOpts(mint=Pubkey.from_string(mint)),
+            )
+            if not resp.value:
+                return None
+            entry = resp.value[0]
+            info = entry.account.data.parsed["info"]["tokenAmount"]
+            if int(info["amount"]) != 0:
+                log.warning("execution.close_account_skipped_nonzero_balance",
+                            mint=mint, amount=info["amount"])
+                return None
+
+            account_pubkey = entry.pubkey
+            program_id = entry.account.owner
+
+            ix = Instruction(
+                program_id,
+                bytes([9]),  # CloseAccount — identical opcode/layout on both
+                             # the classic Token program and Token-2022.
+                [
+                    AccountMeta(account_pubkey, False, True),        # account to close
+                    AccountMeta(self._keypair.pubkey(), False, True),  # rent destination
+                    AccountMeta(self._keypair.pubkey(), True, False),  # owner (signer)
+                ],
+            )
+            blockhash_resp = await self._rpc.get_latest_blockhash()
+            msg = MessageV0.try_compile(
+                self._keypair.pubkey(), [ix], [], blockhash_resp.value.blockhash,
+            )
+            tx = VersionedTransaction(msg, [self._keypair])
+            opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
+            result = await self._rpc.send_transaction(tx, opts=opts)
+            tx_sig = str(result.value)
+
+            confirmed = await self._confirm_tx(tx_sig)
+            if not confirmed:
+                log.warning("execution.close_account_not_confirmed", mint=mint, tx_signature=tx_sig)
+                return None
+
+            log.info("execution.rent_reclaimed", mint=mint,
+                      account=str(account_pubkey), tx_signature=tx_sig)
+            return tx_sig
+        except Exception as exc:
+            log.warning("execution.close_account_failed", mint=mint,
+                        error_type=type(exc).__name__, error=str(exc))
+            return None
 
     async def buy(
         self,
@@ -337,15 +527,36 @@ class ExecutionEngine:
                     tx_signature=tx_sig,
                 )
 
-            # Compute actual fill price from amounts
-            actual_price = Decimal(str(sol_lamports)) / Decimal(str(out_amount))
+            # Real fill price and amount from the actual post-trade balance
+            # (2026-09-24 fix — see get_token_balance_raw()'s docstring for
+            # why: sol_lamports/out_amount is NOT a USD-per-token price, it's
+            # SOL-lamports-per-raw-unit, a different unit entirely from what
+            # the exit-decision logic (DexScreener's price_usd) compares it
+            # against. position_usd is the one number here already known in
+            # real USD, dividing it by the real whole-token amount received
+            # gives a price in the same units as everything else.
+            balance = await self.get_token_balance_raw(mint)
+            if balance is not None:
+                raw_amount, decimals = balance
+                actual_amount = Decimal(raw_amount)
+                actual_price = position_usd / (Decimal(raw_amount) / (Decimal(10) ** decimals))
+            else:
+                # Real, on-chain-confirmed tokens exist regardless — falling
+                # back to the quote's estimate rather than losing track of
+                # them. decimals unknown here without the balance lookup;
+                # nearly all pump.fun-originated SPL tokens use 6, which is
+                # the best available approximation, clearly logged as such.
+                log.error("execution.post_trade_balance_unavailable", mint=mint, tx_signature=tx_sig,
+                          fallback="using quoted out_amount with an assumed 6 decimals")
+                actual_amount = Decimal(str(out_amount))
+                actual_price = position_usd / (Decimal(str(out_amount)) / Decimal(10 ** 6))
 
             log.info(
                 "execution.buy_confirmed",
                 mint=mint,
                 tx_signature=tx_sig,
                 sol_in_lamports=sol_lamports,
-                token_out_lamports=out_amount,
+                token_out_lamports=int(actual_amount),
                 actual_price=str(actual_price),
             )
 
@@ -353,7 +564,7 @@ class ExecutionEngine:
                 success=True,
                 tx_signature=tx_sig,
                 actual_price=actual_price,
-                actual_amount=Decimal(str(out_amount)),
+                actual_amount=actual_amount,
             )
 
     async def _execute_sell(
@@ -411,6 +622,15 @@ class ExecutionEngine:
                     tx_signature=tx_sig,
                 )
 
+            # NOTE (2026-09-24): same dimensional issue as the old buy-side
+            # actual_price (SOL-lamports per raw-token-unit, not a USD-per-
+            # token price) — NOT fixed here because, unlike the buy side,
+            # nothing currently reads this field: _maybe_exit() computes
+            # pnl_usd directly from actual_amount (real SOL received) *
+            # SOL_PRICE_USD, and uses the DexScreener-sourced current_price
+            # for exit_price, never this value. Left as informational only;
+            # fix the same way (real post-trade balance) before anything
+            # ever starts relying on it for a real decision.
             actual_price = Decimal(str(sol_out)) / Decimal(str(token_lamports))
 
             log.info(
@@ -421,6 +641,20 @@ class ExecutionEngine:
                 sol_out_lamports=sol_out,
                 actual_price=str(actual_price),
             )
+
+            # Reclaim the token account's rent now that the position is
+            # fully sold (2026-09-24 — see close_token_account()'s
+            # docstring). A full-exit sell always empties the account, so
+            # this is safe to attempt unconditionally; best-effort and
+            # never allowed to affect the sell's own success/failure —
+            # close_token_account() already swallows its own errors, but
+            # this belt-and-suspenders try/except keeps that guarantee
+            # true even if that ever changes.
+            try:
+                await self.close_token_account(mint)
+            except Exception as exc:
+                log.warning("execution.close_account_call_site_error", mint=mint,
+                            error_type=type(exc).__name__, error=str(exc))
 
             return ExecutionResult(
                 success=True,
@@ -476,9 +710,22 @@ class ExecutionEngine:
             return None
 
     async def _sign_and_submit(self, tx_bytes: bytes) -> str | None:
+        """
+        2026-09-24 — found live, during the first real trade attempts after
+        the Jupiter URL fix: solders.VersionedTransaction has no in-place
+        .sign() method in the installed version (0.29.0) — it's an
+        immutable, Rust-backed object. Every attempt was failing here with
+        "'VersionedTransaction' object has no attribute 'sign'", caught by
+        the except below and reported as the generic "Transaction
+        submission failed". The correct pattern (confirmed against solders'
+        own constructor docstring, then verified end-to-end with the real
+        wallet keypair before deploying): build a NEW VersionedTransaction
+        from the unsigned one's .message and the real signer list, rather
+        than mutating the deserialized object.
+        """
         try:
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx.sign([self._keypair])
+            unsigned = VersionedTransaction.from_bytes(tx_bytes)
+            tx = VersionedTransaction(unsigned.message, [self._keypair])
             opts = TxOpts(
                 skip_preflight=False,
                 preflight_commitment=Confirmed,
@@ -490,11 +737,24 @@ class ExecutionEngine:
             return None
 
     async def _confirm_tx(self, tx_sig: str) -> bool:
+        """
+        2026-09-24 — found live, on the first real trade after the signing
+        fix: get_transaction() requires a solders.Signature object, not a
+        plain str — every single poll attempt raised TypeError, silently
+        swallowed by the bare `except: pass` below (itself a second bug:
+        it never logged anything, so this was invisible in the logs and
+        only found by independently querying the chain directly). The real
+        transaction had ALREADY succeeded on-chain the whole time; this
+        loop just never once successfully checked, spun for the full
+        timeout, and reported a false "not confirmed" — leaving a real,
+        filled position with no ConfluenceLiveTrade row to track it.
+        """
+        sig = Signature.from_string(tx_sig)
         deadline = time.monotonic() + _CONFIRM_TIMEOUT_S
         while time.monotonic() < deadline:
             try:
                 resp = await self._rpc.get_transaction(
-                    tx_sig,
+                    sig,
                     commitment=Confirmed,
                     max_supported_transaction_version=0,
                 )
@@ -506,7 +766,8 @@ class ExecutionEngine:
                                   tx_sig=tx_sig,
                                   err=str(resp.value.transaction.meta.err))
                         return False
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("execution.confirm_poll_error", tx_sig=tx_sig,
+                            error_type=type(exc).__name__, error=str(exc))
             await asyncio.sleep(_CONFIRM_POLL_S)
         return False

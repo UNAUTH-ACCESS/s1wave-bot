@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -187,6 +188,16 @@ class Token(Base):
     rejection_reason: Mapped[str | None] = mapped_column(Text)
     watch_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Set the moment a token enters OBSERVING — from a Tier1 reject or a
+    # Scorer discard alike. This is the anchor sampling_worker uses for the
+    # bounded post-rejection observation window; it is NOT the same as
+    # discovered_at, which for a Scorer-discarded token could be minutes or
+    # hours earlier. observation_exit_reason records how that window ended
+    # (elapsed / token vanished) WITHOUT overwriting rejection_reason, which
+    # always holds the original gate verdict that put the token here.
+    observation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observation_exit_reason: Mapped[str | None] = mapped_column(String(64))
+
     # ── DEX Screener fields (at enrichment time) ──────────────────────────
     liquidity_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     market_cap_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
@@ -325,6 +336,334 @@ class TokenEvaluation(Base):
         return f"<TokenEvaluation {self.gate} passed={self.passed} token={self.token_id}>"
 
 
+class ShadowTrade(Base):
+    """
+    Analysis-only shadow entry for a threshold-lowering experiment (e.g.
+    "scorer_v2_threshold_4"). NEVER read by CapitalEngine, RiskEngine,
+    execution.py, or any production decision path — recording a row here
+    changes nothing about what the real bot does. It exists purely so an
+    experimental, lower-threshold entry policy can be backtested against
+    real subsequent price action using the exact same token_snapshots the
+    real pipeline is already collecting (no extra API load).
+
+    One row per (token, experiment) — the first time that token's real
+    score crossed the experiment's threshold, mirroring how a real
+    strategy only enters once. Outcomes (returns, drawdown, simulated
+    exit) are always derived later from token_snapshots by the analysis
+    script, never stored here.
+    """
+
+    __tablename__ = "shadow_trades"
+    __table_args__ = (
+        UniqueConstraint("token_id", "experiment_version", name="uq_shadow_trades_token_experiment"),
+        Index("ix_shadow_trades_experiment", "experiment_version", "triggered_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False
+    )
+    experiment_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    score: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False)
+    tier1_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(24, 12), nullable=False)
+    liquidity_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    market_cap_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    buys: Mapped[int | None] = mapped_column(Integer)
+    sells: Mapped[int | None] = mapped_column(Integer)
+    wash_multiplier: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    inputs_json: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
+
+    def __repr__(self) -> str:
+        return f"<ShadowTrade {self.experiment_version} score={self.score} token={self.token_id}>"
+
+
+class MomentumSignalEvent(Base):
+    """
+    Analysis-only, forward-tracking shadow experiment for the pump-timing
+    signal found by analysis/pump_timing_research.py and
+    analysis/pump_signal_quality.py (2026-09-22): a >5.3% price move over
+    a trailing 3-minute window reliably precedes a token's peak. NEVER
+    read by CapitalEngine, RiskEngine, execution.py, or any production
+    decision path — recording a row here changes nothing about what the
+    real bot does. It exists so this signal can be validated
+    PROSPECTIVELY (on tokens discovered from here forward), not just
+    retrospectively, using the token_snapshots the real pipeline already
+    writes.
+
+    One row per (token, experiment_version) — the FIRST time the primary
+    signal fires for that token. Outcomes are always derived LATER from
+    token_snapshots by a future analysis script, never stored here — same
+    convention as shadow_trades.
+    """
+
+    __tablename__ = "momentum_signal_events"
+    __table_args__ = (
+        UniqueConstraint("token_id", "experiment_version", name="uq_momentum_signal_token_experiment"),
+        Index("ix_momentum_signal_experiment", "experiment_version", "triggered_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False
+    )
+    experiment_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    trigger_price: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    trailing_return_3min: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    trailing_return_5min: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    buy_pressure: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    volume_mult: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    n_rules_cofiring: Mapped[int] = mapped_column(Integer, nullable=False)
+    liquidity_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    market_cap_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+
+    def __repr__(self) -> str:
+        return f"<MomentumSignalEvent {self.experiment_version} token={self.token_id} n_cofiring={self.n_rules_cofiring}>"
+
+
+class ConfluenceShadowPosition(Base):
+    """
+    Real-time-monitored paper position for the "confluence_entry_v1"
+    experiment (workers/confluence_shadow_worker.py, built 2026-09-22
+    directly from the momentum_confluence_v1 research). Opened the moment
+    a momentum_signal_events row records n_rules_cofiring >= 2; monitored
+    at the same 1-second DexScreener cadence a real trade gets via
+    TradeMonitorWorker (closing the exact gap the earlier expectancy
+    backtest had: that backtest could only simulate exits against
+    WATCHING-tier 30-60s token_snapshots, since no historical 1-second
+    data exists for tokens that were never actually entered).
+
+    NEVER read by execution.py or any production decision path. A row
+    here does not consume CONFLUENCE_LIVE_MAX_CONCURRENT, does not affect
+    the live daily-loss circuit breaker, and does not touch the real
+    `trades` table (removed 2026-09-23 along with the rest of the old
+    scorer/S1Wave pipeline) in any way — a fully separate, isolated table
+    and worker, exactly so this experiment can run without being able to
+    interfere with real trading capacity or decisions. Kept running
+    alongside ConfluenceLiveWorker as an ongoing paper benchmark of the
+    exact same entry/exit rule real money uses.
+
+    Exit priority (updated 2026-09-23, layered stop): a velocity breaker
+    and settings.HARD_FLOOR_PCT still catch a violent crash or an
+    emergency below the normal stop; the everyday stop/take-profit split
+    is now engine/trailing_stop.py's staircase (see that module) instead
+    of a fixed settings.STOP_LOSS_PCT / settings.TAKE_PROFIT_PCT pair —
+    it starts at the same -6% distance below entry, ratchets up in 10%
+    steps as price makes new highs, and never force-sells a winner just
+    for reaching the old +30% mark.
+    """
+
+    __tablename__ = "confluence_shadow_positions"
+    __table_args__ = (
+        UniqueConstraint("token_id", "experiment_version", name="uq_confluence_shadow_token_experiment"),
+        Index("ix_confluence_shadow_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False
+    )
+    experiment_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    n_rules_cofiring: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")  # 'open' | 'closed'
+    exit_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_reason: Mapped[str | None] = mapped_column(String(32))
+    pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    # Trailing-stop staircase state (engine/trailing_stop.py) — NULL until
+    # the first post-entry tick, at which point the worker seeds them
+    # (floor = initial_floor(entry_price), hwm = entry_price).
+    high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceShadowPosition {self.experiment_version} token={self.token_id} status={self.status}>"
+
+
+class ConfluenceShadowObservation(Base):
+    """
+    Raw 1-second price observation for a ConfluenceShadowPosition while
+    OPEN — same convention as TradePriceObservation, applied from day one
+    here specifically because that instrumentation gap (no post-entry
+    price path recoverable) was already found and fixed once this session
+    for real trades; no reason to repeat the same mistake for this
+    experiment. Full path, MFE/MAE etc. are always derived from this table
+    at analysis time, never stored here.
+    """
+
+    __tablename__ = "confluence_shadow_observations"
+    __table_args__ = (
+        Index("ix_confluence_shadow_observations_position_id", "position_id", "observed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    position_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("confluence_shadow_positions.id", ondelete="CASCADE"), nullable=False
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    price_usd: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceShadowObservation position={self.position_id} price={self.price_usd} at={self.observed_at}>"
+
+
+class ConfluenceLiveTrade(Base):
+    """
+    A REAL, on-chain trade for the confluence_entry_v1 strategy, executed
+    via engine/execution.py's ExecutionEngine against a
+    dedicated wallet (settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY) —
+    completely isolated from the real `trades` table (removed 2026-09-23
+    along with the rest of the old scorer/S1Wave pipeline). Built
+    2026-09-23 after the user explicitly reviewed a mixed
+    confluence_shadow_positions evaluation (real edge but inconsistent —
+    2 of 4 time periods flat/negative once a single large outlier was
+    excluded, 17% rug rate) and chose to proceed with a $10 total capital
+    cap.
+
+    Position sizing is exposure-percentage based (2026-09-23, same day the
+    old pipeline was removed and the fixed exit pair replaced; raised to
+    3 concurrent slots and switched to this formula the same day): never
+    more than CONFLUENCE_LIVE_EXPOSURE_PCT of current equity is at risk
+    across every open position combined, split evenly across
+    CONFLUENCE_LIVE_MAX_CONCURRENT slots — e.g. 10% total / 3 slots =
+    ~3.33% of equity per trade. Equity itself is the LIVE on-chain wallet
+    balance (2026-09-24, replacing an earlier fixed-stake-plus-realized-pnl
+    figure, per the user's instruction to size against whatever is actually
+    deposited) — see engine/live_equity.py, capped at
+    CONFLUENCE_LIVE_MAX_POSITION_USD regardless. See
+    workers/confluence_live_worker.py's _compute_position_usd().
+
+    Mirrors confluence_shadow_positions' shape, plus real execution
+    detail: tx signatures, actual SOL spent/received, actual token amount
+    (needed to size the exit swap exactly).
+    """
+
+    __tablename__ = "confluence_live_trades"
+    __table_args__ = (
+        Index("ix_confluence_live_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tokens.id", ondelete="CASCADE"), nullable=False
+    )
+    n_rules_cofiring: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")  # 'open' | 'closed' | 'buy_failed'
+    entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)  # actual fill price
+    # BigInteger (2026-09-24, found live): a real raw token amount
+    # (2,167,016,274 for a real trade this session) already exceeds
+    # Postgres INTEGER's ~2.147B signed 32-bit max — common for memecoins
+    # with large supplies and several decimals. Plain int in Python has no
+    # such limit, so this was invisible until the actual INSERT failed.
+    entry_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    entry_token_lamports: Mapped[int | None] = mapped_column(BigInteger)  # actual amount bought — needed to size the sell
+    entry_tx_signature: Mapped[str | None] = mapped_column(String(128))
+    exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))  # last observed price that triggered the exit decision
+    exit_reason: Mapped[str | None] = mapped_column(String(32))
+    exit_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)  # actual SOL received from the sell
+    exit_tx_signature: Mapped[str | None] = mapped_column(String(128))
+    pnl_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))  # actual realized USD P&L, entry SOL cost vs exit SOL proceeds
+    position_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)  # USD size at entry (compounded — see class docstring)
+    error_detail: Mapped[str | None] = mapped_column(Text)  # populated only if status='buy_failed' or a sell needed manual intervention
+    # Trailing-stop staircase state (engine/trailing_stop.py) — NULL until
+    # the first post-entry tick, at which point the worker seeds them
+    # (floor = initial_floor(entry_price), hwm = entry_price).
+    high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceLiveTrade token={self.token_id} status={self.status}>"
+
+
+class ConfluenceLiveObservation(Base):
+    """Raw 1-second price observation for an OPEN ConfluenceLiveTrade —
+    same convention as ConfluenceShadowObservation/TradePriceObservation."""
+
+    __tablename__ = "confluence_live_observations"
+    __table_args__ = (
+        Index("ix_confluence_live_observations_trade_id", "trade_id", "observed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    trade_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("confluence_live_trades.id", ondelete="CASCADE"), nullable=False
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    price_usd: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceLiveObservation trade={self.trade_id} price={self.price_usd} at={self.observed_at}>"
+
+
+class ConfluenceNotification(Base):
+    """
+    In-app notification feed for real-money confluence_entry_v1 events
+    (2026-09-24, per the user's request: an in-app notification center plus
+    a live-streamed dashboard, since Telegram alerting is still
+    unconfigured — see workers/confluence_live_worker.py's emit points).
+
+    Persisted (not just pushed live) so a notification is still visible if
+    you open the dashboard later rather than only as an ephemeral toast —
+    exposed via GET /confluence/notifications and pushed live over
+    GET /confluence/stream (SSE). level='critical' is reserved for things
+    that also would have fired the Telegram alert had it been configured
+    (a sell exhausting all retries, the wallet crossing into permanently
+    halted) — everything else is 'info' or 'warning'.
+
+    Halt-state notifications (permanently_halted / daily_halted) are
+    edge-triggered by the worker (only on a state CHANGE), never emitted
+    every cycle — _safe_to_enter() re-checks these every ~1s and would
+    otherwise spam a row per second.
+    """
+
+    __tablename__ = "confluence_notifications"
+    __table_args__ = (
+        Index("ix_confluence_notifications_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    level: Mapped[str] = mapped_column(String(16), nullable=False)  # 'info' | 'warning' | 'critical'
+    event: Mapped[str] = mapped_column(String(48), nullable=False)  # short slug, e.g. 'entry_filled'
+    message: Mapped[str] = mapped_column(Text, nullable=False)  # human-readable, ready to display as-is
+    trade_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("confluence_live_trades.id", ondelete="SET NULL")
+    )
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceNotification {self.level} {self.event} at={self.created_at}>"
+
+
 # ── trades ───────────────────────────────────────────────────────────────────
 
 class Trade(Base):
@@ -414,6 +753,41 @@ class Trade(Base):
 
     def __repr__(self) -> str:
         return f"<Trade {self.token_mint[:8]}… {self.status} entry={self.entry_price}>"
+
+
+class TradePriceObservation(Base):
+    """
+    Raw price observation for a trade while it is OPEN, one row per
+    TradeMonitorWorker cycle (~1s). Written only for status=OPEN trades —
+    the worker's existing OPEN-only load query means writes naturally stop
+    the cycle after a trade closes, with no separate stop condition coded.
+
+    MFE/MAE, highest/lowest price while holding, and the full price path
+    are always derived from this table at analysis time (see
+    analysis/full_lifecycle_report.py) — never stored here, the same
+    convention as every other outcome in this project.
+    """
+
+    __tablename__ = "trade_price_observations"
+    __table_args__ = (
+        Index("ix_trade_price_observations_trade_id", "trade_id", "observed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=_new_uuid
+    )
+    trade_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("trades.id", ondelete="CASCADE"), nullable=False
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    price_usd: Mapped[Decimal] = mapped_column(Numeric(30, 12), nullable=False)
+    liquidity_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    buy_pressure: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+
+    def __repr__(self) -> str:
+        return f"<TradePriceObservation trade={self.trade_id} price={self.price_usd} at={self.observed_at}>"
 
 
 # ── balance_history ───────────────────────────────────────────────────────────

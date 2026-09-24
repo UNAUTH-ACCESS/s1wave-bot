@@ -8,7 +8,8 @@ increment above entry. Pure logic — no DB access, no I/O.
 
 Staircase rules
 ---------------
-Entry: stop floor = entry_price * (1 - 0.06) = entry * 0.94
+Entry: stop floor = entry_price * (1 - 0.12) = entry * 0.88 (2026-09-24,
+widened from 0.94 — see _INITIAL_STOP_PCT below for why)
 
 At each 10% profit increment above entry, the floor moves up to lock
 in the previous stage:
@@ -35,8 +36,21 @@ from __future__ import annotations
 from decimal import Decimal
 
 
-# The initial stop distance below entry (-6%)
-_INITIAL_STOP_PCT = Decimal("0.06")
+# The initial stop distance below entry — widened -6% -> -12% (2026-09-24),
+# per the user's explicit instruction after watching two real live trades
+# both exit within ~1 second via HARD_FLOOR: a real, live-observed 10.5%
+# single-tick move on a brand-new pump.fun token turned out to be normal
+# noise (the real fill P&L came back to roughly breakeven a few seconds
+# later, once the sell actually confirmed on-chain) rather than a real
+# crash — the -6%/-7% pair was tight enough to be caught by that kind of
+# ordinary first-second volatility before a position had any real chance
+# to develop. NOTE: this is the actual, only place this distance is
+# enforced — settings.STOP_LOSS_PCT is a separate, same-value config field
+# used only for the HARD_FLOOR_PCT-must-be-stricter validation and
+# display; keep both in sync by hand if either changes (this module is
+# deliberately dependency-free — "pure logic, no DB access, no I/O" per
+# its own docstring — so it does not import settings directly).
+_INITIAL_STOP_PCT = Decimal("0.12")
 
 # Step size for staircase increments (5%)
 # Data-validated: 5% steps outperform 10% on all 11 actual trades

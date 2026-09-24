@@ -96,8 +96,8 @@ class TestSettingsValidation:
     def test_valid_settings_accepted(self):
         from config.settings import Settings
         s = Settings(**self._make_env())
-        assert s.STOP_LOSS_PCT == -0.06
-        assert s.HARD_FLOOR_PCT == -0.07
+        assert s.STOP_LOSS_PCT == -0.12  # widened 2026-09-24 — see config/settings.py's comment
+        assert s.HARD_FLOOR_PCT == -0.15
         assert s.max_hold_seconds == 6 * 3600
         assert s.cb_pause_seconds == 60 * 60
 

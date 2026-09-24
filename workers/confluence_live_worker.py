@@ -1,0 +1,873 @@
+"""
+workers/confluence_live_worker.py
+====================================
+REAL, on-chain live trading for confluence_entry_v1 ONLY.
+
+Built 2026-09-23 after the user reviewed a mixed
+confluence_shadow_positions evaluation (n=167 real, 1-second-monitored
+paper trades: a real edge, but inconsistent across time — 2 of 4
+chronological periods were flat/negative once a single dominant outlier
+was excluded — and a 17% rug rate averaging -78%) and explicitly chose to
+proceed anyway, with $10 total capital at risk. This worker is that
+decision, implemented as cautiously as the user asked.
+
+ISOLATION — read this before touching anything here or in the files it
+touches
+-----------------------------------------------------------------------
+This worker, and the two-parameter change to engine/execution.py's
+ExecutionEngine that makes it possible, are the ONLY things in this
+codebase that can move real money as of 2026-09-23. Specifically:
+  - Uses its OWN dedicated wallet (settings.CONFLUENCE_LIVE_WALLET_
+    PRIVATE_KEY), never settings.WALLET_PRIVATE_KEY.
+  - The old scorer/S1Wave/CapitalEngine paper-trading pipeline (the only
+    other thing that ever called ExecutionEngine()) was removed entirely
+    on 2026-09-23 — this is now the only production caller of
+    ExecutionEngine, period.
+  - Never touches the real `trades` table (also removed) or
+    MAX_CONCURRENT_TRADES — its own confluence_live_trades table is
+    fully separate.
+  - Gated behind settings.CONFLUENCE_LIVE_ENABLED, which defaults to
+    False. New entries stop the instant this is False, though open
+    positions are still monitored/exited regardless — see main.py.
+
+Entry rule — IDENTICAL to confluence_shadow_worker.py, on purpose
+---------------------------------------------------------------------
+Same signal (momentum_signal_events, n_rules_cofiring >= 2 for
+experiment_version='momentum_confluence_v1') as the paper experiment this
+was validated against. Not extended, not re-tuned — the whole point of
+freezing the strategy per the user's own instruction was to test THIS
+exact rule with real execution risk added, not a new one. (The user later
+asked, same day, for compounding position sizing and a layered exit — see
+below — but the ENTRY signal itself has never changed.)
+
+Position sizing — exposure percentage against LIVE wallet equity, split
+across concurrent slots (2026-09-23: percentage-of-equity formula, per the
+user's own instruction "expose 10% of total capital so each trade is
+3.33%"; 2026-09-24: equity itself became the live on-chain wallet balance
+instead of a fixed config stake, per the user's instruction "$7 deposited
+-> trade with $7, $15 deposited -> trade with $15 ... size trades with
+available wallet capital" — see engine/live_equity.py, the shared module
+this and api/app.py both call so the formula can't drift between them)
+---------------------------------------------------------------------
+See engine/live_equity.py's module docstring and compute_position_usd():
+never more than CONFLUENCE_LIVE_EXPOSURE_PCT of CURRENT live equity is at
+risk across every open position combined, split evenly across
+CONFLUENCE_LIVE_MAX_CONCURRENT slots. Compounds automatically since
+equity IS the live wallet balance — a deposit, a withdrawal, and realized
+P&L all show up in it for free, no separate bookkeeping needed. Always
+capped at CONFLUENCE_LIVE_MAX_POSITION_USD.
+
+Safety layers, all independent, all checked before every entry
+--------------------------------------------------------------------
+  1. settings.CONFLUENCE_LIVE_ENABLED must be True (master switch).
+  2. No more than settings.CONFLUENCE_LIVE_MAX_CONCURRENT trades already
+     OPEN (raised from 1 to 3 on 2026-09-23 — see config/settings.py's
+     comment and analysis/sl_tp_and_concurrency_sweep.py for the replay
+     analysis that motivated it: one-at-a-time trading only captured 15
+     of 196 real signals and concentrated all risk into a single bet at
+     a time, which is what produced the near-total wipeout found in an
+     earlier retroactive replay).
+  3. Live wallet equity must be above CONFLUENCE_LIVE_MIN_TRADEABLE_USD
+     (a dust floor, default $1) — below it, this halts PERMANENTLY (not
+     just for the day) until the wallet is topped back up. Since equity
+     IS the live balance now, this is a direct, always-current read of
+     "is there anything meaningful left to trade with", not a fixed
+     lifetime-loss figure that could go stale.
+  4. A daily circuit breaker (CONFLUENCE_LIVE_DAILY_LOSS_LIMIT_PCT of
+     *today's starting* live equity, realized today) pauses new entries
+     until the next UTC day — a softer, earlier warning than #3.
+
+Bad-tick guard — deliberately duplicated, not imported, from
+workers/confluence_shadow_worker.py
+------------------------------------------------------------------------
+Same logic (an implausible single-tick move is held until a second,
+similar tick confirms it — see that file's docstring for the real
+2026-09-22 incident this defends against), copied rather than shared on
+purpose: a future change to the paper-shadow experiment must never be
+able to silently change real-money behavior, and vice versa.
+
+Exit priority — layered stop (2026-09-23, replacing the old fixed
+-6%/+30% pair): velocity breaker -> HARD_FLOOR -> engine/trailing_stop.py's
+staircase (starts at the same -6% distance below entry, ratchets up in
+10% steps as price makes new highs, never force-sells a winner just for
+reaching the old +30% mark) -> TIME_EXIT. Identical logic in
+confluence_shadow_worker.py, duplicated on purpose per the isolation
+note above.
+
+On a sell failure: execution.py's own sell() already retries 3x with
+delay and fires a Telegram alert on total failure (execution.sell_
+failed_critical). This worker does not add a second retry loop on top —
+a trade that fails to sell simply stays 'open' and gets re-evaluated
+(and re-attempted) on the next normal ~1s cycle, same as any other open
+position. No infinite tight-loop retries; the existing 1s poll interval
+is the backoff.
+
+Logging contract
+-----------------
+info:
+  confluence_live.started / stopped
+  confluence_live.entry_attempted / entry_filled / entry_failed
+  confluence_live.exit_attempted / exit_filled / exit_failed
+  confluence_live.cycle_complete
+warning:
+  confluence_live.daily_loss_limit_hit
+  confluence_live.total_capital_exhausted
+  confluence_live.implausible_tick_held / implausible_tick_confirmed
+error:
+  confluence_live.fetch_error
+  confluence_live.cycle_error
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import httpx
+from sqlalchemy import select, func
+
+from config.logging import get_logger
+from config.settings import settings
+from database.engine import get_session
+from engine.execution import ExecutionEngine
+from engine.live_equity import (
+    compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
+)
+from engine.trailing_stop import initial_floor, update_trailing_stop
+from models.orm import (
+    ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification, MomentumSignalEvent, Token,
+)
+from workers.entry_filters import is_liquidity_too_high, is_wash_trading_rejected
+from workers.http_queue import RateLimitedQueue
+from workers.dexscreener_client import _DEXSCREENER_BASE, _best_pair
+
+log = get_logger(__name__)
+
+SOURCE_EXPERIMENT_VERSION = "momentum_confluence_v1"
+MIN_RULES_COFIRING = 2
+VELOCITY_BREAKER_PCT = Decimal("-0.25")
+_EQUITY_CACHE_TTL_S = 10.0
+
+_TIMEOUT = httpx.Timeout(timeout=10.0, connect=5.0)
+_MAX_MINTS_PER_REQUEST = 30
+
+IMPLAUSIBLE_TICK_RATIO = 3.0
+CONFIRMATION_TOLERANCE = 0.5
+
+# Liquidity guard (2026-09-24) — see ExecutionEngine.get_sell_quote()'s
+# docstring for the real incident: BLK's DexScreener-sourced price showed
+# +19.5% unrealized while a real Jupiter quote for the exact held size,
+# routed through the pool actually trading now, showed 100% price impact
+# and a real -76.5% loss. The snapshot price a position is monitored
+# against can be arbitrarily stale in a way the normal HARD_FLOOR/
+# trailing-stop logic — which only ever looks at that same snapshot —
+# cannot detect. Checked at most once per _LIQUIDITY_CHECK_INTERVAL_S per
+# trade.
+#
+# 2026-09-24, same day — found live within minutes of deploying at 20s:
+# lite-api.jup.ag (the free, unauthenticated Jupiter tier — the same one
+# execution.py uses for real buy/sell quotes) 429'd EVERY single guard
+# check, continuously, even with zero other traffic. 3 concurrent
+# positions x one check per 20s (~9 req/min sustained) is apparently
+# already over its real per-IP budget once added on top of normal trading
+# activity — real buy/sell quotes are infrequent (once per signal), so
+# they weren't the problem; the guard's own steady background polling
+# was. A silently-429ing guard provides zero protection (fails safe,
+# falls through to the normal snapshot logic, exactly as if the guard
+# didn't exist) while looking deployed and active. Widened to 60s — still
+# catches a liquidity crisis well within the timeframe it matters, at a
+# request rate real trading has run at all session without a single 429.
+_LIQUIDITY_CHECK_INTERVAL_S = 60.0
+_LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
+_LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
+
+
+class ConfluenceLiveWorker:
+    """REAL on-chain execution of the confluence_entry_v1 rule. See module
+    docstring for isolation guarantees and safety layers — this class does
+    not enforce them alone, it's the combination of settings gating,
+    dedicated wallet, and a separate table that makes this safe to run
+    alongside everything else."""
+
+    def __init__(self, shutdown_event: asyncio.Event, poll_interval: float = 1.0) -> None:
+        self._shutdown = shutdown_event
+        self._poll_interval = poll_interval
+        self._http = RateLimitedQueue()
+        self._started_at = datetime.now(timezone.utc)
+        self._last_accepted_price: dict = {}
+        self._pending_tick: dict = {}
+        self._equity_cache: tuple[float, Decimal | None] | None = None
+        # Edge-trigger state for halt notifications — None means "not observed
+        # yet"; a transition FROM None still notifies once at startup so the
+        # in-app feed always reflects current reality, not just changes since
+        # boot. _safe_to_enter() re-checks these every ~1s and must NOT notify
+        # on every check, only when the value actually changes.
+        self._last_permanently_halted: bool | None = None
+        self._last_daily_halted: bool | None = None
+        # A stuck-exit (execution.py's sell() already exhausts all retries
+        # internally before ever returning failure, so every result.success
+        # False IS the critical case) gets re-attempted every ~1s cycle by
+        # design — notify once per trade, not once per cycle, or a token
+        # with dried-up liquidity would flood the feed for as long as it
+        # stays stuck.
+        self._notified_stuck_trades: set = set()
+        # Liquidity guard state (2026-09-24) — trade id -> time.monotonic()
+        # of the last real Jupiter quote check, so it's throttled per-trade
+        # rather than per-cycle.
+        self._last_liquidity_check: dict = {}
+        self._execution = ExecutionEngine(
+            paper_override=False,
+            wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
+            rpc_url_override=settings.HELIUS_RPC_URL,
+        )
+
+    async def run(self) -> None:
+        log.info("confluence_live.started", poll_interval=self._poll_interval,
+                 started_at=self._started_at.isoformat(),
+                 min_tradeable_usd=settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,
+                 max_position_usd=settings.CONFLUENCE_LIVE_MAX_POSITION_USD,
+                 max_concurrent=settings.CONFLUENCE_LIVE_MAX_CONCURRENT)
+        self._http.start()
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                while not self._shutdown.is_set():
+                    try:
+                        await self._cycle(client)
+                    except Exception as exc:
+                        log.error("confluence_live.cycle_error", error=str(exc), exc_info=True)
+                    try:
+                        await asyncio.wait_for(self._shutdown.wait(), timeout=self._poll_interval)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            self._http.stop()
+            log.info("confluence_live.stopped")
+
+    async def _cycle(self, client: httpx.AsyncClient) -> None:
+        t0 = time.monotonic()
+
+        # Runs regardless of CONFLUENCE_LIVE_ENABLED — see its own docstring
+        # for why: halt-state notifications are informational, not an entry
+        # decision, and a paused user still needs to know the moment a
+        # deposit clears the dust floor.
+        equity = await self._get_equity_usd()
+        today_pnl = await self._load_today_realized_pnl() if equity is not None else Decimal("0")
+        all_time_pnl = await self._load_all_time_realized_pnl() if equity is not None else Decimal("0")
+        await self._refresh_halt_notifications(equity, today_pnl, all_time_pnl)
+
+        if settings.CONFLUENCE_LIVE_ENABLED:
+            await self._maybe_enter()
+
+        open_trades = await self._load_open_trades()
+        if not open_trades:
+            return
+
+        mints = list(open_trades.keys())
+        snapshots: dict[str, dict] = {}
+        for i in range(0, len(mints), _MAX_MINTS_PER_REQUEST):
+            chunk = mints[i:i + _MAX_MINTS_PER_REQUEST]
+            try:
+                snapshots.update(await self._fetch(client, chunk))
+            except Exception as exc:
+                log.error("confluence_live.fetch_error", error=str(exc),
+                          exc_type=type(exc).__name__, chunk_size=len(chunk))
+
+        now = datetime.now(timezone.utc)
+        for mint, trade in open_trades.items():
+            data = snapshots.get(mint)
+            if data is None:
+                continue
+            price = self._accept_price(trade, data["price_usd"])
+            if price is None:
+                continue
+            await self._record_observation(trade["id"], price, now)
+            await self._maybe_exit(trade, price, now)
+
+        elapsed_ms = round((time.monotonic() - t0) * 1000)
+        log.info("confluence_live.cycle_complete", open_trades=len(mints), elapsed_ms=elapsed_ms)
+
+    # ── in-app notifications (2026-09-24) ───────────────────────────────
+
+    async def _notify(self, level: str, event: str, message: str, trade_id=None) -> None:
+        """Persist an in-app notification — see models.orm.ConfluenceNotification
+        for the retention/severity contract. Never raises: a notification
+        failure must not be allowed to break the trading cycle that
+        triggered it."""
+        try:
+            async with get_session() as session:
+                session.add(ConfluenceNotification(level=level, event=event, message=message, trade_id=trade_id))
+        except Exception as exc:
+            log.error("confluence_live.notify_failed", event=event, error=str(exc))
+
+    # ── safety gates ─────────────────────────────────────────────────────
+
+    async def _load_all_time_realized_pnl(self) -> Decimal:
+        """Re-added 2026-09-24 for the absolute-dollar lifetime max-loss cap
+        (CONFLUENCE_LIVE_MAX_LOSS_USD) — independent of equity, which no
+        longer tracks this on its own now that equity is the live wallet
+        balance rather than (stake + all-time pnl)."""
+        async with get_session() as session:
+            result = await session.execute(
+                select(func.coalesce(func.sum(ConfluenceLiveTrade.pnl_usd), 0))
+                .where(ConfluenceLiveTrade.status == "closed")
+            )
+            return Decimal(str(result.scalar_one()))
+
+    async def _load_today_realized_pnl(self) -> Decimal:
+        start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with get_session() as session:
+            result = await session.execute(
+                select(func.coalesce(func.sum(ConfluenceLiveTrade.pnl_usd), 0))
+                .where(ConfluenceLiveTrade.status == "closed", ConfluenceLiveTrade.exit_time >= start_of_day)
+            )
+            return Decimal(str(result.scalar_one()))
+
+    async def _open_trade_count(self) -> int:
+        async with get_session() as session:
+            result = await session.execute(
+                select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "open")
+            )
+            return result.scalar_one()
+
+    async def _get_equity_usd(self) -> Decimal | None:
+        """
+        Live wallet equity in USD (2026-09-24) — see engine/live_equity.py
+        for the full model. Cached briefly: balance only changes on our own
+        fills or an external deposit/withdrawal, so there's no need to hit
+        the RPC on every ~1s poll cycle. None means "unknown right now"
+        (RPC error, or SOL_PRICE_USD not yet populated) — callers must
+        treat that as "can't safely size or check gates", never as zero.
+
+        2026-09-24 — found live, right after deploying an unrelated fix and
+        restarting: the very first read after startup failed (SOL_PRICE_USD
+        genuinely hadn't been populated by the heartbeat yet), and that
+        None got cached for the full TTL — turning one transient,
+        one-second startup hiccup into ~10 seconds of the bot reporting
+        "equity unknown" and refusing to enter anything, long after the
+        real data was already available (confirmed live: /confluence/status,
+        which fetches fresh every request, was already returning a correct
+        equity the whole time this worker sat on the stale cached None).
+        Only a SUCCESSFUL read is worth caching — a failure should be
+        retried on the very next ~1s cycle, not stuck for the full TTL.
+        """
+        now = time.monotonic()
+        if self._equity_cache is not None:
+            cached_at, cached_value = self._equity_cache
+            if now - cached_at < _EQUITY_CACHE_TTL_S:
+                return cached_value
+        sol_balance = await self._execution.get_wallet_balance_sol()
+        equity = compute_equity_usd(sol_balance, Decimal(str(settings.SOL_PRICE_USD)))
+        if equity is not None:
+            self._equity_cache = (now, equity)
+        return equity
+
+    async def _refresh_halt_notifications(
+        self, equity: Decimal | None, today_pnl: Decimal, all_time_pnl: Decimal = Decimal("0"),
+    ) -> None:
+        """
+        Edge-triggered halt-state notifications (2026-09-24) — deliberately
+        called every cycle from _cycle() UNCONDITIONALLY, not just when
+        CONFLUENCE_LIVE_ENABLED / from inside _safe_to_enter(). A user who
+        has manually paused trading (the dashboard's PAUSE button) still
+        needs to know the moment a deposit clears the dust floor — that's
+        informational, not an entry decision, and must not depend on
+        whether entries happen to be gated off right now. Found the hard
+        way: a deposit landed while paused and produced zero notification,
+        because this used to live entirely inside _safe_to_enter(), which
+        _cycle() only calls when CONFLUENCE_LIVE_ENABLED is True.
+        """
+        if equity is None:
+            return
+
+        perm_halted = is_permanently_halted(equity, all_time_pnl)
+        if perm_halted != self._last_permanently_halted:
+            self._last_permanently_halted = perm_halted
+            if perm_halted:
+                max_loss_hit = all_time_pnl <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
+                reason = (
+                    f"realized losses reached the ${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} test-phase limit "
+                    f"(all-time: ${all_time_pnl:.2f})" if max_loss_hit else
+                    f"wallet balance ${equity:.2f} is below the ${settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD:.2f} minimum"
+                )
+                await self._notify("critical", "permanently_halted",
+                                    f"Trading halted — {reason}. A human needs to re-enable it to resume.")
+            else:
+                armed_note = "trading is ARMED — may enter a position on the next signal" if settings.CONFLUENCE_LIVE_ENABLED \
+                    else "trading is currently PAUSED — resume it from the dashboard when you're ready"
+                await self._notify("info", "wallet_funded",
+                                    f"Wallet funded — ${equity:.2f} available ({armed_note}).")
+        if perm_halted:
+            log.warning("confluence_live.total_capital_exhausted", equity_usd=str(equity), all_time_pnl=str(all_time_pnl))
+            return
+
+        day_halted = is_daily_halted(equity, today_pnl)
+        if day_halted != self._last_daily_halted:
+            self._last_daily_halted = day_halted
+            if day_halted:
+                await self._notify("warning", "daily_loss_limit_hit",
+                                    f"Daily loss limit reached (today: ${today_pnl:.2f}) — "
+                                    "paused until the next UTC day.")
+            else:
+                await self._notify("info", "daily_loss_limit_cleared",
+                                    "Daily loss limit no longer in effect.")
+        if day_halted:
+            log.warning("confluence_live.daily_loss_limit_hit", today_pnl=str(today_pnl), equity_usd=str(equity))
+
+    async def _safe_to_enter(self) -> bool:
+        equity = await self._get_equity_usd()
+        if equity is None:
+            log.warning("confluence_live.equity_unknown", reason="wallet balance or SOL price unavailable")
+            return False
+
+        all_time_pnl = await self._load_all_time_realized_pnl()
+        if is_permanently_halted(equity, all_time_pnl):
+            return False
+
+        today_pnl = await self._load_today_realized_pnl()
+        if is_daily_halted(equity, today_pnl):
+            return False
+
+        if await self._open_trade_count() >= settings.CONFLUENCE_LIVE_MAX_CONCURRENT:
+            return False
+
+        return True
+
+    async def _compute_position_usd(self) -> Decimal:
+        """
+        Exposure-percentage sizing against LIVE wallet equity (2026-09-24) —
+        see engine/live_equity.py's compute_position_usd() for the formula,
+        unchanged since 2026-09-23 (10% exposure / 3 slots = ~3.33% of
+        equity per trade, capped at CONFLUENCE_LIVE_MAX_POSITION_USD).
+        Returns 0 if equity is currently unknown (RPC hiccup) rather than
+        raising — _maybe_enter() already treats position_usd <= 0 as
+        "nothing to do this cycle".
+        """
+        equity = await self._get_equity_usd()
+        if equity is None:
+            return Decimal("0")
+        return compute_position_usd(equity)
+
+    # ── entry ────────────────────────────────────────────────────────────
+
+    async def _maybe_enter(self) -> None:
+        if not await self._safe_to_enter():
+            return
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(
+                    MomentumSignalEvent.token_id, MomentumSignalEvent.n_rules_cofiring,
+                    MomentumSignalEvent.triggered_at,
+                )
+                .where(
+                    MomentumSignalEvent.experiment_version == SOURCE_EXPERIMENT_VERSION,
+                    MomentumSignalEvent.n_rules_cofiring >= MIN_RULES_COFIRING,
+                    MomentumSignalEvent.triggered_at >= self._started_at,
+                )
+                .order_by(MomentumSignalEvent.triggered_at.asc())
+            )
+            candidates = result.all()
+            if not candidates:
+                return
+
+            existing = await session.execute(select(ConfluenceLiveTrade.token_id))
+            already_traded = set(existing.scalars().all())
+
+            chosen = None
+            for token_id, n_cofiring, triggered_at in candidates:
+                if token_id in already_traded:
+                    continue
+
+                # Entry-quality filter (2026-09-24) — see workers/entry_filters.py
+                # for the full data: WASH_TRADING-rejected tokens are 56% of
+                # all confluence_entry_v1 trades and the single worst-
+                # performing population (31.3% rug rate, net-negative even
+                # capped). Recorded as a permanent 'wash_skipped' row
+                # so this candidate is never re-evaluated on a later cycle —
+                # already_traded reflects any row that exists, regardless of
+                # status.
+                if await is_wash_trading_rejected(session, token_id, triggered_at):
+                    session.add(ConfluenceLiveTrade(
+                        token_id=token_id, n_rules_cofiring=n_cofiring, status="wash_skipped",
+                        entry_time=datetime.now(timezone.utc), entry_price=Decimal("0"),
+                        position_usd=Decimal("0"),
+                        error_detail="Entry-quality filter: token's most recent TIER1 evaluation before this signal was a WASH_TRADING rejection.",
+                    ))
+                    already_traded.add(token_id)
+                    log.info("confluence_live.entry_wash_skipped", token_id=str(token_id))
+                    continue
+
+                # Liquidity-ceiling filter (2026-09-24) — see
+                # workers/entry_filters.py for the full data: liquidity <
+                # $30k at signal time is a much stronger, cleaner
+                # predictor than WASH_TRADING alone (6.5% vs 36.7% rug
+                # rate on an evenly-split n=262 dataset), and stays
+                # predictive even inside the WASH_TRADING population, so
+                # it's checked independently on top of it.
+                if await is_liquidity_too_high(session, token_id, triggered_at):
+                    session.add(ConfluenceLiveTrade(
+                        token_id=token_id, n_rules_cofiring=n_cofiring, status="high_liq_skip",
+                        entry_time=datetime.now(timezone.utc), entry_price=Decimal("0"),
+                        position_usd=Decimal("0"),
+                        error_detail="Entry-quality filter: token's most recent TIER1 evaluation before this signal reported liquidity >= the $30k ceiling.",
+                    ))
+                    already_traded.add(token_id)
+                    log.info("confluence_live.entry_high_liq_skipped", token_id=str(token_id))
+                    continue
+
+                chosen = (token_id, n_cofiring)
+                break
+            if chosen is None:
+                return
+
+            token_id, n_cofiring = chosen
+            token_result = await session.execute(select(Token).where(Token.id == token_id))
+            token = token_result.scalar_one_or_none()
+            if token is None:
+                return
+
+        position_usd = await self._compute_position_usd()
+        if position_usd <= 0:
+            log.warning("confluence_live.entry_failed", token_id=str(token_id), reason="computed position_usd <= 0")
+            return
+        sol_price = Decimal(str(settings.SOL_PRICE_USD))
+        if sol_price <= 0:
+            log.warning("confluence_live.entry_failed", token_id=str(token_id), reason="no SOL price available")
+            return
+
+        log.info("confluence_live.entry_attempted", token_id=str(token_id), symbol=token.symbol,
+                  position_usd=str(position_usd))
+        result = await self._execution.buy(token.mint_address, position_usd, sol_price)
+
+        async with get_session() as session:
+            if not result.success:
+                session.add(ConfluenceLiveTrade(
+                    token_id=token_id, n_rules_cofiring=n_cofiring, status="buy_failed",
+                    entry_time=datetime.now(timezone.utc), entry_price=Decimal("0"),
+                    position_usd=position_usd, error_detail=f"{result.error_type}: {result.error_detail}",
+                ))
+                log.error("confluence_live.entry_failed", token_id=str(token_id), symbol=token.symbol,
+                          error_type=result.error_type, error_detail=result.error_detail)
+                await self._notify("warning", "entry_failed",
+                                    f"Buy failed for {token.symbol}: {result.error_type} — {result.error_detail}")
+                return
+
+            # engine/execution.py's buy() now always sets actual_price on
+            # success (real post-trade balance, or a documented fallback) —
+            # never fall back to position_usd/sol_price here again: that's
+            # a plain SOL amount, not a per-token price, and was the same
+            # class of unit bug this session found and fixed live. Treat a
+            # still-missing actual_price as the execution layer's own bug,
+            # not something to paper over with more wrong math.
+            entry_price = result.actual_price
+            entry_price_unknown = entry_price is None
+            if entry_price_unknown:
+                log.error("confluence_live.entry_price_missing", token_id=str(token_id), symbol=token.symbol,
+                          reason="execution.buy() reported success with no actual_price — this should be unreachable")
+                # 0, not a guess — _check_exit() already treats entry_price<=0
+                # as "can't evaluate an exit", which is the safe behavior
+                # here: the position still gets recorded and monitored, it
+                # just won't get an automated stop/target until someone
+                # looks at it, rather than risking a wrong exit computed
+                # from a made-up price.
+                entry_price = Decimal("0")
+            row = ConfluenceLiveTrade(
+                token_id=token_id, n_rules_cofiring=n_cofiring, status="open",
+                entry_time=datetime.now(timezone.utc), entry_price=entry_price,
+                entry_sol_lamports=int(float(position_usd / sol_price) * 1e9),
+                entry_token_lamports=int(result.actual_amount) if result.actual_amount else None,
+                entry_tx_signature=result.tx_signature, position_usd=position_usd,
+            )
+            session.add(row)
+            await session.flush()  # populate row.id for the notification below
+            trade_id = row.id
+        log.info("confluence_live.entry_filled", token_id=str(token_id), symbol=token.symbol,
+                  tx_signature=result.tx_signature, entry_price=str(entry_price))
+        if entry_price_unknown:
+            await self._notify("critical", "entry_price_missing",
+                                f"Bought {token.symbol} (${position_usd:.2f}) but couldn't determine a real entry "
+                                "price — it won't get an automated exit until this is looked at manually.",
+                                trade_id=trade_id)
+        else:
+            await self._notify("info", "entry_filled",
+                                f"Bought {token.symbol} — ${position_usd:.2f} at ${entry_price:.8f}",
+                                trade_id=trade_id)
+
+    # ── exit — layered stop (2026-09-23) ────────────────────────────────
+
+    def _check_exit(
+        self, entry_price: Decimal, entry_time: datetime, current_price: Decimal, now: datetime,
+        current_floor: Decimal, current_hwm: Decimal,
+    ) -> tuple[str | None, Decimal, Decimal]:
+        """
+        Returns (exit_reason_or_None, new_floor, new_hwm).
+
+        A velocity breaker and settings.HARD_FLOOR_PCT still catch a
+        violent single-tick crash or an emergency below the normal stop.
+        The everyday stop/take-profit split is now
+        engine/trailing_stop.py's staircase instead of a fixed
+        settings.STOP_LOSS_PCT / settings.TAKE_PROFIT_PCT pair: it starts
+        at the same -6% distance below entry, ratchets up in 10% steps as
+        price makes new highs (breakeven once up 10%, more locked each
+        further 10%), and never force-sells a winner just for reaching
+        the old +30% mark — it keeps trailing instead.
+        """
+        if entry_price is None or entry_price <= Decimal("0"):
+            return None, current_floor, current_hwm
+
+        pnl_pct = (current_price - entry_price) / entry_price
+        if pnl_pct <= VELOCITY_BREAKER_PCT:
+            return "HARD_FLOOR", current_floor, max(current_hwm, current_price)
+        hard_floor = Decimal(str(settings.HARD_FLOOR_PCT))
+        if pnl_pct <= hard_floor:
+            return "HARD_FLOOR", current_floor, max(current_hwm, current_price)
+
+        new_floor, new_hwm, should_close = update_trailing_stop(
+            entry_price, current_price, current_floor, current_hwm,
+        )
+        if should_close:
+            reason = "STOP_LOSS" if new_floor <= initial_floor(entry_price) else "TRAILING_STOP"
+            return reason, new_floor, new_hwm
+
+        hold_seconds = (now - entry_time).total_seconds()
+        if hold_seconds >= settings.max_hold_seconds:
+            return "TIME_EXIT", new_floor, new_hwm
+        return None, new_floor, new_hwm
+
+    async def _check_liquidity_guard(self, trade: dict) -> tuple[str | None, Decimal | None]:
+        """
+        Real-executable-liquidity backstop — see this module's constants
+        section and ExecutionEngine.get_sell_quote()'s docstring for the
+        real incident that motivated this (BLK: +19.5% on a stale
+        snapshot, -76.5% on a real quote for the same size). The normal
+        exit logic in _check_exit() only ever looks at the same
+        DexScreener snapshot price the position is being monitored
+        against, so it structurally cannot see this failure mode.
+
+        Returns ("LIQUIDITY_GUARD", real_price) if a real Jupiter quote
+        for the full position size shows either >=35% price impact or an
+        already-worse-than-any-normal-stop real P&L. Returns (None, None)
+        if the check isn't due yet for this trade, the quote failed (never
+        treat a failed check as "safe"), or neither threshold is crossed.
+        """
+        trade_id = trade["id"]
+        now_mono = time.monotonic()
+        last_check = self._last_liquidity_check.get(trade_id)
+        if last_check is not None and (now_mono - last_check) < _LIQUIDITY_CHECK_INTERVAL_S:
+            return None, None
+        self._last_liquidity_check[trade_id] = now_mono
+
+        if not trade.get("entry_token_lamports"):
+            return None, None
+
+        quote = await self._execution.get_sell_quote(trade["mint"], trade["entry_token_lamports"])
+        if quote is None:
+            return None, None
+
+        sol_price = Decimal(str(settings.SOL_PRICE_USD))
+        position_usd = trade.get("position_usd")
+        if sol_price <= 0 or not position_usd:
+            return None, None
+
+        real_proceeds_usd = (Decimal(quote["out_lamports"]) / Decimal("1e9")) * sol_price
+        real_pnl_pct = (real_proceeds_usd / position_usd) - 1
+
+        if quote["price_impact_pct"] >= _LIQUIDITY_CRISIS_IMPACT_PCT or real_pnl_pct <= _LIQUIDITY_CRISIS_PNL_FLOOR_PCT:
+            # Decimals unknown here without a balance lookup — nearly all
+            # pump.fun-originated SPL tokens use 6, same documented
+            # approximation as execution.py's own post-trade-balance
+            # fallback. Informational only: the real sell that follows
+            # sizes itself from entry_token_lamports directly, never this.
+            implied_price = real_proceeds_usd / (Decimal(trade["entry_token_lamports"]) / Decimal(10 ** 6))
+            log.warning("confluence_live.liquidity_crisis_detected", trade_id=str(trade_id),
+                        mint=trade["mint"], price_impact_pct=str(quote["price_impact_pct"]),
+                        real_pnl_pct=str(real_pnl_pct))
+            return "LIQUIDITY_GUARD", implied_price
+
+        return None, None
+
+    async def _maybe_exit(self, trade: dict, current_price: Decimal, now: datetime) -> None:
+        current_floor = trade.get("trailing_stop_floor") or initial_floor(trade["entry_price"])
+        current_hwm = trade.get("high_watermark_price") or trade["entry_price"]
+
+        guard_reason, guard_price = await self._check_liquidity_guard(trade)
+        if guard_reason is not None:
+            # Overrides the snapshot-based decision entirely — the whole
+            # point is that the snapshot price is the thing that's wrong
+            # here, so nothing downstream should keep using it. Floor/hwm
+            # pass through unchanged; the position is about to close.
+            reason, current_price, new_floor, new_hwm = guard_reason, guard_price, current_floor, current_hwm
+        else:
+            reason, new_floor, new_hwm = self._check_exit(
+                trade["entry_price"], trade["entry_time"], current_price, now, current_floor, current_hwm,
+            )
+
+        if reason is None:
+            async with get_session() as session:
+                row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
+                row = row_result.scalar_one_or_none()
+                if row is not None and row.status == "open":
+                    row.trailing_stop_floor = new_floor
+                    row.high_watermark_price = new_hwm
+            return
+
+        if not trade.get("entry_token_lamports"):
+            log.error("confluence_live.exit_failed", trade_id=str(trade["id"]),
+                      reason="no entry_token_lamports recorded — cannot size sell")
+            if trade["id"] not in self._notified_stuck_trades:
+                self._notified_stuck_trades.add(trade["id"])
+                await self._notify("critical", "exit_failed_unsizeable",
+                                    f"{trade.get('symbol') or trade['mint'][:8]} cannot be sold — no recorded "
+                                    "token amount. MANUAL INTERVENTION NEEDED.", trade_id=trade["id"])
+            return
+
+        log.info("confluence_live.exit_attempted", trade_id=str(trade["id"]), reason=reason)
+        result = await self._execution.sell(
+            trade["mint"], Decimal(str(trade["entry_token_lamports"])),
+            trade_id=str(trade["id"]), symbol=trade.get("symbol"),
+        )
+
+        if not result.success:
+            log.error("confluence_live.exit_failed", trade_id=str(trade["id"]),
+                      error_type=result.error_type, error_detail=result.error_detail)
+            # execution.py's sell() already exhausts _MAX_SELL_RETRIES
+            # internally before ever returning failure — this branch IS the
+            # critical, all-retries-exhausted case every time, not a partial
+            # failure. Notify once per trade (see _notified_stuck_trades).
+            if trade["id"] not in self._notified_stuck_trades:
+                self._notified_stuck_trades.add(trade["id"])
+                await self._notify("critical", "exit_failed_critical",
+                                    f"{trade.get('symbol') or trade['mint'][:8]} sell failed after all retries "
+                                    f"({result.error_type}: {result.error_detail}). Position stays open and will "
+                                    "keep retrying — MANUAL INTERVENTION may be needed.", trade_id=trade["id"])
+            async with get_session() as session:
+                row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
+                row = row_result.scalar_one_or_none()
+                if row is not None and row.status == "open":
+                    row.trailing_stop_floor = new_floor
+                    row.high_watermark_price = new_hwm
+            return  # stays 'open' — retried on the next normal cycle, per module docstring
+
+        sol_price = Decimal(str(settings.SOL_PRICE_USD))
+        exit_proceeds_usd = (Decimal(str(result.actual_amount)) / Decimal("1e9")) * sol_price if result.actual_amount else None
+        pnl_usd = (exit_proceeds_usd - trade["position_usd"]) if exit_proceeds_usd is not None else None
+
+        async with get_session() as session:
+            row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
+            row = row_result.scalar_one_or_none()
+            if row is None or row.status != "open":
+                return
+            row.status = "closed"
+            row.exit_time = now
+            row.exit_price = current_price
+            row.exit_reason = reason
+            row.exit_sol_lamports = int(result.actual_amount) if result.actual_amount else None
+            row.exit_tx_signature = result.tx_signature
+            row.pnl_usd = pnl_usd
+            row.trailing_stop_floor = new_floor
+            row.high_watermark_price = new_hwm
+        self._last_accepted_price.pop(trade["id"], None)
+        self._pending_tick.pop(trade["id"], None)
+        self._notified_stuck_trades.discard(trade["id"])
+        pnl_pct = (pnl_usd / trade["position_usd"] * 100) if pnl_usd is not None and trade["position_usd"] else None
+        # LIQUIDITY_GUARD is always critical regardless of pnl sign — it
+        # means the snapshot price this position was being monitored
+        # against had already diverged from reality, which is worth
+        # flagging distinctly from a routine, expected stop.
+        notify_level = "critical" if reason == "LIQUIDITY_GUARD" else ("info" if (pnl_usd or 0) >= 0 else "warning")
+        await self._notify(
+            notify_level, "exit_filled",
+            f"{trade.get('symbol') or trade['mint'][:8]} closed ({reason}): "
+            f"{f'{pnl_pct:+.1f}%' if pnl_pct is not None else 'pnl unknown'}"
+            f"{f', ${pnl_usd:+.2f}' if pnl_usd is not None else ''}",
+            trade_id=trade["id"],
+        )
+        log.info("confluence_live.exit_filled", trade_id=str(trade["id"]), exit_reason=reason,
+                  tx_signature=result.tx_signature, pnl_usd=str(pnl_usd) if pnl_usd is not None else None)
+
+    # ── loading / observation ────────────────────────────────────────────
+
+    async def _load_open_trades(self) -> dict[str, dict]:
+        async with get_session() as session:
+            result = await session.execute(
+                select(
+                    Token.mint_address, Token.symbol, ConfluenceLiveTrade.id,
+                    ConfluenceLiveTrade.entry_price, ConfluenceLiveTrade.entry_time,
+                    ConfluenceLiveTrade.entry_token_lamports, ConfluenceLiveTrade.position_usd,
+                    ConfluenceLiveTrade.trailing_stop_floor, ConfluenceLiveTrade.high_watermark_price,
+                )
+                .join(Token, Token.id == ConfluenceLiveTrade.token_id)
+                .where(ConfluenceLiveTrade.status == "open")
+            )
+            return {
+                mint: dict(id=tid, mint=mint, symbol=symbol, entry_price=ep, entry_time=et,
+                           entry_token_lamports=etl, position_usd=pu,
+                           trailing_stop_floor=floor, high_watermark_price=hwm)
+                for mint, symbol, tid, ep, et, etl, pu, floor, hwm in result.all()
+            }
+
+    async def _record_observation(self, trade_id, price: Decimal, now: datetime) -> None:
+        async with get_session() as session:
+            session.add(ConfluenceLiveObservation(trade_id=trade_id, observed_at=now, price_usd=price))
+
+    # ── bad-tick guard — deliberately duplicated, see module docstring ────
+
+    def _accept_price(self, trade: dict, new_price: Decimal) -> Decimal | None:
+        trade_id = trade["id"]
+        last_price = self._last_accepted_price.get(trade_id, trade["entry_price"])
+        if last_price is None or last_price <= 0:
+            self._last_accepted_price[trade_id] = new_price
+            return new_price
+
+        ratio = new_price / last_price
+        plausible = (Decimal("1") / Decimal(str(IMPLAUSIBLE_TICK_RATIO))) <= ratio <= Decimal(str(IMPLAUSIBLE_TICK_RATIO))
+        pending = self._pending_tick.get(trade_id)
+
+        if plausible:
+            self._pending_tick.pop(trade_id, None)
+            self._last_accepted_price[trade_id] = new_price
+            return new_price
+
+        if pending is not None:
+            confirm_ratio = new_price / pending if pending > 0 else None
+            confirmed = confirm_ratio is not None and (
+                (1 - CONFIRMATION_TOLERANCE) <= confirm_ratio <= (1 + CONFIRMATION_TOLERANCE)
+            )
+            if confirmed:
+                log.warning("confluence_live.implausible_tick_confirmed", trade_id=str(trade_id), price=str(new_price))
+                self._pending_tick.pop(trade_id, None)
+                self._last_accepted_price[trade_id] = new_price
+                return new_price
+            self._pending_tick.pop(trade_id, None)
+
+        log.warning("confluence_live.implausible_tick_held", trade_id=str(trade_id),
+                    last_price=str(last_price), new_price=str(new_price))
+        self._pending_tick[trade_id] = new_price
+        return None
+
+    # ── DexScreener fetch — same source/parsing as TradeMonitorWorker ─────
+
+    async def _fetch(self, client: httpx.AsyncClient, mints: list[str]) -> dict[str, dict]:
+        resp = await self._http.submit(client.get, f"{_DEXSCREENER_BASE}/{','.join(mints)}")
+        if resp.status_code == 429:
+            log.warning("confluence_live.rate_limited")
+            return {}
+        resp.raise_for_status()
+        data = resp.json()
+        pairs_by_mint: dict[str, list[dict]] = {}
+        for pair in data.get("pairs") or []:
+            mint = (pair.get("baseToken") or {}).get("address")
+            if mint in mints:
+                pairs_by_mint.setdefault(mint, []).append(pair)
+        result: dict[str, dict] = {}
+        for mint, pairs in pairs_by_mint.items():
+            pair = _best_pair(pairs)
+            if not pair:
+                continue
+            price = pair.get("priceUsd")
+            if price is None:
+                continue
+            result[mint] = {"price_usd": Decimal(str(price))}
+        return result

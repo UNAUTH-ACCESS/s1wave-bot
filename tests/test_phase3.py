@@ -28,6 +28,7 @@ import uuid
 import pytest
 from sqlalchemy import select
 
+from config.settings import settings
 from filters.tier1 import (
     RejectionReason,
     Tier1Result,
@@ -115,6 +116,15 @@ class TestTier1FullPass:
 # ── Constraint 1: Liquidity ───────────────────────────────────────────────────
 
 class TestLiquidityConstraint:
+    """Pins TIER1_MIN_LIQUIDITY_USD to a known value for the duration of
+    this class so the boundary logic itself is verified regardless of
+    whatever production's current threshold happens to be (it drifted
+    from this file's original assumption of 20000 to the current
+    12000 default at some point without these tests being updated)."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_threshold(self, monkeypatch):
+        monkeypatch.setattr(settings, "TIER1_MIN_LIQUIDITY_USD", 20000.0)
 
     def test_exact_minimum_passes(self):
         token = make_token(liquidity_usd=Decimal("20000.00"))
@@ -161,6 +171,15 @@ class TestMarketCapConstraint:
 # ── Constraint 3: Token age ───────────────────────────────────────────────────
 
 class TestTokenAgeConstraint:
+    """Pins TIER1_MIN_AGE_MINUTES to a known value (5) for this class — the
+    same drift as TestLiquidityConstraint's threshold: production's actual
+    default is now 0 (no minimum at all, per the S1 Wave "enter before
+    burst confirmation" design), so these boundary tests must supply their
+    own known threshold rather than assume production's current value."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_threshold(self, monkeypatch):
+        monkeypatch.setattr(settings, "TIER1_MIN_AGE_MINUTES", 5)
 
     def _token_at_age(self, age_minutes: float) -> tuple[Token, datetime]:
         now = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -268,29 +287,17 @@ class TestFreezeAuthorityConstraint:
         assert result.rejection_reason == RejectionReason.FREEZE_AUTHORITY_NOT_RENOUNCED
 
 
-# ── Constraint 6: LP locked / burned ─────────────────────────────────────────
-
-class TestLPConstraint:
-
-    def test_lp_locked_passes(self):
-        token = make_token(lp_locked_burned=True)
-        assert run_tier1_filter(token).passed is True
-
-    def test_lp_not_locked_fails(self):
-        token = make_token(lp_locked_burned=False)
-        result = run_tier1_filter(token)
-        assert result.passed is False
-        assert result.rejection_reason == RejectionReason.LP_NOT_LOCKED_OR_BURNED
-
-    def test_none_lp_fails_safely(self):
-        """None = couldn't verify = reject."""
-        token = make_token(lp_locked_burned=None)
-        result = run_tier1_filter(token)
-        assert result.passed is False
-        assert result.rejection_reason == RejectionReason.MISSING_LP_DATA
+# LP locked/burned is no longer a run_tier1_filter() constraint — removed
+# when enrichment_worker.py started hardcoding lp_locked_burned=True for
+# every token (pump.fun's graduation protocol guarantees LP burn, so it's
+# no longer independently checked here). RejectionReason.LP_NOT_LOCKED_
+# OR_BURNED / MISSING_LP_DATA remain in the enum only for historical rows
+# already written under the old constraint. TestLPConstraint (3 tests
+# asserting lp_locked_burned=False/None reject) removed 2026-09-23 — it
+# tested a check that no longer exists.
 
 
-# ── Constraint 7: Wash multiplier ─────────────────────────────────────────────
+# ── Constraint 6 (was 7): Wash multiplier ─────────────────────────────────────
 
 class TestWashMultiplierConstraint:
     """
@@ -331,8 +338,14 @@ class TestWashMultiplierConstraint:
 class TestShortCircuit:
     """
     When multiple constraints fail, the first one in evaluation order is reported.
-    Order: liquidity → market_cap → age → mint_auth → freeze_auth → lp → wash
+    Order: liquidity → market_cap → age → mint_auth → freeze_auth → wash
+    (LP is no longer a separate constraint — see the note above
+    TestWashMultiplierConstraint.)
     """
+
+    @pytest.fixture(autouse=True)
+    def _pin_age_threshold(self, monkeypatch):
+        monkeypatch.setattr(settings, "TIER1_MIN_AGE_MINUTES", 5)
 
     def test_liquidity_fails_before_market_cap(self):
         token = make_token(
@@ -369,36 +382,48 @@ class TestShortCircuit:
         result = run_tier1_filter(token)
         assert result.rejection_reason == RejectionReason.MINT_AUTHORITY_NOT_RENOUNCED
 
-    def test_freeze_auth_fails_before_lp(self):
+    def test_freeze_auth_fails_before_wash(self):
         token = make_token(
             freeze_authority_renounced=False,  # fails constraint 5
-            lp_locked_burned=False,            # would fail constraint 6
+            wash_multiplier=Decimal("9.9999"), # would fail constraint 6
         )
         result = run_tier1_filter(token)
         assert result.rejection_reason == RejectionReason.FREEZE_AUTHORITY_NOT_RENOUNCED
-
-    def test_lp_fails_before_wash(self):
-        token = make_token(
-            lp_locked_burned=False,            # fails constraint 6
-            wash_multiplier=Decimal("9.9999"), # would fail constraint 7
-        )
-        result = run_tier1_filter(token)
-        assert result.rejection_reason == RejectionReason.LP_NOT_LOCKED_OR_BURNED
 
 
 # ── Tier1Worker DB writes ─────────────────────────────────────────────────────
 
 class TestTier1WorkerDBWrites:
+    """
+    Rewritten 2026-09-23: Tier1Worker was fully rewritten at some point from
+    a Token-row-based design (fetch by mint, evaluate via run_tier1_filter(),
+    write REJECTED/WATCHING) to a dict-based one (filters.tier1_worker.
+    Tier1Worker._evaluate(t) — a raw dict pushed by DiscoveryWorker, no DB
+    read first, its own inline threshold checks, no dependency on
+    filters/tier1.py or RejectionReason at all). The old tests called a
+    method (_evaluate_one) that no longer exists and asserted a REJECTED
+    DB write that no longer happens (a hard-gate failure is now log-only —
+    see _reject() — the token row, if any, is simply left untouched).
+    These replacements exercise the real current behavior.
+    """
+
+    def _passing_dict(self, mint: str, **overrides) -> dict:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        defaults = dict(
+            mint=mint, symbol="TEST", name="Test Token",
+            pool_created_at_ms=now_ms - 30 * 60_000,  # 30 min old
+            liquidity_usd=Decimal("25000.00"), market_cap_usd=Decimal("50000.00"),
+            mint_authority=None, freeze_authority=None,
+            lp_burn=100, buys=40, sells=20,
+        )
+        defaults.update(overrides)
+        return defaults
 
     @pytest.mark.asyncio
     async def test_passing_token_advances_to_watching(self, session):
         from filters.tier1_worker import Tier1Worker
 
-        now = datetime.now(timezone.utc)
-        token = make_token(discovered_at=now - timedelta(minutes=30))
-        session.add(token)
-        await session.flush()
-
+        mint = "MintPASSAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         filter_q = asyncio.Queue()
         sampling_q = asyncio.Queue()
         shutdown = asyncio.Event()
@@ -407,23 +432,24 @@ class TestTier1WorkerDBWrites:
         with patch("filters.tier1_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await worker._evaluate_one(token.mint_address)
+            await worker._evaluate(self._passing_dict(mint))
 
-        result = await session.execute(
-            select(Token).where(Token.mint_address == token.mint_address)
-        )
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
         updated = result.scalar_one()
         assert updated.status == TokenStatus.WATCHING
         assert updated.watch_started_at is not None
 
     @pytest.mark.asyncio
-    async def test_failing_token_advanced_to_rejected(self, session):
+    async def test_failing_token_is_written_as_observing_control_group(self, session):
+        """A hard-gate failure is no longer dropped outright — it becomes
+        the control group: written as OBSERVING (not REJECTED — there is
+        no REJECTED write at this layer anymore) and still pushed to
+        sampling_queue so sampling_worker can sample it for a short,
+        bounded window (settings.OBSERVE_WINDOW_SECONDS) before it's
+        eventually aged out. See Tier1Worker._reject()."""
         from filters.tier1_worker import Tier1Worker
 
-        token = make_token(lp_locked_burned=False)  # will fail constraint 6
-        session.add(token)
-        await session.flush()
-
+        mint = "MintFAILAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         filter_q = asyncio.Queue()
         sampling_q = asyncio.Queue()
         shutdown = asyncio.Event()
@@ -432,50 +458,45 @@ class TestTier1WorkerDBWrites:
         with patch("filters.tier1_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await worker._evaluate_one(token.mint_address)
+            await worker._evaluate(self._passing_dict(mint, liquidity_usd=Decimal("100.00")))
 
-        result = await session.execute(
-            select(Token).where(Token.mint_address == token.mint_address)
-        )
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
         updated = result.scalar_one()
-        assert updated.status == TokenStatus.REJECTED
-        assert updated.rejection_reason == RejectionReason.LP_NOT_LOCKED_OR_BURNED.value
+        assert updated.status == TokenStatus.OBSERVING
+        assert updated.watch_started_at is None  # never eligible to trade
+        assert sampling_q.qsize() == 1
 
     @pytest.mark.asyncio
     async def test_passing_token_pushed_to_sampling_queue(self, session):
         from filters.tier1_worker import Tier1Worker
 
-        now = datetime.now(timezone.utc)
-        token = make_token(discovered_at=now - timedelta(minutes=30))
-        session.add(token)
-        await session.flush()
-
+        mint = "MintQUEUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         filter_q = asyncio.Queue()
         sampling_q = asyncio.Queue()
         shutdown = asyncio.Event()
         worker = Tier1Worker(filter_q, sampling_q, shutdown)
+        t = self._passing_dict(mint)
 
         with patch("filters.tier1_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await worker._evaluate_one(token.mint_address)
+            await worker._evaluate(t)
 
         assert sampling_q.qsize() == 1
-        queued_mint = await sampling_q.get()
-        assert queued_mint == token.mint_address
+        queued = await sampling_q.get()
+        assert queued["mint"] == mint
 
     @pytest.mark.asyncio
-    async def test_already_watching_token_is_skipped(self, session):
-        """Race condition guard — WATCHING tokens are not re-evaluated."""
+    async def test_evaluate_needs_no_preexisting_token_row(self, session):
+        """Unlike the old Token-row-based design, _evaluate() never reads
+        a Token row before deciding pass/fail — it works entirely off the
+        dict DiscoveryWorker handed it. A mint never before seen in the DB
+        evaluates and writes correctly on its own."""
         from filters.tier1_worker import Tier1Worker
 
-        now = datetime.now(timezone.utc)
-        token = make_token(
-            discovered_at=now - timedelta(minutes=30),
-            status=TokenStatus.WATCHING,
-        )
-        session.add(token)
-        await session.flush()
+        mint = "MintNEVERSEENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
+        assert result.scalar_one_or_none() is None  # confirm no pre-existing row
 
         filter_q = asyncio.Queue()
         sampling_q = asyncio.Queue()
@@ -485,15 +506,10 @@ class TestTier1WorkerDBWrites:
         with patch("filters.tier1_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            await worker._evaluate_one(token.mint_address)
+            await worker._evaluate(self._passing_dict(mint))
 
-        # Status unchanged, nothing pushed to sampling queue
-        result = await session.execute(
-            select(Token).where(Token.mint_address == token.mint_address)
-        )
-        updated = result.scalar_one()
-        assert updated.status == TokenStatus.WATCHING
-        assert sampling_q.empty()
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
+        assert result.scalar_one().status == TokenStatus.WATCHING
 
 
 # ── Zero vs None distinction ──────────────────────────────────────────────────
@@ -541,140 +557,133 @@ class TestZeroVsNoneRejection:
 
 class TestConcurrencyRaceCondition:
     """
-    Verifies that SELECT FOR UPDATE prevents double evaluation when both the
-    fast-path queue and the fallback sweep fire on the same token simultaneously.
-
-    Without FOR UPDATE: both coroutines read ENRICHED → both write WATCHING
-    → sampling queue gets the same mint twice → double position risk.
-
-    With FOR UPDATE: one transaction holds the lock, the other sees the
-    already-advanced status and exits cleanly.
+    Rewritten 2026-09-23. The old premise (SELECT FOR UPDATE guarding a
+    Token-row-based Tier1Worker against a fast-path queue and a fallback
+    sweep both firing on the same token) no longer applies: the current
+    dict-based Tier1Worker._evaluate() never reads a Token row or checks
+    its status before evaluating, and DiscoveryWorker's own in-memory
+    `_promoted` set already prevents the same mint from ever being queued
+    to filter_queue twice — there is no "fallback sweep" in the current
+    architecture at all. Calling _evaluate() twice for the same dict WILL
+    push to sampling_queue twice (there is no de-dup at this layer); that
+    is documented here as real, current behavior rather than papered over
+    with a test asserting a guard that doesn't exist.
     """
 
+    def _passing_dict(self, mint: str, **overrides) -> dict:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        defaults = dict(
+            mint=mint, symbol="TEST", name="Test Token",
+            pool_created_at_ms=now_ms - 30 * 60_000,
+            liquidity_usd=Decimal("25000.00"), market_cap_usd=Decimal("50000.00"),
+            mint_authority=None, freeze_authority=None,
+            lp_burn=100, buys=40, sells=20,
+        )
+        defaults.update(overrides)
+        return defaults
+
     @pytest.mark.asyncio
-    async def test_concurrent_evaluations_produce_single_queue_push(self, session):
-        """
-        Two concurrent _evaluate_one calls on the same token must result in
-        exactly one push to the sampling queue, not two.
-        """
+    async def test_repeated_evaluation_of_the_same_mint_upserts_one_row(self, session):
+        """The upsert (on_conflict_do_update by mint_address) means calling
+        _evaluate() twice for the same mint never creates two Token rows —
+        this part of the old safety property does still hold."""
         from filters.tier1_worker import Tier1Worker
 
-        now = datetime.now(timezone.utc)
-        token = make_token(discovered_at=now - timedelta(minutes=30))
-        session.add(token)
-        await session.flush()
+        mint = "MintDUPEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        filter_q = asyncio.Queue()
+        sampling_q = asyncio.Queue()
+        shutdown = asyncio.Event()
+        worker = Tier1Worker(filter_q, sampling_q, shutdown)
+        t = self._passing_dict(mint)
 
+        with patch("filters.tier1_worker.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await worker._evaluate(t)
+            await worker._evaluate(t)
+
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
+        assert len(result.scalars().all()) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_passing_and_a_failing_token_evaluated_together_dont_cross_contaminate(self, session):
+        """A passing token and a failing one, evaluated back to back, must
+        each land in their own correct state — WATCHING+eligible-to-trade
+        for the pass, OBSERVING+control-group for the fail — with no
+        state leaking between the two calls (e.g. via a mutated shared
+        `inputs` dict)."""
+        from filters.tier1_worker import Tier1Worker
+
+        pass_mint = "MintPASS2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        fail_mint = "MintFAIL2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         filter_q = asyncio.Queue()
         sampling_q = asyncio.Queue()
         shutdown = asyncio.Event()
         worker = Tier1Worker(filter_q, sampling_q, shutdown)
 
-        call_count = 0
-        original_get_session = __import__(
-            "filters.tier1_worker", fromlist=["get_session"]
-        ).get_session
-
-        # We simulate the race by running evaluate_one twice concurrently.
-        # In production with a real DB, FOR UPDATE serialises them.
-        # In tests with the mock session we verify the status-check guard
-        # catches the second call after the first has written WATCHING.
         with patch("filters.tier1_worker.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await worker._evaluate(self._passing_dict(pass_mint))
+            await worker._evaluate(self._passing_dict(fail_mint, liquidity_usd=Decimal("100.00")))
 
-            # Run both concurrently
-            await asyncio.gather(
-                worker._evaluate_one(token.mint_address),
-                worker._evaluate_one(token.mint_address),
-            )
-
-        # Exactly one push to the sampling queue
-        assert sampling_q.qsize() == 1
-
-    @pytest.mark.asyncio
-    async def test_rejected_token_not_pushed_to_sampling_queue(self, session):
-        """A failing token must never reach the sampling queue regardless of concurrency."""
-        from filters.tier1_worker import Tier1Worker
-
-        token = make_token(lp_locked_burned=False)
-        session.add(token)
-        await session.flush()
-
-        filter_q = asyncio.Queue()
-        sampling_q = asyncio.Queue()
-        shutdown = asyncio.Event()
-        worker = Tier1Worker(filter_q, sampling_q, shutdown)
-
-        with patch("filters.tier1_worker.get_session") as mock_gs:
-            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
-            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            # Even if called twice (queue + sweep firing together)
-            await asyncio.gather(
-                worker._evaluate_one(token.mint_address),
-                worker._evaluate_one(token.mint_address),
-            )
-
-        assert sampling_q.empty()
+        result = await session.execute(select(Token).where(Token.mint_address == pass_mint))
+        assert result.scalar_one().status == TokenStatus.WATCHING
+        result = await session.execute(select(Token).where(Token.mint_address == fail_mint))
+        assert result.scalar_one().status == TokenStatus.OBSERVING
+        assert sampling_q.qsize() == 2
 
     @pytest.mark.asyncio
-    async def test_gather_error_isolation(self):
-        """
-        If one enrichment data source raises, the others complete normally.
-        The failing source is reported and the token is rejected,
-        but the successful fetches are not cancelled.
-        """
+    async def test_helius_asset_failure_does_not_block_enrichment(self, session):
+        """Real current error-isolation property: a Helius get_asset()
+        failure is caught and logged, token_decimals defaults to 6, and
+        enrichment still completes and writes. Replaces the old 3-way
+        asyncio.gather test — TX analysis was removed entirely (see
+        TestHeliusClient's analyse_transactions stub tests), and DEX/Helius
+        are now fetched sequentially, not concurrently. That old test's
+        dex mock returned None to simulate "one source failed", but None
+        now means "not indexed yet" and triggers a real multi-minute retry
+        loop (5 attempts, 10/20/40/60s delays) — reusing that shape here
+        would make this test extremely slow for no reason, so this uses a
+        real pair instead and fails only the Helius call."""
         from workers.enrichment_worker import EnrichmentWorker
-        from helius.client import HeliusAssetInfo, HeliusTxAnalysis
+        from dexscreener.client import DexTokenDetail, DexPairSnapshot
 
-        dex_completed = False
-        tx_completed = False
-
-        async def slow_dex(mint):
-            nonlocal dex_completed
-            await asyncio.sleep(0.01)
-            dex_completed = True
-            return None  # returns None, not exception
-
-        async def failing_asset(mint):
-            raise ConnectionError("Helius timeout")
-
-        async def slow_tx(mint):
-            nonlocal tx_completed
-            await asyncio.sleep(0.01)
-            tx_completed = True
-            return HeliusTxAnalysis(
-                lp_locked_burned=True, wash_multiplier=1.5,
-                buy_count=30, sell_count=20,
-            )
+        mint = "MintHELIUSFAILAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        token = Token(mint_address=mint, symbol="HF", status=TokenStatus.ENRICHED,
+                      discovered_at=datetime.now(timezone.utc))
+        session.add(token)
+        await session.flush()
 
         mock_dex = AsyncMock()
-        mock_dex.get_token_detail = slow_dex
+        mock_dex.get_token_detail.return_value = DexTokenDetail(
+            token_address=mint, symbol="HF", name="Helius Fail",
+            best_pair=DexPairSnapshot(
+                pair_address="PairHF", base_token_address=mint, base_token_symbol="HF",
+                base_token_name="Helius Fail", price_usd=Decimal("0.001"),
+                liquidity_usd=Decimal("35000"), market_cap_usd=Decimal("70000"),
+                volume_m5_usd=Decimal("5000"), volume_h1_usd=Decimal("20000"),
+                buy_pressure_m5=Decimal("0.65"), buy_pressure_h1=Decimal("0.60"),
+                pair_created_at_ms=1746057600000,
+                txns_m5_buys=65, txns_m5_sells=35, txns_h1_buys=250, txns_h1_sells=150,
+            ),
+        )
         mock_helius = AsyncMock()
-        mock_helius.get_asset = failing_asset
-        mock_helius.analyse_transactions = slow_tx
-
-        rejected_mint = None
-        rejected_reason = None
-
-        async def fake_mark_rejected(mint, reason):
-            nonlocal rejected_mint, rejected_reason
-            rejected_mint = mint
-            rejected_reason = reason
+        mock_helius.get_asset.side_effect = ConnectionError("Helius timeout")
 
         queue = asyncio.Queue()
         shutdown = asyncio.Event()
         worker = EnrichmentWorker(queue, mock_dex, mock_helius, shutdown)
-        worker._mark_rejected = fake_mark_rejected
 
-        await worker._enrich_token("MintRACETESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        with patch("workers.enrichment_worker.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            await worker._enrich_token(mint)
 
-        # Both the DEX and TX fetches completed (not cancelled by asset failure)
-        assert dex_completed is True
-        assert tx_completed is True
-        # Token was rejected due to asset failure
-        assert rejected_mint == "MintRACETESTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        assert "ASSET" in rejected_reason
+        result = await session.execute(select(Token).where(Token.mint_address == mint))
+        updated = result.scalar_one()
+        assert updated.liquidity_usd == Decimal("35000")  # enrichment still completed
+        assert updated.token_decimals == 6  # defaulted rather than fetched
 
 
 # ── RejectionReason codes coverage ────────────────────────────────────────────

@@ -46,27 +46,160 @@ class Settings(BaseSettings):
     TELEGRAM_CHAT_ID: str = ""
 
     # ── SolanaTracker ────────────────────────────────────────────────────────
-    SOLANA_TRACKER_API_KEY: str = ""         # discovery + sampling
-    SOLANA_TRACKER_API_KEY_MONITOR: str = "" # trade monitor (separate rate limit lane)
+    SOLANA_TRACKER_API_KEY: str = ""            # sampling + S1 Wave's price re-check
+    # Discovery's own key/rate-limit lane, isolated from sampling's above.
+    # Previously named SOLANA_TRACKER_API_KEY_MONITOR and used by
+    # TradeMonitorWorker — that worker now uses DexScreener (free, no key)
+    # instead, so this slot was repurposed for discovery. As of 2026-09-21
+    # this holds a genuinely separate SolanaTracker account/key, so
+    # discovery now has real quota separation from sampling, not just a
+    # separate rate-limit queue — see discovery_worker.py.
+    SOLANA_TRACKER_API_KEY_DISCOVERY: str = ""
 
     # ── Execution (Phase 9) ───────────────────────────────────────────────
     PAPER_TRADING: bool = True               # True = simulation only, False = live
     WALLET_PRIVATE_KEY: str = ""             # base58 encoded keypair
     SOLANA_RPC_URL: str = ""                 # Helius HTTP RPC endpoint
-    JUPITER_API_URL: str = "https://quote-api.jup.ag/v6"
+    # 2026-09-24 — found live, during the first real confluence_live trade
+    # attempts: the old quote-api.jup.ag/v6 base is DEAD (curl: connection
+    # failure / HTTP status 000, not a 404 — Jupiter has since moved their
+    # free tier to lite-api.jup.ag). engine/execution.py's _get_quote()
+    # catches any exception and returns None, which the caller reports as
+    # the generic "No route found" — so this looked exactly like "this
+    # token has no liquidity" for every single attempt, when the real cause
+    # was the bot never reaching Jupiter at all. Confirmed real liquidity
+    # and a real route exist for the 3 tokens that failed this way
+    # (verified directly against the new endpoint: a live 200 quote via
+    # "Pump.fun Amm", and the matching /swap endpoint answers real
+    # requests too) before changing this.
+    JUPITER_API_URL: str = "https://lite-api.jup.ag/swap/v1"
     SLIPPAGE_BPS: int = 500                  # 5% slippage tolerance for memecoins
     SOL_PRICE_USD: float = 0.0               # Fallback — updated by heartbeat worker
+
+    # ── Confluence live trading (Phase 16, 2026-09-23) ─────────────────────
+    # A second, fully isolated real-money path for the confluence_entry_v1
+    # strategy alone — never touches PAPER_TRADING, WALLET_PRIVATE_KEY,
+    # CapitalEngine, or the STRONG_BUY/S1_WAVE paths in any way. Defaults
+    # here are deliberately the safest possible values: disabled — do not
+    # raise the percentages/ceilings below without a fresh, explicit
+    # instruction from the user, they are real risk decisions, not tuning
+    # knobs.
+    CONFLUENCE_LIVE_ENABLED: bool = False                    # master kill switch — stays False until the user explicitly arms it
+    CONFLUENCE_LIVE_WALLET_PRIVATE_KEY: str = ""             # dedicated wallet, isolated from WALLET_PRIVATE_KEY
+    # 2026-09-24: equity is now the LIVE on-chain wallet balance, not a
+    # fixed stake figure — see engine/live_equity.py for the full model and
+    # why (the user's own instruction: "$7 deposited -> trade with $7,
+    # $15 deposited -> trade with $15 ... size trades with available
+    # wallet capital"). Fund the wallet with whatever amount you want at
+    # risk; the bot sizes and halts against that real balance automatically,
+    # with no config change needed per deposit.
+    #
+    # Dust floor for the permanent-halt gate (engine/live_equity.py's
+    # is_permanently_halted()) — below this, swap fees/slippage would
+    # dominate any trade, so treat the account as tapped out rather than
+    # attempt an ever-shrinking sequence of sub-dollar trades.
+    CONFLUENCE_LIVE_MIN_TRADEABLE_USD: Annotated[float, Field(gt=0)] = 1.0
+    # 2026-09-24, user's explicit instruction for the first real test run:
+    # "set max loss to $3". Absolute-dollar lifetime cap, independent of the
+    # dust floor above — once ALL-TIME REALIZED LOSS across every closed
+    # confluence_live_trades row reaches this amount, halt PERMANENTLY, same
+    # severity as the dust-floor halt, regardless of how much equity is
+    # still technically in the wallet. This is a real risk decision for a
+    # live test phase, not a tuning knob — do not raise it without a fresh,
+    # explicit instruction.
+    CONFLUENCE_LIVE_MAX_LOSS_USD: Annotated[float, Field(gt=0)] = 3.0
+    # Outer sanity ceiling on a single position, independent of how much
+    # the account has compounded or how much is deposited — NOT the
+    # everyday position size (see CONFLUENCE_LIVE_EXPOSURE_PCT below for
+    # that). A backstop against a mis-sized trade if equity is ever
+    # unexpectedly large, not a number meant to bind in normal operation.
+    CONFLUENCE_LIVE_MAX_POSITION_USD: Annotated[float, Field(gt=0)] = 50.0
+    # Raised from 1 to 3 (2026-09-23) after analysis/sl_tp_and_concurrency_
+    # sweep.py replayed all 200 closed confluence_shadow_positions rows:
+    # one-at-a-time trading only ever captured 15 of 196 real signals (the
+    # rest were skipped as overlapping) and that small, concentrated
+    # sequence was what produced the near-total wipeout found earlier
+    # (a real losing streak landing on a single large bet). Splitting the
+    # same capital across 3 concurrent, proportionally smaller positions
+    # captured 37 signals in the same replay and cut max drawdown from
+    # 99% to 34% — the best point found; 5+ slots captured more signals
+    # but did not reduce drawdown further or improve the final result, so
+    # there's no data-backed case for going wider than 3.
+    #
+    # 2026-09-24: lowered to 1 for the user's first live test run ("single
+    # trade at a time so we confirm it works"), then raised back to 3 the
+    # same day once that was verified end-to-end ("reduce position sizing
+    # so we can run 3 trades at a time") — CONFLUENCE_LIVE_EXPOSURE_PCT
+    # stayed at 2% total, so raising this back to 3 automatically shrinks
+    # each individual trade to ~0.67% of equity (2% / 3), not a separate
+    # change — see that setting's comment for the exact math.
+    CONFLUENCE_LIVE_MAX_CONCURRENT: Annotated[int, Field(ge=1)] = 3
+    # Exposure-percentage sizing (2026-09-23, replacing the earlier fixed-
+    # stake-plus-profit-share formula the same day; 2026-09-24, lowered
+    # 10% -> 2% per the user's instruction "each trade 2% of available
+    # balance" while CONFLUENCE_LIVE_MAX_CONCURRENT was still 1; lowered
+    # again 2% -> 1.5% the same day once MAX_CONCURRENT went back to 3, per
+    # the user's explicit instruction "each trade should be 0.5% now ... so
+    # we can meet up with our research profit factor and not hold the
+    # software back" — i.e. size each individual slot at 0.5% directly,
+    # which at 3 slots means 1.5% total).
+    # Position sizing (engine/live_equity.py's compute_position_usd()):
+    #   equity          = live wallet SOL balance * SOL_PRICE_USD  (2026-09-24)
+    #   total_exposure  = equity * CONFLUENCE_LIVE_EXPOSURE_PCT
+    #   position_usd    = total_exposure / CONFLUENCE_LIVE_MAX_CONCURRENT
+    # i.e. never more than this fraction of CURRENT total capital is at
+    # risk across every open position combined, split evenly across the
+    # concurrent slots — at MAX_CONCURRENT=3, 1.5% total / 3 slots = 0.5%
+    # of equity per trade. This compounds automatically (equity moves with
+    # the wallet's real balance — deposits, withdrawals, and realized P&L
+    # all show up in it for free) without a separate profit-redeployment
+    # knob, and is inherently protective: after a loss, equity is smaller,
+    # so the very next position is automatically smaller too.
+    CONFLUENCE_LIVE_EXPOSURE_PCT: Annotated[float, Field(gt=0, le=1)] = 0.015
+    # Real daily-loss circuit breaker, separate from the paper one
+    # CapitalEngine/RiskEngine already have — halts new live entries for
+    # the rest of the UTC day if today's realized real P&L drops below
+    # this fraction of *today's starting* live equity (see
+    # engine/live_equity.py's is_daily_halted()).
+    CONFLUENCE_LIVE_DAILY_LOSS_LIMIT_PCT: Annotated[float, Field(gt=0, le=1)] = 0.5
+
+    # ── Dashboard auth (2026-09-23) ─────────────────────────────────────────
+    # HTTP Basic Auth in front of the whole api/app.py FastAPI app (dashboard
+    # + every JSON endpoint) — added specifically because the user is about
+    # to open the firewall on settings.API_PORT to the public internet. The
+    # dashboard shows the confluence-live wallet address/balance/trading
+    # activity; it was built as "local use only, no auth" and must not be
+    # left that way once it's internet-reachable. Empty = auth disabled
+    # (matches the original local-only default); set both to require login.
+    DASHBOARD_AUTH_USER: str = ""
+    DASHBOARD_AUTH_PASSWORD: str = ""
 
     # ── Discovery ───────────────────────────────────────────────────────────
     DEXSCREENER_POLL_INTERVAL: Annotated[int, Field(ge=10, le=300)] = 60
     SAMPLE_INTERVAL_SECONDS: Annotated[int, Field(ge=10, le=300)] = 30
 
-    # How long a Tier1-rejected token stays in OBSERVING and keeps getting
-    # sampled for free (piggybacking the same batch call as WATCHING tokens)
-    # before it's written off to REJECTED. Bounded deliberately — this is
-    # the control group, not a second watch list, so it must not grow the
-    # sampling batch without limit.
-    OBSERVE_WINDOW_SECONDS: Annotated[int, Field(ge=30, le=600)] = 90
+    # How long a Tier1-rejected or Scorer-discarded token stays in OBSERVING
+    # and keeps getting sampled for free (piggybacking the same batch call
+    # as WATCHING tokens) before it's written off to REJECTED. Widened from
+    # 90s to 1800s (30min) so peak-return-at-5/15/30-minutes is actually
+    # computable for the control group, not just a near-instant snapshot.
+    # Still hard-bounded (never unlimited) — this is the control group, not
+    # a second watch list, so it must not grow the sampling batch without
+    # limit. It never becomes eligible for WATCH, trading, or alerts
+    # regardless of how long the window is.
+    OBSERVE_WINDOW_SECONDS: Annotated[int, Field(ge=30, le=3600)] = 1800
+
+    # Longer window for tokens flagged by a shadow-evaluation experiment
+    # (see workers/scoring_worker.py's SHADOW_EXPERIMENT_*) — long enough to
+    # support a 1-hour outcome horizon. Deliberately scoped to ONLY
+    # shadow-flagged tokens (a small subset of OBSERVING), not applied
+    # globally, specifically because of the SolanaTracker 20-tokens-per-
+    # request limit discovered during the OBSERVE_WINDOW_SECONDS incident —
+    # sampling_worker now chunks requests so any batch size works
+    # correctly, but a longer window still means more concurrent tokens on
+    # average, so it stays opt-in per-token rather than raising the
+    # default for everyone.
+    SHADOW_OBSERVE_WINDOW_SECONDS: Annotated[int, Field(ge=60, le=7200)] = 3600
 
     # ── Tier 1 hard gate ────────────────────────────────────────────────────
     TIER1_MIN_LIQUIDITY_USD: Annotated[float, Field(gt=0)] = 12_000.0
@@ -90,8 +223,19 @@ class Settings(BaseSettings):
 
     # ── Exit rules ──────────────────────────────────────────────────────────
     # All stored as decimals, e.g. -0.06 = -6%
-    STOP_LOSS_PCT: Annotated[float, Field(le=0)] = -0.06
-    HARD_FLOOR_PCT: Annotated[float, Field(le=0)] = -0.07
+    #
+    # 2026-09-24, widened -6%/-7% -> -12%/-15% per the user's explicit
+    # instruction, after two real live trades both exited within ~1 second
+    # via HARD_FLOOR on what turned out to be ordinary first-second
+    # volatility for a brand-new pump.fun token (real fill P&L came back
+    # to roughly breakeven once the sell confirmed a few seconds later).
+    # STOP_LOSS_PCT itself does NOT drive the actual initial-stop distance
+    # — that's engine/trailing_stop.py's own hardcoded _INITIAL_STOP_PCT,
+    # kept dependency-free on purpose. This field is only used below (the
+    # HARD_FLOOR-must-be-stricter validation) and for display/logging —
+    # keep it equal to trailing_stop.py's constant by hand if either changes.
+    STOP_LOSS_PCT: Annotated[float, Field(le=0)] = -0.12
+    HARD_FLOOR_PCT: Annotated[float, Field(le=0)] = -0.15
     TAKE_PROFIT_PCT: Annotated[float, Field(gt=0)] = 0.30
     MAX_HOLD_HOURS: Annotated[int, Field(ge=1, le=48)] = 6
 

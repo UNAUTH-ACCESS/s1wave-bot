@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>S1Wave — Bot Dashboard</title>
+<title>S1Wave — Confluence Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
@@ -37,6 +37,7 @@
   header {
     display:flex; align-items:center; justify-content:space-between;
     margin-bottom:28px; padding-bottom:18px; border-bottom:1px solid var(--border);
+    flex-wrap: wrap; gap: 12px;
   }
   .logo { display:flex; align-items:center; gap:12px; }
   .logo-mark {
@@ -54,14 +55,18 @@
     font-size:10px; cursor:pointer; transition:all 0.2s; letter-spacing:1px;
   }
   .btn:hover { border-color:var(--accent); color:var(--accent); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.toggle { width:100%; margin-top:12px; padding:9px 14px; font-weight:700; }
+  .btn.toggle.resume { border-color:rgba(255,68,68,.4); color:var(--danger); }
+  .btn.toggle.resume:hover { background:rgba(255,68,68,.08); border-color:var(--danger); }
+  .btn.toggle.pause { border-color:rgba(255,184,0,.4); color:var(--warn); }
+  .btn.toggle.pause:hover { background:rgba(255,184,0,.08); border-color:var(--warn); }
 
-  /* grid */
   .row { display:grid; gap:14px; margin-bottom:14px; }
   .r4 { grid-template-columns:repeat(4,1fr); }
-  .r21{ grid-template-columns:1fr 2fr; }
+  .r2 { grid-template-columns:1fr 1fr; }
   .r1 { grid-template-columns:1fr; }
 
-  /* card */
   .card {
     background:var(--surface); border:1px solid var(--border); border-radius:12px;
     padding:20px; position:relative; overflow:hidden;
@@ -72,8 +77,6 @@
     background:linear-gradient(90deg,transparent,var(--accent),transparent); opacity:0.25;
   }
   @keyframes fi { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
-  .card:nth-child(1){animation-delay:.05s} .card:nth-child(2){animation-delay:.1s}
-  .card:nth-child(3){animation-delay:.15s} .card:nth-child(4){animation-delay:.2s}
 
   .clabel {
     font-family:'Space Mono',monospace; font-size:9px; letter-spacing:2px;
@@ -85,7 +88,6 @@
   }
   .dot { width:6px; height:6px; border-radius:50%; background:var(--accent); }
 
-  /* badge */
   .badge {
     display:inline-flex; align-items:center; gap:6px;
     padding:3px 10px; border-radius:20px;
@@ -98,7 +100,6 @@
   .pulse { width:6px; height:6px; border-radius:50%; background:currentColor; animation:pu 2s infinite; }
   @keyframes pu { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-  /* stat row */
   .sr {
     display:flex; justify-content:space-between; align-items:center;
     padding:5px 0; border-bottom:1px solid var(--border);
@@ -108,45 +109,16 @@
   .sv { font-family:'Space Mono',monospace; font-size:11px; color:var(--bright); font-weight:700; }
   .sv.g { color:var(--accent); } .sv.y { color:var(--warn); } .sv.r { color:var(--danger); }
 
-  /* big number */
-  .bn { font-size:34px; font-weight:800; color:var(--bright); line-height:1; letter-spacing:-1px; }
+  .bn { font-size:30px; font-weight:800; color:var(--bright); line-height:1; letter-spacing:-1px; }
   .bn.g { color:var(--accent); } .bn.r { color:var(--danger); } .bn.y { color:var(--warn); }
   .bu { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); margin-top:4px; margin-bottom:12px; }
 
-  /* perf grid */
   .pg { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
   .pi { background:rgba(0,255,135,.03); border:1px solid var(--border); border-radius:8px; padding:10px; }
   .pil { font-family:'Space Mono',monospace; font-size:9px; color:var(--muted); letter-spacing:1px; margin-bottom:4px; }
   .piv { font-size:18px; font-weight:800; color:var(--bright); letter-spacing:-0.3px; }
   .piv.g{color:var(--accent)} .piv.r{color:var(--danger)} .piv.y{color:var(--warn)}
 
-  /* filter chips */
-  .chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:10px; }
-  .chip {
-    background:rgba(0,255,135,.06); border:1px solid rgba(0,255,135,.2);
-    color:var(--accent2); padding:2px 7px; border-radius:4px;
-    font-family:'Space Mono',monospace; font-size:9px;
-  }
-
-  /* activity */
-  .feed { display:flex; flex-direction:column; gap:5px; max-height:300px; overflow-y:auto; }
-  .feed::-webkit-scrollbar { width:3px; }
-  .feed::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
-  .sig {
-    display:flex; align-items:center; gap:8px; padding:7px 10px;
-    border-radius:6px; background:rgba(255,255,255,.02);
-    border:1px solid var(--border); font-family:'Space Mono',monospace; font-size:10px;
-  }
-  .stype {
-    padding:2px 5px; border-radius:3px; font-size:8px; font-weight:700;
-    letter-spacing:1px; white-space:nowrap;
-  }
-  .stype.e { background:rgba(0,255,135,.15); color:var(--accent); }
-  .stype.s { background:rgba(255,68,68,.1);  color:var(--danger); }
-  .smint { color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .sdim  { color:var(--muted); font-size:9px; }
-
-  /* CB */
   .cb {
     display:flex; align-items:center; gap:8px; padding:8px 12px;
     border-radius:8px; margin-top:10px;
@@ -154,15 +126,8 @@
   }
   .cb.ok     { background:rgba(0,255,135,.05); border:1px solid rgba(0,255,135,.2); color:var(--accent); }
   .cb.paused { background:rgba(255,184,0,.05);  border:1px solid rgba(255,184,0,.2);  color:var(--warn); }
+  .cb.halt   { background:rgba(255,68,68,.05);  border:1px solid rgba(255,68,68,.2);  color:var(--danger); }
 
-  /* open position */
-  .op {
-    background:rgba(0,255,135,.04); border:1px solid rgba(0,255,135,.2);
-    border-radius:8px; padding:12px; margin-top:10px;
-  }
-  .optitle { font-size:10px; font-family:'Space Mono',monospace; color:var(--accent); margin-bottom:8px; }
-
-  /* trades table */
   .tbl { width:100%; border-collapse:collapse; font-family:'Space Mono',monospace; font-size:10px; }
   .tbl th {
     text-align:left; padding:8px 10px; color:var(--muted);
@@ -178,10 +143,56 @@
     padding:2px 5px; border-radius:3px; font-size:8px;
     background:rgba(255,255,255,.05); color:var(--muted);
   }
-  .wb { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:3px; }
-  .wb.w{background:var(--accent)} .wb.l{background:var(--danger)}
+  .tablewrap { overflow-x: auto; }
 
-  /* loading / error */
+  /* Live connection indicator (header) */
+  .livedot { width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; }
+  .livedot.on  { background:var(--accent); box-shadow:0 0 6px var(--accent); animation:pulse2 1.6s ease-in-out infinite; }
+  .livedot.off { background:var(--danger); }
+  @keyframes pulse2 { 0%,100%{opacity:1} 50%{opacity:.35} }
+  .liveind {
+    display:flex; align-items:center; gap:6px;
+    font-family:'Space Mono',monospace; font-size:9px; letter-spacing:1px;
+    color:var(--muted); text-transform:uppercase;
+  }
+
+  /* Notification feed */
+  .notif-list { display:flex; flex-direction:column; gap:6px; max-height:340px; overflow-y:auto; }
+  .notif-row {
+    display:flex; gap:10px; align-items:flex-start; padding:9px 11px;
+    border-radius:8px; font-family:'Space Mono',monospace; font-size:10px; line-height:1.5;
+    border:1px solid var(--border); background:rgba(255,255,255,.015);
+  }
+  .notif-row.info     { border-color:rgba(0,255,135,.2); }
+  .notif-row.warning  { border-color:rgba(255,184,0,.25); background:rgba(255,184,0,.03); }
+  .notif-row.critical { border-color:rgba(255,68,68,.35); background:rgba(255,68,68,.05); }
+  .notif-badge {
+    flex-shrink:0; width:6px; height:6px; border-radius:50%; margin-top:5px;
+  }
+  .notif-row.info .notif-badge     { background:var(--accent); }
+  .notif-row.warning .notif-badge  { background:var(--warn); }
+  .notif-row.critical .notif-badge { background:var(--danger); }
+  .notif-msg { flex:1; color:var(--text); }
+  .notif-time { color:var(--muted); font-size:9px; white-space:nowrap; }
+
+  /* Toast pop-ups for brand-new notifications */
+  #toasts {
+    position:fixed; top:16px; right:16px; z-index:1000;
+    display:flex; flex-direction:column; gap:8px; max-width:360px;
+  }
+  .toast {
+    padding:12px 14px; border-radius:10px; font-family:'Space Mono',monospace;
+    font-size:11px; line-height:1.5; color:var(--bright);
+    background:var(--surface); border:1px solid var(--border);
+    box-shadow:0 8px 24px rgba(0,0,0,.4);
+    animation:toast-in .25s ease-out, toast-out .3s ease-in 5.7s forwards;
+  }
+  .toast.info     { border-left:3px solid var(--accent); }
+  .toast.warning  { border-left:3px solid var(--warn); }
+  .toast.critical { border-left:3px solid var(--danger); }
+  @keyframes toast-in  { from{opacity:0; transform:translateX(24px)} to{opacity:1; transform:translateX(0)} }
+  @keyframes toast-out { to{opacity:0; transform:translateX(24px)} }
+
   .ld {
     display:flex; align-items:center; justify-content:center;
     padding:32px; color:var(--muted); font-family:'Space Mono',monospace;
@@ -198,14 +209,22 @@
     padding:10px; background:rgba(255,68,68,.05);
     border:1px solid rgba(255,68,68,.2); border-radius:6px; margin-top:6px;
   }
+  .empty {
+    color: var(--muted); font-family:'Space Mono',monospace; font-size: 10px;
+    padding: 20px; text-align: center;
+  }
+  .note {
+    font-family:'Space Mono',monospace; font-size: 9px; color: var(--muted);
+    margin-top: 10px; line-height: 1.5;
+  }
 
   @media(max-width:900px){
     .r4{grid-template-columns:repeat(2,1fr)}
-    .r21{grid-template-columns:1fr}
+    .r2{grid-template-columns:1fr}
   }
   @media(max-width:500px){
     .r4{grid-template-columns:1fr}
-    .wrap{padding:12px} .bn{font-size:26px}
+    .wrap{padding:12px} .bn{font-size:24px}
   }
 </style>
 </head>
@@ -217,43 +236,70 @@
       <div class="logo-mark">S1</div>
       <div>
         <div class="logo-name">S1Wave</div>
-        <div class="logo-sub">Solana Trading Bot</div>
+        <div class="logo-sub">confluence_entry_v1</div>
       </div>
     </div>
     <div class="hdr-right">
+      <span class="liveind" id="liveind"><span class="livedot" id="livedot"></span><span id="livetext">connecting</span></span>
       <span class="ts" id="ts">—</span>
       <button class="btn" onclick="loadAll()">↻ REFRESH</button>
     </div>
   </header>
 
-  <!-- Row 1: 4 status cards -->
+  <div id="toasts"></div>
+
+  <!-- Row 1: 4 status cards — fixed .card wrappers, only their inner HTML is
+       ever replaced (see renderStatusCards). Recreating the .card element
+       itself on every ~1s SSE tick replayed its fade-in opacity animation
+       forever, which was the dashboard's main "flicker" complaint. -->
   <div class="row r4" id="r1">
-    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
-    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
-    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
-    <div class="card"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="statArmed"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="statEquity"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="statPositions"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="statShadow"><div class="ld"><div class="sp"></div>Loading</div></div>
   </div>
 
-  <!-- Row 2: Performance + Activity -->
-  <div class="row r21">
+  <!-- Row 2: Shadow performance + safety gates -->
+  <div class="row r2">
     <div class="card" id="perf"><div class="ld"><div class="sp"></div>Loading</div></div>
-    <div class="card" id="act"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="gates"><div class="ld"><div class="sp"></div>Loading</div></div>
   </div>
 
-  <!-- Row 3: Trades table -->
+  <!-- Row 3: Equity curve -->
   <div class="row r1">
-    <div class="card" id="trades"><div class="ld"><div class="sp"></div>Loading</div></div>
+    <div class="card" id="curve"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 4: Open positions — dedicated, diffed panel (see renderOpenPositions).
+       Rows are created once per trade and only their price/P&L cells are
+       patched in place every SSE tick, so the table never flashes or loses
+       your place while it's live. -->
+  <div class="row r1">
+    <div class="card" id="openpositions"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 4b: Trade history (closed) — 30s poll only, not SSE-driven. -->
+  <div class="row r1">
+    <div class="card" id="livetrades"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 4b: In-app notifications -->
+  <div class="row r1">
+    <div class="card" id="notifs"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
+  <!-- Row 5: Recent shadow closes -->
+  <div class="row r1">
+    <div class="card" id="shadowtrades"><div class="ld"><div class="sp"></div>Loading</div></div>
   </div>
 
 </div>
 <script>
-// ── CONFIG ─────────────────────────────────────────────────────────
-// Change this to your server IP if accessing remotely
-// e.g. const BASE = 'http://139.162.181.164:8000'
 const BASE = '';
-
 const get = path => fetch(BASE + path).then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
 
+const pct = x => x === null || x === undefined ? '—' : (x*100).toFixed(1) + '%';
+const usd = x => x === null || x === undefined ? '—' : '$' + Number(x).toFixed(2);
 const ago = s => {
   if (!s) return '—';
   const d = Math.floor((Date.now() - new Date(s)) / 1000);
@@ -262,215 +308,452 @@ const ago = s => {
   if (d < 86400) return Math.floor(d/3600) + 'h ago';
   return Math.floor(d/86400) + 'd ago';
 };
-const short = m => m ? m.slice(0,6)+'…'+m.slice(-4) : '—';
-const pc = (v, pos='tp', neg='tn') => parseFloat(v) >= 0 ? pos : neg;
+const short = (s, n=10) => s ? (s.length > n ? s.slice(0,n)+'…' : s) : '—';
 
-// ── ROW 1: STATUS ──────────────────────────────────────────────────
-async function loadStatus() {
-  const r1 = document.getElementById('r1');
+let lastShadow = {};
+
+function renderStatusCards(status, shadow) {
+  shadow = shadow || lastShadow || {};
+  const armed = status.enabled;
+  const c1 = `
+    <div class="clabel">Live Switch</div>
+    <span class="badge ${armed ? 'running' : 'paused'}"><span class="pulse"></span>${armed ? 'ARMED' : 'DISABLED'}</span>
+    <div class="bn ${status.wallet_sol ? 'g' : ''}">${status.wallet_sol !== null ? status.wallet_sol.toFixed(4) : '—'}</div>
+    <div class="bu">SOL IN WALLET (${usd(status.wallet_usd)})</div>
+    <div class="sr"><span class="sl">ADDRESS</span><span class="sv">${status.wallet_address ? short(status.wallet_address, 14) : '—'}</span></div>
+    <div class="sr"><span class="sl">SOL PRICE</span><span class="sv">${usd(status.sol_price_usd)}</span></div>
+    <button class="btn toggle ${armed ? 'pause' : 'resume'}" id="toggleBtn" onclick="toggleTrading(${!armed})">
+      ${armed ? '⏸ PAUSE TRADING' : '▶ RESUME TRADING'}
+    </button>
+  `;
+
+  const pnlClass = parseFloat(status.all_time_realized_pnl_usd) > 0 ? 'g' : parseFloat(status.all_time_realized_pnl_usd) < 0 ? 'r' : '';
+  const c2 = `
+    <div class="clabel">Equity</div>
+    <div class="bn ${pnlClass}">${usd(status.equity_usd)}</div>
+    <div class="bu">LIVE WALLET BALANCE — SIZES EVERY TRADE</div>
+    <div class="sr"><span class="sl">ALL-TIME P&amp;L</span><span class="sv ${pnlClass}">${usd(status.all_time_realized_pnl_usd)}</span></div>
+    <div class="sr"><span class="sl">TODAY P&amp;L</span><span class="sv">${usd(status.today_realized_pnl_usd)}</span></div>
+  `;
+
+  const c3 = `
+    <div class="clabel">Live Positions</div>
+    <div class="bn">${status.open_trades} <span style="font-size:16px;color:var(--muted)">/ ${status.max_concurrent}</span></div>
+    <div class="bu">OPEN / MAX CONCURRENT SLOTS</div>
+    <div class="sr"><span class="sl">EXPOSURE</span><span class="sv">${pct(status.exposure_pct)} of equity</span></div>
+    <div class="sr"><span class="sl">CLOSED TOTAL</span><span class="sv">${status.closed_trades}</span></div>
+  `;
+
+  const wr = shadow.win_rate;
+  const wrClass = wr > 0.5 ? 'g' : wr < 0.5 ? 'r' : '';
+  const c4 = `
+    <div class="clabel">Shadow Benchmark (paper)</div>
+    <div class="bn ${wrClass}">${pct(wr)}</div>
+    <div class="bu">WIN RATE · ${shadow.closed} CLOSED, ${shadow.open} OPEN</div>
+    <div class="sr"><span class="sl">RUG RATE</span><span class="sv r">${pct(shadow.rug_rate)}</span></div>
+    <div class="sr"><span class="sl">MEDIAN TRADE</span><span class="sv g">${pct(shadow.median_pnl_pct)}</span></div>
+  `;
+
+  // Patch each card's contents in place — the .card wrapper elements
+  // themselves (created once in the static HTML) are never touched, so
+  // their fade-in animation never replays on a live tick.
+  document.getElementById('statArmed').innerHTML = c1;
+  document.getElementById('statEquity').innerHTML = c2;
+  document.getElementById('statPositions').innerHTML = c3;
+  document.getElementById('statShadow').innerHTML = c4;
+}
+
+async function loadStatusCards() {
+  const [status, shadow] = await Promise.all([get('/confluence/status'), get('/confluence/shadow/stats')]);
+  lastShadow = shadow;
+  renderStatusCards(status, shadow);
+  return { status, shadow };
+}
+
+function loadPerf(shadow) {
+  const reasons = shadow.exit_reasons || {};
+  const total = Object.values(reasons).reduce((a,b)=>a+b, 0) || 1;
+  const rows = Object.entries(reasons).sort((a,b)=>b[1]-a[1]).map(([k,v]) => `
+    <div class="sr"><span class="sl">${k}</span><span class="sv">${v} <span style="color:var(--muted)">(${(v/total*100).toFixed(0)}%)</span></span></div>
+  `).join('');
+  document.getElementById('perf').innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Shadow performance</div>
+    <div class="pg">
+      <div class="pi"><div class="pil">MEAN (RAW)</div><div class="piv ${shadow.mean_pnl_pct_raw>0?'g':'r'}">${pct(shadow.mean_pnl_pct_raw)}</div></div>
+      <div class="pi"><div class="pil">MEAN (CAPPED +100%)</div><div class="piv ${shadow.mean_pnl_pct_capped>0?'g':'r'}">${pct(shadow.mean_pnl_pct_capped)}</div></div>
+    </div>
+    <div style="margin-top:14px">${rows}</div>
+    <div class="note">Raw mean is skewed by 2 outlier trades whose peak price shows $0 recorded liquidity — a real order wouldn't fill there. Capped mean is the realistic number to trust.</div>
+  `;
+}
+
+function loadGates(status) {
+  const permHalt = status.permanently_halted;
+  const dayHalt = status.daily_halted;
+  document.getElementById('gates').innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Safety gates</div>
+    <div class="sr"><span class="sl">PERMANENT HALT</span><span class="sv ${permHalt?'r':'g'}">${permHalt ? 'TRIGGERED' : 'clear'}</span></div>
+    <div class="sr"><span class="sl">MAX LIFETIME LOSS</span><span class="sv">${usd(status.max_loss_usd)}</span></div>
+    <div class="sr"><span class="sl">DAILY LOSS HALT</span><span class="sv ${dayHalt?'r':'g'}">${dayHalt ? 'TRIGGERED' : 'clear'}</span></div>
+    <div class="sr"><span class="sl">DAILY LOSS LIMIT</span><span class="sv">${usd(status.daily_loss_limit_usd)}</span></div>
+    <div class="cb ${permHalt ? 'halt' : dayHalt ? 'paused' : 'ok'}">
+      ${permHalt ? `⛔ Halted for good — wallet below $${status.min_tradeable_usd} or realized losses hit the $${status.max_loss_usd} cap. A human must re-enable it.`
+        : dayHalt ? '⏸ Daily loss limit hit — paused until next UTC day.'
+        : '✓ All clear — new entries permitted (subject to CONFLUENCE_LIVE_ENABLED).'}
+    </div>
+  `;
+}
+
+async function loadCurve() {
+  const { points } = await get('/confluence/shadow/curve');
+  if (!points.length) {
+    document.getElementById('curve').innerHTML = `<div class="ctitle"><div class="dot"></div>Shadow cumulative P&amp;L (illustrative)</div><div class="empty">No closed positions yet.</div>`;
+    return;
+  }
+  const w = 1200, h = 220, pad = 30;
+  const vals = points.map(p => p.cum_pnl_pct);
+  const min = Math.min(0, ...vals), max = Math.max(0, ...vals);
+  const range = (max - min) || 1;
+  const x = i => pad + (i / (points.length - 1 || 1)) * (w - pad*2);
+  const y = v => h - pad - ((v - min) / range) * (h - pad*2);
+  const path = points.map((p,i) => `${i===0?'M':'L'}${x(i).toFixed(1)},${y(p.cum_pnl_pct).toFixed(1)}`).join(' ');
+  const zeroY = y(0).toFixed(1);
+  const last = points[points.length-1].cum_pnl_pct;
+  const lastRaw = points[points.length-1].cum_pnl_pct_raw;
+  document.getElementById('curve').innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Shadow cumulative P&amp;L (illustrative — straight sum of pnl%, not the real compounding simulation)</div>
+    <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:${h}px" role="img" aria-label="Cumulative shadow pnl percent over time, ending at ${pct(last)}">
+      <line x1="${pad}" y1="${zeroY}" x2="${w-pad}" y2="${zeroY}" stroke="var(--border)" stroke-dasharray="4 4"/>
+      <path d="${path}" fill="none" stroke="${last>=0?'#00FF87':'#FF4444'}" stroke-width="2"/>
+    </svg>
+    <div class="note">${points.length} closed positions · ends at ${pct(last)} cumulative (each trade capped at +100% — see the outlier note above; uncapped raw sum is ${pct(lastRaw)})</div>
+  `;
+}
+
+// ── Open positions — diffed, cell-level updates only ────────────────────
+//
+// This panel used to be rebuilt with a fresh innerHTML on every ~1s SSE
+// tick, same as the closed-trade history below it. Since open positions'
+// price/P&L genuinely change every tick, that meant the entire table (all
+// rows, every column) flashed and reflowed once a second — the dashboard's
+// other big "hard to read" source, alongside the status-card fade-in.
+// Fixed by keeping one real <tr> per open trade id across ticks and only
+// writing new text into its price/P&L cells; rows are created/removed only
+// when a position actually opens or closes.
+const openPositionRows = new Map(); // trade id -> <tr>
+
+function ensureOpenPositionsTable() {
+  let table = document.querySelector('#openpositions table');
+  if (table) return table;
+  document.getElementById('openpositions').innerHTML = `
+    <div class="ctitle" style="justify-content:space-between">
+      <span style="display:flex;align-items:center;gap:8px"><div class="dot"></div>Open positions <span style="color:var(--muted);font-weight:400">— live price, streamed every ~1s</span></span>
+      <button class="btn" id="closeAllBtn" onclick="closeAllPositions()" style="border-color:rgba(255,68,68,.35);color:var(--danger)">⛔ CLOSE ALL</button>
+    </div>
+    <div class="tablewrap"><table class="tbl">
+      <thead><tr><th>Token</th><th>Opened</th><th>Size</th><th>Entry → Current price</th><th>P&amp;L</th><th></th></tr></thead>
+      <tbody id="openpositions-body"></tbody>
+    </table></div>
+  `;
+  return document.querySelector('#openpositions table');
+}
+
+// ── Manual close (2026-09-24) — real, on-chain, irreversible. Always
+// confirms first; disables the clicked button immediately so a slow
+// network can't be double-clicked into two real sell attempts.
+async function closePosition(tradeId, symbol, btn) {
+  if (!confirm(`Close ${symbol || 'this position'} now?\n\nThis sells the full position back to SOL immediately, at whatever the market pays right now. This cannot be undone.`)) return;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
   try {
-    const [h, b] = await Promise.all([get('/health'), get('/balance')]);
-    const mode = false; // false = LIVE, true = PAPER
-    const cb = b.circuit_breaker;
-    const sc = cb.is_paused ? 'paused' : 'running';
-    const modeStr = mode ? "PAPER" : "LIVE";
-
-    r1.innerHTML = `
-      <div class="card">
-        <div class="clabel">Bot Status</div>
-        <div class="badge ${sc}"><span class="pulse"></span>${sc.toUpperCase()}</div>
-        <div class="sr"><span class="sl">VERSION</span><span class="sv">${h.version}</span></div>
-        <div class="sr"><span class="sl">UPTIME</span><span class="sv g">${h.uptime}</span></div>
-        <div class="sr"><span class="sl">TIMESTAMP</span><span class="sv">${ago(h.timestamp)}</span></div>
-      </div>
-
-      <div class="card">
-        <div class="clabel">Balance</div>
-        <div class="bn g">${parseFloat(b.available_balance).toFixed(4)}</div>
-        <div class="bu">SOL AVAILABLE</div>
-        <div class="sr"><span class="sl">TOTAL PNL</span>
-          <span class="sv ${pc(b.total_pnl_usd)}">${parseFloat(b.total_pnl_usd)>=0?'+':''}$${parseFloat(b.total_pnl_usd).toFixed(2)}</span></div>
-        <div class="sr"><span class="sl">RETURN</span>
-          <span class="sv ${pc(b.total_return_pct)}">${parseFloat(b.total_return_pct)>=0?'+':''}${parseFloat(b.total_return_pct).toFixed(2)}%</span></div>
-        <div class="sr"><span class="sl">OPEN POSITIONS</span><span class="sv">${b.open_positions}</span></div>
-      </div>
-
-      <div class="card">
-        <div class="clabel">Today</div>
-        <div class="bn ${pc(b.daily.pnl_usd)}">${parseFloat(b.daily.pnl_usd)>=0?'+':''}$${parseFloat(b.daily.pnl_usd).toFixed(2)}</div>
-        <div class="bu">DAILY PNL</div>
-        <div class="sr"><span class="sl">DATE</span><span class="sv">${b.daily.date_utc}</span></div>
-        <div class="sr"><span class="sl">HALTED</span>
-          <span class="sv ${b.daily.is_halted?'r':'g'}">${b.daily.is_halted?'YES':'NO'}</span></div>
-      </div>
-
-      <div class="card">
-        <div class="clabel">Circuit Breaker</div>
-        <div class="bn ${cb.is_paused?'y':'g'}">${cb.is_paused?'PAUSED':'ACTIVE'}</div>
-        <div class="bu">MODE: ${modeStr}</div>
-        <div class="sr"><span class="sl">CONSEC. LOSSES</span>
-          <span class="sv ${cb.consecutive_losses>=4?'r':cb.consecutive_losses>=2?'y':'g'}">${cb.consecutive_losses}/6</span></div>
-        ${cb.resume_at?`<div class="sr"><span class="sl">RESUMES</span><span class="sv y">${ago(cb.resume_at)}</span></div>`:''}
-        <div class="sr"><span class="sl">CLOSED TRADES</span><span class="sv">${b.closed_trades}</span></div>
-      </div>
-    `;
-  } catch(e) {
-    r1.innerHTML = `<div class="card"><div class="err">Failed to load: ${e.message}<br>Is the bot running on port 8000?</div></div>`;
+    const res = await fetch(BASE + `/confluence/live/trades/${tradeId}/close`, { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    await loadLiveTrades();
+  } catch (e) {
+    alert('Close failed: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Close'; }
   }
 }
 
-// ── PERFORMANCE ────────────────────────────────────────────────────
-async function loadPerf() {
-  const card = document.getElementById('perf');
+async function closeAllPositions() {
+  if (!confirm('Close ALL open positions now?\n\nThis sells every open position back to SOL immediately, one at a time, at whatever the market pays right now. This cannot be undone.')) return;
+  const btn = document.getElementById('closeAllBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Closing…'; }
   try {
-    const s = await get('/stats');
-    if (s.message) {
-      card.innerHTML = `<div class="ctitle"><span class="dot"></span>Trade Performance</div>
-        <div style="color:var(--muted);font-family:'Space Mono',monospace;font-size:11px;padding:20px;text-align:center;">No trades yet</div>`;
-      return;
+    const res = await fetch(BASE + '/confluence/live/close-all', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    if (data.closed < data.total) {
+      const failed = (data.results || []).filter(r => !r.success).map(r => `${r.symbol || r.trade_id}: ${r.error}`).join('\n');
+      alert(`Closed ${data.closed}/${data.total}. Failures:\n${failed}`);
     }
+    await loadLiveTrades();
+  } catch (e) {
+    alert('Close all failed: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⛔ CLOSE ALL'; }
+  }
+}
 
-    const evApprox = s.total_pnl_usd / s.total_trades;
-    const wl = Math.abs(s.avg_pnl_usd); // approximation
+function renderOpenPositions(openLive) {
+  openLive = openLive || [];
+  if (!openLive.length) {
+    openPositionRows.clear();
+    document.getElementById('openpositions').innerHTML = `<div class="ctitle"><div class="dot"></div>Open positions</div><div class="empty">No open positions right now.</div>`;
+    return;
+  }
+  ensureOpenPositionsTable();
+  const body = document.getElementById('openpositions-body');
+  const seen = new Set();
 
-    const filters = [
-      'bp ≥ 0.80', 'wash ≥ 6', 'liq ≥ $20k',
-      'liq < $35k', '1m == 0%', '5m < 80%'
-    ].map(f => `<span class="chip">${f}</span>`).join('');
+  openLive.forEach(t => {
+    seen.add(t.id);
+    const pnl = t.live_pnl_pct;
+    const pnlClass = pnl > 0 ? 'tp' : pnl < 0 ? 'tn' : '';
+    const stale = t.current_price_age_s !== null && t.current_price_age_s > 5;
+    const priceHtml = `$${Number(t.entry_price).toPrecision(4)} → ${t.current_price !== null ? '$'+Number(t.current_price).toPrecision(4) : '—'}${stale ? ' <span style="color:var(--warn)">(stale)</span>' : ''}`;
+    const pnlHtml = pnl !== null ? (pnl>=0?'+':'')+pnl.toFixed(1)+'%' : '—';
 
-    card.innerHTML = `
-      <div class="ctitle"><span class="dot"></span>Trade Performance</div>
-      <div class="pg">
-        <div class="pi">
-          <div class="pil">WIN RATE</div>
-          <div class="piv ${s.win_rate_pct>=40?'g':s.win_rate_pct>=30?'y':'r'}">${s.win_rate_pct}%</div>
-        </div>
-        <div class="pi">
-          <div class="pil">NET PNL</div>
-          <div class="piv ${pc(s.total_pnl_usd)}">${s.total_pnl_usd>=0?'+':''}$${s.total_pnl_usd.toFixed(2)}</div>
-        </div>
-        <div class="pi">
-          <div class="pil">BEST TRADE</div>
-          <div class="piv g">+$${s.best_trade_usd.toFixed(2)}</div>
-        </div>
-        <div class="pi">
-          <div class="pil">WORST TRADE</div>
-          <div class="piv r">$${s.worst_trade_usd.toFixed(2)}</div>
-        </div>
+    let tr = openPositionRows.get(t.id);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${t.symbol || '—'}</td>
+        <td class="cell-opened">${ago(t.entry_time)}</td>
+        <td>$${Number(t.position_usd).toFixed(2)}</td>
+        <td class="cell-price"></td>
+        <td class="cell-pnl"></td>
+        <td><button class="btn" style="padding:4px 10px;font-size:9px;border-color:rgba(255,68,68,.3);color:var(--danger)" onclick="closePosition('${t.id}', '${(t.symbol||'').replace(/'/g,"")}', this)">Close</button></td>
+      `;
+      openPositionRows.set(t.id, tr);
+      body.appendChild(tr);
+    }
+    tr.querySelector('.cell-opened').textContent = ago(t.entry_time);
+    tr.querySelector('.cell-price').innerHTML = priceHtml;
+    const pnlCell = tr.querySelector('.cell-pnl');
+    pnlCell.innerHTML = pnlHtml;
+    pnlCell.className = 'cell-pnl ' + pnlClass;
+  });
+
+  // Drop rows for anything that closed since the last tick.
+  for (const [id, tr] of openPositionRows) {
+    if (!seen.has(id)) {
+      tr.remove();
+      openPositionRows.delete(id);
+    }
+  }
+}
+
+let lastClosedTrades = [];
+
+function renderTradeHistory(closed) {
+  closed = closed || lastClosedTrades || [];
+  if (!closed.length) {
+    document.getElementById('livetrades').innerHTML = `<div class="ctitle"><div class="dot"></div>Trade history (closed)</div><div class="empty">Nothing closed yet.</div>`;
+    return;
+  }
+  const closedTrs = closed.map(t => `
+    <tr>
+      <td>${t.symbol || '—'}</td>
+      <td><span class="etag">${t.status}</span></td>
+      <td>${ago(t.entry_time)}</td>
+      <td>$${Number(t.position_usd).toFixed(2)}</td>
+      <td>${t.exit_reason || '—'}</td>
+      <td class="${parseFloat(t.pnl_usd)>0?'tp':parseFloat(t.pnl_usd)<0?'tn':''}">${t.pnl_usd !== null ? usd(t.pnl_usd) : '—'}</td>
+    </tr>
+  `).join('');
+  document.getElementById('livetrades').innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Trade history (closed) <span style="color:var(--muted);font-weight:400">— real, on-chain trades</span></div>
+    <div class="tablewrap"><table class="tbl">
+      <thead><tr><th>Token</th><th>Status</th><th>Entry</th><th>Size</th><th>Exit reason</th><th>P&amp;L</th></tr></thead>
+      <tbody>${closedTrs}</tbody>
+    </table></div>
+  `;
+}
+
+async function loadLiveTrades() {
+  const [open, closed] = await Promise.all([
+    get('/confluence/live/trades?status=open&limit=20'),
+    get('/confluence/live/trades?status=closed&limit=10'),
+  ]);
+  lastClosedTrades = closed;
+  renderTradeHistory(closed);
+  // Fallback render (no live price yet) — the SSE stream immediately
+  // supersedes this with current_price/live_pnl_pct once connected.
+  renderOpenPositions(open.map(t => ({ ...t, current_price: null, current_price_age_s: null, live_pnl_pct: null })));
+}
+
+async function loadShadowTrades() {
+  const rows = await get('/confluence/shadow/positions?status=closed&limit=15');
+  if (!rows.length) {
+    document.getElementById('shadowtrades').innerHTML = `<div class="ctitle"><div class="dot"></div>Recent shadow closes (paper)</div><div class="empty">Nothing closed yet.</div>`;
+    return;
+  }
+  const trs = rows.map(p => `
+    <tr>
+      <td>${p.symbol || '—'}</td>
+      <td>${ago(p.exit_time)}</td>
+      <td>${p.exit_reason || '—'}</td>
+      <td class="${parseFloat(p.pnl_pct)>0?'tp':'tn'}">${pct(p.pnl_pct)}</td>
+    </tr>
+  `).join('');
+  document.getElementById('shadowtrades').innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Recent shadow closes (paper — never real money)</div>
+    <div class="tablewrap"><table class="tbl">
+      <thead><tr><th>Token</th><th>Closed</th><th>Reason</th><th>P&amp;L %</th></tr></thead>
+      <tbody>${trs}</tbody>
+    </table></div>
+  `;
+}
+
+// ── In-app notifications (2026-09-24) ───────────────────────────────────
+let seenNotifIds = new Set();
+// True only once the REST baseline (30 most recent, see loadNotifications())
+// has actually loaded — NOT flipped by an SSE render. Found live 2026-09-24:
+// the SSE stream's snapshot only carries the last 10 notifications, while
+// the REST endpoint carries 30; connectStream() fires immediately on page
+// load and usually wins the race against the two sequential awaited fetches
+// loadNotifications() sits behind, so its small 10-item list was the one
+// flipping this flag — then the fuller 30-item REST list landed moments
+// later, found up to 20 older notifications missing from that small set,
+// and toasted them as brand-new. Reproduced exactly as "notifications pop
+// back up when I refresh". Gating on the REST baseline specifically means
+// no toast is ever shown until all up-to-30 recent notifications are
+// already recorded in seenNotifIds, however the two sources race.
+let notifsBaselineLoaded = false;
+
+function levelLabel(level) {
+  return level === 'critical' ? '⛔ CRITICAL' : level === 'warning' ? '⚠ WARNING' : 'ℹ INFO';
+}
+
+function showToast(n) {
+  const el = document.createElement('div');
+  el.className = `toast ${n.level}`;
+  el.innerHTML = `<div style="color:var(--muted);font-size:9px;letter-spacing:1px;margin-bottom:4px">${levelLabel(n.level)}</div>${n.message}`;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+let lastNotifKey = null;
+
+function renderNotifications(list) {
+  // The SSE stream re-sends the notification list on every ~1s tick even
+  // when nothing new happened. Rebuilding the whole scrollable list that
+  // often reset its scroll position and caused visible flicker for no
+  // reason — skip the DOM rebuild entirely when the list is unchanged.
+  const key = list.map(n => n.id).join(',');
+  if (key === lastNotifKey) return;
+  lastNotifKey = key;
+
+  if (!list.length) {
+    document.getElementById('notifs').innerHTML = `<div class="ctitle"><div class="dot"></div>Notifications</div><div class="empty">Nothing yet — entries, exits, and any halt will show up here as they happen.</div>`;
+  } else {
+    const rows = list.map(n => `
+      <div class="notif-row ${n.level}">
+        <div class="notif-badge"></div>
+        <div class="notif-msg">${n.message}</div>
+        <div class="notif-time">${ago(n.created_at)}</div>
       </div>
-      <div style="margin-top:14px;">
-        <div class="sr"><span class="sl">TOTAL TRADES</span><span class="sv">${s.total_trades}</span></div>
-        <div class="sr"><span class="sl">WINS / LOSSES</span>
-          <span class="sv"><span style="color:var(--accent)">${s.wins}W</span> / <span style="color:var(--danger)">${s.losses}L</span></span></div>
-        <div class="sr"><span class="sl">AVG PNL/TRADE</span>
-          <span class="sv ${pc(s.avg_pnl_usd)}">${s.avg_pnl_usd>=0?'+':''}$${s.avg_pnl_usd.toFixed(4)}</span></div>
-        <div class="sr"><span class="sl">AVG HOLD</span><span class="sv">${s.avg_hold_human}</span></div>
-      </div>
-      <div style="margin-top:12px;">
-        <div class="clabel" style="margin-bottom:6px;">ACTIVE FILTERS V2</div>
-        <div class="chips">${filters}</div>
-      </div>
+    `).join('');
+    document.getElementById('notifs').innerHTML = `
+      <div class="ctitle"><div class="dot"></div>Notifications</div>
+      <div class="notif-list">${rows}</div>
     `;
-  } catch(e) {
-    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Trade Performance</div><div class="err">${e.message}</div>`;
   }
+
+  // Toast only genuinely NEW notifications — never before the REST baseline
+  // has loaded (see notifsBaselineLoaded's comment for why), and not ones
+  // already toasted from a previous tick.
+  const newOnes = list.filter(n => !seenNotifIds.has(n.id));
+  if (notifsBaselineLoaded) {
+    newOnes.slice().reverse().forEach(showToast);
+  }
+  list.forEach(n => seenNotifIds.add(n.id));
 }
 
-// ── ACTIVITY ───────────────────────────────────────────────────────
-async function loadActivity() {
-  const card = document.getElementById('act');
+async function loadNotifications() {
+  const list = await get('/confluence/notifications?limit=30');
+  renderNotifications(list);
+  // Only now is it safe to start toasting — every recent notification is
+  // guaranteed to be in seenNotifIds by this point, no matter which source
+  // (this call or an earlier/later SSE tick) actually painted the list.
+  notifsBaselineLoaded = true;
+}
+
+// ── Manual arm/disarm button (2026-09-24) ───────────────────────────────
+// Disarming is the safe direction — no confirmation needed. Arming lets the
+// bot spend real money on the next qualifying signal, so it gets one extra
+// explicit confirmation here before the request ever reaches the server.
+async function toggleTrading(nextEnabled) {
+  if (nextEnabled) {
+    const ok = confirm(
+      'Resume LIVE trading?\n\nThe bot will be allowed to enter real, on-chain trades with real money on the next qualifying signal, sized against whatever is currently in the wallet.'
+    );
+    if (!ok) return;
+  }
+  const btn = document.getElementById('toggleBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
   try {
-    const [open, bal] = await Promise.all([get('/trades/open'), get('/balance')]);
-    const cb = bal.circuit_breaker;
-
-    // Recent closed trades as signal proxy
-    const hist = await get('/trades/history?limit=10');
-    const signals = hist.trades.map(t => {
-      const win = parseFloat(t.pnl_usd) > 0;
-      return `
-        <div class="sig">
-          <span class="stype ${win?'e':'s'}">${win?'WIN':'LOSS'}</span>
-          <span class="smint">${short(t.mint)}</span>
-          <span class="sdim">${t.hold_human}</span>
-          <span class="sdim ${win?'tp':'tn'}">${parseFloat(t.pnl_pct)>=0?'+':''}${parseFloat(t.pnl_pct).toFixed(2)}%</span>
-          <span class="sdim">${ago(t.exit_time)}</span>
-        </div>`;
-    }).join('') || `<div style="color:var(--muted);font-family:'Space Mono',monospace;font-size:10px;padding:20px;text-align:center;">No recent trades</div>`;
-
-    const openHTML = open.length ? open.map(p => `
-      <div class="op">
-        <div class="optitle">⚡ OPEN POSITION</div>
-        <div class="sr"><span class="sl">TOKEN</span><span class="sv">${short(p.mint)}</span></div>
-        <div class="sr"><span class="sl">ENTRY</span><span class="sv">$${parseFloat(p.entry_price).toExponential(3)}</span></div>
-        <div class="sr"><span class="sl">HOLD</span><span class="sv">${p.hold_human}</span></div>
-        <div class="sr"><span class="sl">UNREALISED</span>
-          <span class="sv ${p.unrealised_pnl_pct>=0?'g':'r'}">${p.unrealised_pnl_pct>=0?'+':''}${(p.unrealised_pnl_pct||0).toFixed(2)}%</span></div>
-      </div>`).join('') : '';
-
-    card.innerHTML = `
-      <div class="ctitle"><span class="dot"></span>Live Activity</div>
-      <div class="clabel" style="margin-bottom:6px;">RECENT TRADES</div>
-      <div class="feed">${signals}</div>
-      ${openHTML}
-      <div class="cb ${cb.is_paused?'paused':'ok'}">
-        ${cb.is_paused
-          ? `⚠ CB PAUSED — ${cb.consecutive_losses}/6 losses — resumes ${ago(cb.resume_at)}`
-          : `✓ CB ACTIVE — ${cb.consecutive_losses}/6 consecutive losses`}
-      </div>
-    `;
-  } catch(e) {
-    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Live Activity</div><div class="err">${e.message}</div>`;
+    const res = await fetch(BASE + `/confluence/toggle?enabled=${nextEnabled}`, { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadStatusCards();
+  } catch (e) {
+    alert('Failed to update: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
-// ── TRADES TABLE ───────────────────────────────────────────────────
-async function loadTrades() {
-  const card = document.getElementById('trades');
-  try {
-    const d = await get('/trades/history?limit=20');
-    const rows = d.trades.map(t => {
-      const win = parseFloat(t.pnl_usd) > 0;
-      return `<tr>
-        <td><span class="wb ${win?'w':'l'}"></span>${short(t.mint)}</td>
-        <td>${t.symbol||'—'}</td>
-        <td>${t.entry_time ? new Date(t.entry_time).toLocaleString() : '—'}</td>
-        <td>$${parseFloat(t.entry_price).toExponential(3)}</td>
-        <td class="${win?'tp':'tn'}">${parseFloat(t.pnl_usd)>=0?'+':''}$${parseFloat(t.pnl_usd).toFixed(4)}</td>
-        <td class="${win?'tp':'tn'}">${parseFloat(t.pnl_pct)>=0?'+':''}${parseFloat(t.pnl_pct).toFixed(2)}%</td>
-        <td>${t.hold_human}</td>
-        <td><span class="etag">${t.exit_reason||'—'}</span></td>
-      </tr>`;
-    }).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px;">No trades yet</td></tr>`;
-
-    card.innerHTML = `
-      <div class="ctitle">
-        <span class="dot"></span>Recent Trades
-        <span style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted);font-weight:400;margin-left:auto;">${d.total} total</span>
-      </div>
-      <div style="overflow-x:auto;">
-        <table class="tbl">
-          <thead><tr>
-            <th>TOKEN</th><th>SYMBOL</th><th>ENTRY TIME</th>
-            <th>ENTRY PRICE</th><th>PNL USD</th><th>PNL %</th>
-            <th>HOLD</th><th>EXIT</th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-  } catch(e) {
-    card.innerHTML = `<div class="ctitle"><span class="dot"></span>Recent Trades</div><div class="err">${e.message}</div>`;
-  }
+// ── Live stream (2026-09-24) — SSE, ~1s cadence, no-lag view of open
+// positions/equity/notifications. EventSource auto-reconnects on drop; we
+// just reflect connection state visually so "is this actually live" is
+// never a guess.
+function setLiveIndicator(state) {
+  const dot = document.getElementById('livedot');
+  const text = document.getElementById('livetext');
+  dot.className = 'livedot' + (state === 'on' ? ' on' : state === 'off' ? ' off' : '');
+  text.textContent = state === 'on' ? 'live' : state === 'off' ? 'reconnecting…' : 'connecting…';
 }
 
-// ── LOAD ALL ───────────────────────────────────────────────────────
+function connectStream() {
+  const es = new EventSource(BASE + '/confluence/stream');
+  es.onopen = () => setLiveIndicator('on');
+  es.onerror = () => setLiveIndicator('off');  // EventSource retries automatically
+  es.onmessage = (ev) => {
+    setLiveIndicator('on');
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.error) return;
+      renderStatusCards(data.status, lastShadow);
+      loadGates(data.status);
+      renderOpenPositions(data.open_trades);
+      renderNotifications(data.notifications);
+      document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+    } catch (e) { console.error('stream parse error', e); }
+  };
+  return es;
+}
+
 async function loadAll() {
-  document.getElementById('ts').textContent = 'Refreshing…';
-  await Promise.all([loadStatus(), loadPerf(), loadActivity(), loadTrades()]);
-  document.getElementById('ts').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+  try {
+    const { status, shadow } = await loadStatusCards();
+    loadPerf(shadow);
+    loadGates(status);
+    await Promise.all([loadCurve(), loadLiveTrades(), loadShadowTrades(), loadNotifications()]);
+  } catch (e) {
+    console.error(e);
+  }
 }
 
+// Slow-changing panels (shadow benchmark, equity curve, closed-trade
+// history) only need the 30s poll — the SSE stream above already drives
+// everything that changes second-to-second (equity, wallet, open
+// positions with live price, notifications), so it's connected
+// independently and immediately, not gated on the first poll finishing.
 loadAll();
 setInterval(loadAll, 30000);
+connectStream();
 </script>
 </body>
 </html>

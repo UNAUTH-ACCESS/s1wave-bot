@@ -7,6 +7,7 @@ __pycache__/
 .coverage
 *.egg-info/
 bot.log
+bot.log.*
 *.log
 logs/
 *.bak

@@ -214,8 +214,10 @@ class Tier1Worker:
                     discovered_at=now,
                     # watch_started_at deliberately left NULL — this token
                     # was never eligible to trade, so "started watching"
-                    # never happened. sampling_worker uses discovered_at
-                    # for OBSERVING tokens' age-out check instead.
+                    # never happened. sampling_worker uses
+                    # observation_started_at for OBSERVING tokens' age-out
+                    # check instead (set once here, preserved on conflict).
+                    observation_started_at=now,
                     liquidity_usd=t.get("liquidity_usd"),
                     market_cap_usd=t.get("market_cap_usd"),
                     mint_authority_renounced=t.get("mint_authority") is None,

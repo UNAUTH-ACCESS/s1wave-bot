@@ -3,16 +3,29 @@ main.py
 =======
 SolanaBot v3 process entry point.
 
-Architecture (SolanaTracker pipeline):
+Architecture, post-2026-09-23 trim
+-----------------------------------
+The old scorer/S1Wave/CapitalEngine paper-trading pipeline (ScoringWorker,
+CapitalEngine, RiskEngine, S1WaveWorker, TradeMonitorWorker,
+TradeRiskWorker, engine/rolling_window.py) was removed entirely — it was
+the strategy the shadow_trades research found catastrophic (-91.5%
+median). Its old data (trades, shadow_trades, trade_price_observations)
+is left in the database untouched as a historical record; nothing writes
+to those tables anymore. What remains is the one validated, real branch:
+
   DiscoveryWorker  — polls ST /tokens/multi/graduated every 60s
                      → fully-enriched token dicts → filter_queue
   Tier1Worker      — hard gate (liquidity, mcap, age, lp_burn,
                      authorities, wash guard) → sampling_queue
   SamplingWorker   — ST POST /tokens/multi batch every 60s
-                     → TokenSnapshot rows → scoring_queue
-  ScoringWorker    — rolling window scorer → entry_queue
-  CapitalEngine    — position sizing, Jupiter execution → trades
-  RiskEngine       — stop loss / take profit / time exit
+                     → TokenSnapshot rows (also feeds momentum_signal.py
+                     via shared_snapshot.write_snapshot_and_notify)
+  ConfluenceShadowWorker — paper-only, real-time-monitored validation of
+                     the confluence_entry_v1 signal (kept running
+                     alongside the live worker as an ongoing benchmark)
+  ConfluenceLiveWorker   — real, on-chain execution of confluence_entry_v1
+                     via its own dedicated wallet, gated behind
+                     settings.CONFLUENCE_LIVE_ENABLED (default False)
 """
 
 from __future__ import annotations
@@ -34,13 +47,9 @@ log = get_logger(__name__)
 from workers.discovery_worker import DiscoveryWorker
 from filters.tier1_worker import Tier1Worker
 from workers.sampling_worker import SamplingWorker
-from workers.scoring_worker import ScoringWorker
-from engine.capital import CapitalEngine
-from engine.risk import RiskEngine
-from workers.trade_monitor_worker import TradeMonitorWorker
-from workers.trade_risk_worker import TradeRiskWorker
-from workers.s1_wave_worker import S1WaveWorker
 from workers.notification_worker import NotificationWorker
+from workers.confluence_shadow_worker import ConfluenceShadowWorker
+from workers.confluence_live_worker import ConfluenceLiveWorker
 from workers.http_queue import get_http_queue
 
 _shutdown_event = asyncio.Event()
@@ -117,27 +126,6 @@ async def main() -> None:
     log.info("solanabot.starting", version="3.0.0")
     log.info("config.validated", host=settings.API_HOST, port=settings.API_PORT)
 
-    # Validate execution config on startup
-    if not settings.PAPER_TRADING:
-        if not settings.WALLET_PRIVATE_KEY:
-            log.error("startup.missing_wallet_key")
-            return
-        if not settings.SOLANA_RPC_URL:
-            log.error("startup.missing_rpc_url")
-            return
-        try:
-            import base64
-            import base58
-            from solders.keypair import Keypair
-            key_bytes = base58.b58decode(settings.WALLET_PRIVATE_KEY)
-            kp = Keypair.from_bytes(key_bytes)
-            log.info("startup.wallet_loaded", pubkey=str(kp.pubkey())[:16] + "...")
-        except Exception as exc:
-            log.error("startup.wallet_invalid", error=str(exc))
-            return
-    else:
-        log.info("startup.paper_trading_mode")
-
     initial_balance = Decimal(str(settings.INITIAL_BALANCE_USD))
     await init_db(initial_balance=initial_balance)
 
@@ -153,53 +141,36 @@ async def main() -> None:
     # ── Queues ────────────────────────────────────────────────────────────
     filter_queue:   asyncio.Queue = asyncio.Queue()   # discovery -> tier1
     sampling_queue: asyncio.Queue = asyncio.Queue()   # tier1 -> sampling
-    scoring_queue:  asyncio.Queue = asyncio.Queue()   # sampling -> scoring
-    entry_queue:    asyncio.Queue = asyncio.Queue()   # scoring -> capital
-    monitor_queue:  asyncio.Queue = asyncio.Queue()   # trade_monitor -> trade_risk
-    s1_queue:       asyncio.Queue = asyncio.Queue()   # sampling -> s1_wave_worker
 
     # ── Workers ───────────────────────────────────────────────────────────
-    risk = RiskEngine(_shutdown_event)
-
     discovery = DiscoveryWorker(filter_queue, _shutdown_event)
 
     tier1 = Tier1Worker(filter_queue, sampling_queue, _shutdown_event)
 
-    sampling = SamplingWorker(
-        scoring_queue=scoring_queue,
-        shutdown_event=_shutdown_event,
-        s1_queue=s1_queue,
-    )
+    sampling = SamplingWorker(shutdown_event=_shutdown_event)
 
-    scoring = ScoringWorker(scoring_queue, entry_queue, _shutdown_event)
-
-    capital = CapitalEngine(entry_queue, _shutdown_event)
-
-    trade_monitor = TradeMonitorWorker(
-        monitor_queue=monitor_queue,
-        shutdown_event=_shutdown_event,
-        api_key=settings.SOLANA_TRACKER_API_KEY_MONITOR,
-    )
-
-    trade_risk = TradeRiskWorker(
-        monitor_queue=monitor_queue,
-        risk_engine=risk,
-        shutdown_event=_shutdown_event,
-    )
-
-    s1_wave = S1WaveWorker(
-        s1_queue=s1_queue,
-        shutdown_event=_shutdown_event,
-    )
+    confluence_shadow = ConfluenceShadowWorker(shutdown_event=_shutdown_event)
 
     tasks.append(asyncio.create_task(discovery.run(),     name="discovery"))
     tasks.append(asyncio.create_task(tier1.run(),         name="tier1"))
     tasks.append(asyncio.create_task(sampling.run(),      name="sampling"))
-    tasks.append(asyncio.create_task(scoring.run(),       name="scoring"))
-    tasks.append(asyncio.create_task(capital.run(),       name="capital"))
-    tasks.append(asyncio.create_task(s1_wave.run(),        name="s1_wave"))
-    tasks.append(asyncio.create_task(trade_monitor.run(), name="trade_monitor"))
-    tasks.append(asyncio.create_task(trade_risk.run(),    name="trade_risk"))
+    tasks.append(asyncio.create_task(confluence_shadow.run(), name="confluence_shadow"))
+
+    # Real-money confluence_entry_v1 executor (Phase 16, 2026-09-23). Gated
+    # on the dedicated wallet key being configured at all, not on
+    # CONFLUENCE_LIVE_ENABLED — this lets the worker keep monitoring/exiting
+    # any already-open real position even if the kill switch is later
+    # flipped off, rather than abandoning it. With ENABLED=False and zero
+    # open confluence_live_trades rows (the default, safe state until the
+    # user funds the wallet and explicitly arms it), each cycle does
+    # nothing: no entries attempted, no open trades to load, no DexScreener
+    # calls, no execution calls. See workers/confluence_live_worker.py's
+    # module docstring for the full isolation/safety-layer writeup.
+    if settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY:
+        confluence_live = ConfluenceLiveWorker(shutdown_event=_shutdown_event)
+        tasks.append(asyncio.create_task(confluence_live.run(), name="confluence_live"))
+    else:
+        log.info("confluence_live.not_started", reason="CONFLUENCE_LIVE_WALLET_PRIVATE_KEY not configured")
 
     notification = NotificationWorker(_shutdown_event)
     tasks.append(asyncio.create_task(notification.run(), name="notification"))
