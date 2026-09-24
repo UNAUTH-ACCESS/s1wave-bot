@@ -39,14 +39,19 @@ As of 2026-09-24 ~18:30 UTC: wallet ~$6.19, all-time realized P&L ~-$1.27 (see a
 | `api/app.py` | Dashboard backend — status, trades, SSE stream, toggle, manual close(s). |
 | `static/s1wave_dashboard.html` | The dashboard itself. |
 
-## The two live entry filters (as of 2026-09-24)
+## The three live entry filters (as of 2026-09-24)
 
-Both implemented in `workers/entry_filters.py`, checked in order, in both workers, right before a position would open:
+All three implemented in `workers/entry_filters.py`, checked in order, in both workers, right before a position would open:
 
 1. `is_wash_trading_rejected()` — skip if the token's most recent TIER1 evaluation before the signal was a `WASH_TRADING` rejection.
 2. `is_liquidity_too_high()` — skip if that same evaluation reports `liquidity_usd >= $30,000`.
+3. `is_buy_pressure_too_low()` — skip if the triggering MomentumSignalEvent's `buy_pressure < 0.97`. The cleanest, most monotonic discriminator found yet (11.7% vs ~35-44% HARD_FLOOR rate) — pure/synchronous, no DB query, since the value is already on the row both workers query.
 
-Skipped candidates are recorded (`status='wash_skipped'` / `'high_liq_skip'`), not silently dropped, specifically so a future analysis pass can measure whether these filters are actually helping. **Read the module docstring for the full numbers before changing either threshold** — they came from analyzing 262 closed shadow trades against every available metric, not guesses.
+Skipped candidates are recorded (`status='wash_skipped'` / `'high_liq_skip'` / `'low_bp_skip'`), not silently dropped, specifically so a future analysis pass can measure whether each filter is actually helping. **Read the module docstring for the full numbers before changing any threshold** — they came from analyzing the shadow dataset (262, then 304 trades) against every available metric, not guesses.
+
+## Unsellable positions (as of 2026-09-24)
+
+A position whose real sell keeps failing (confirmed real on-chain rejection, e.g. a fully-drained pool — not a bug on our end) gets downgraded from `status='open'` to `status='unsellable'` after `_UNSELLABLE_AFTER_S` (10 min) of continuous failure. This frees its `CONFLUENCE_LIVE_MAX_CONCURRENT` slot for a new trade (`_open_trade_count()` only counts `'open'`) while it keeps being priced and keeps getting real sell attempts every cycle (`_load_open_trades()` includes both). The **only** way out is a real successful sell — never a fabricated close. Surfaced on the dashboard as a red "⛔ STUCK" badge and a separate `unsellable_trades` count on `/confluence/status`, so stuck money is never just invisible. **Known limitation**: the failure-duration clock lives in-process memory, so a service restart resets it for any currently-stuck position — acceptable for now, but worth remembering if a stuck position seems to "reset" after a deploy.
 
 ## Known accounting gap (real, open, low priority but real)
 
