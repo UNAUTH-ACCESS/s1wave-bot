@@ -87,6 +87,20 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
         rpc_url_override=settings.HELIUS_RPC_URL,
     )
+
+    # Read decimals BEFORE selling (the balance still exists) so exit_price
+    # can be computed in real USD-per-whole-token terms afterward — added
+    # 2026-09-24 after finding this method's exit_price was silently using
+    # execution.py's known-wrong-unit sell-side actual_price (SOL-lamports
+    # per raw-token-unit, documented there as "informational only... fix
+    # before anything starts relying on it"). Nothing financial ever read
+    # this field (pnl_usd is computed straight from real on-chain SOL
+    # received, unaffected either way), but a manually-closed trade's
+    # recorded exit_price was showing a nonsense multiple of entry_price
+    # (a real one: $0.0000178 exit vs $0.0000021 entry on a trade that
+    # actually closed near breakeven) — confirmed on Robinhood and FOMOCAT.
+    balance_before_sell = await engine.get_token_balance_raw(mint)
+
     log.info("manual_actions.close_attempted", trade_id=trade_id, symbol=symbol, mint=mint)
     result = await engine.sell(mint, Decimal(str(entry_token_lamports)), trade_id=trade_id, symbol=symbol)
     if not result.success:
@@ -98,6 +112,17 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
     exit_proceeds_usd = (Decimal(str(result.actual_amount)) / Decimal("1e9")) * sol_price_usd if result.actual_amount else None
     pnl_usd = (exit_proceeds_usd - position_usd) if exit_proceeds_usd is not None else None
     now = datetime.now(timezone.utc)
+
+    if exit_proceeds_usd is not None and balance_before_sell is not None:
+        _, decimals = balance_before_sell
+        exit_price = exit_proceeds_usd / (Decimal(str(entry_token_lamports)) / (Decimal(10) ** decimals))
+    else:
+        # Balance lookup failed (rare) — fall back to the documented-wrong-
+        # unit value rather than losing the field entirely; logged clearly
+        # so it's never mistaken for a real, comparable price.
+        exit_price = result.actual_price if result.actual_price else Decimal("0")
+        log.warning("manual_actions.exit_price_unit_fallback", trade_id=trade_id, symbol=symbol,
+                    reason="pre-sell balance lookup unavailable — exit_price is in the wrong unit")
 
     async with get_session() as session:
         row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade_uuid))).scalar_one_or_none()
@@ -112,7 +137,7 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
                                       error="Sold on-chain, but the trade row had already changed status — check manually")
         row.status = "closed"
         row.exit_time = now
-        row.exit_price = result.actual_price if result.actual_price else Decimal("0")
+        row.exit_price = exit_price
         row.exit_reason = "MANUAL_CLOSE"
         row.exit_sol_lamports = int(result.actual_amount) if result.actual_amount else None
         row.exit_tx_signature = result.tx_signature

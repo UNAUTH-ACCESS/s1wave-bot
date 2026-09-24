@@ -76,6 +76,7 @@ async def test_closes_a_real_open_position_and_records_pnl(session):
 
     with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
          patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+        MockEngine.return_value.get_token_balance_raw = AsyncMock(return_value=(500_000_000, 6))
         MockEngine.return_value.sell = AsyncMock(return_value=ExecutionResult(
             success=True, tx_signature="closesig", actual_amount=Decimal("400000"),  # 0.0004 SOL back
         ))
@@ -86,6 +87,41 @@ async def test_closes_a_real_open_position_and_records_pnl(session):
     assert result.tx_signature == "closesig"
     # proceeds = 0.0004 SOL * $116 = $0.0464; cost was $0.05 -> -$0.0036
     assert result.pnl_usd == Decimal("0.0004") * Decimal("116.0") - Decimal("0.05")
+
+    row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+    # exit_price in real USD-per-whole-token terms: proceeds_usd / (raw_amount / 10**decimals)
+    expected_exit_price = (Decimal("0.0004") * Decimal("116.0")) / (Decimal("500000000") / Decimal(10 ** 6))
+    assert row.exit_price == expected_exit_price
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_documented_wrong_unit_price_when_balance_lookup_fails(session):
+    """If the pre-sell balance lookup fails (rare), exit_price falls back to
+    execution.py's documented sell-side actual_price rather than losing the
+    field — pnl_usd is unaffected either way since it never depends on
+    exit_price."""
+    token = make_token(symbol="SI")
+    session.add(token)
+    await session.flush()
+    trade = ConfluenceLiveTrade(
+        token_id=token.id, n_rules_cofiring=2, status="open",
+        entry_time=datetime.now(timezone.utc) - timedelta(hours=1), entry_price=Decimal("0.0001"),
+        entry_token_lamports=500_000_000, position_usd=Decimal("0.05"),
+    )
+    session.add(trade)
+    await session.flush()
+
+    with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
+         patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+        MockEngine.return_value.get_token_balance_raw = AsyncMock(return_value=None)
+        MockEngine.return_value.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="closesig", actual_amount=Decimal("400000"), actual_price=Decimal("0.0008"),
+        ))
+        result = await close_trade_manually(str(trade.id), sol_price_usd=Decimal("116.0"))
+
+    assert result.success is True
+    row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+    assert row.exit_price == Decimal("0.0008")
 
     row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
     assert row.status == "closed"
@@ -166,6 +202,7 @@ async def test_sell_failure_leaves_trade_open_with_real_error(session):
 
     with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
          patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+        MockEngine.return_value.get_token_balance_raw = AsyncMock(return_value=(500_000_000, 6))
         MockEngine.return_value.sell = AsyncMock(return_value=ExecutionResult(
             success=False, error_type="SELL_FAILED_CRITICAL", error_detail="no route",
         ))
