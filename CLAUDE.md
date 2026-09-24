@@ -1,0 +1,79 @@
+# S1Wave — orientation for whoever picks this up next
+
+**If you are an AI model reading this cold: read this whole file before touching anything. This trades real money.**
+
+## Current standing orders (2026-09-24, from the user, still in force until told otherwise)
+
+1. **S1Wave is the priority.** Claude usage resets Monday (2026-09-28) — until then, spend effort here before contentpipe or anything else.
+2. **Goal: make the account profitable and stable by Sept 28.** Not "keep it running" — actually improve the real numbers. Use the live dataset (shadow + live trades) to keep finding and shipping data-backed entry/exit improvements, the same way the wash-trading and liquidity-ceiling filters got built (see "How past improvements got made" below) — that pattern is the playbook, keep running it.
+3. **Keep the ledger accurate and keep reclaiming stranded money.** The rent-auto-reclaim fix (below) must keep working — verify it after any deploy that touches `engine/execution.py` or `engine/manual_actions.py`. See "Known accounting gap" below for a real, still-open imprecision in the displayed P&L.
+4. **Don't run standing background monitors.** Check status on demand (`GET /confluence/status`, `/confluence/live/trades`) instead of a persistent log-tail — burns usage for little benefit. See `/home/solana/.claude/projects/-home-solana/memory/feedback_no_proactive_monitoring.md`.
+5. **Everything must survive a reboot and resume correctly blind.** Confirmed as of 2026-09-24: `s1wave-bot.service` is `enabled` (systemd --user) and `loginctl show-user solana` reports `Linger=yes`, so it starts on boot without a login session. `CONFLUENCE_LIVE_ENABLED` and all thresholds live in `.env`, not just process memory, so a restart preserves the armed/paused state. If you're resuming after a gap: run the "Resuming after a blind period" checklist below before assuming anything about current state.
+
+## What this is
+
+A real-money Solana memecoin trading bot. `workers/confluence_live_worker.py` is the **only** component that can move real funds — dedicated wallet (`CONFLUENCE_LIVE_WALLET_PRIVATE_KEY` in `.env`, public address `7yyvL2cSnnbtxbosL9kdVZbWZLJFpzLKUhYevvxZLmqS` — safe to share; **never echo the private key**). `workers/confluence_shadow_worker.py` runs the exact same entry/exit rules on paper, no money, purely as a larger-sample benchmark for whether the rules have real edge.
+
+Entry signal (`workers/momentum_signal.py`): a >5.3% price move over a trailing 3-minute window, with `n_rules_cofiring >= 2` secondary rules also true at that moment (`workers/entry_filters.py` — see below — then further screens the candidate before it's allowed to actually open).
+
+Dashboard: https://s1wave-solana.duckdns.org/ (Basic Auth `solana`/`DUGqntc_fudiuXxw`) — live SSE stream, Pause/Resume, per-position Close + Close All buttons.
+
+## Real money, right now (verify fresh, don't trust this number as still-current)
+
+As of 2026-09-24 ~18:30 UTC: wallet ~$6.19, all-time realized P&L ~-$1.27 (see accounting gap note below — the real all-in picture is somewhat worse than this field alone suggests), 3 open positions, ~24 closed. Original deposit: exactly 0.09277473 SOL, confirmed on-chain, received 2026-09-24 08:27:31 UTC — the wallet's only-ever deposit.
+
+**Always re-check via the API, never trust a number in this doc or in your own memory of a past conversation**: `GET /confluence/status`, `GET /confluence/live/trades?status=open`.
+
+## Architecture map
+
+| File | Role |
+|---|---|
+| `workers/confluence_live_worker.py` | The only thing that spends real money. Entry, exit, halt gates, notifications. |
+| `workers/confluence_shadow_worker.py` | Paper-trading twin — same rules, no money, bigger sample size. |
+| `workers/momentum_signal.py` + `shared_snapshot.py` | The entry signal itself. |
+| `workers/entry_filters.py` | Two data-backed skip conditions checked before either worker opens a position — **read this file's docstring first**, it has the full analysis behind both filters. |
+| `engine/execution.py` | Real Jupiter swaps (buy/sell), token balance reads, `get_sell_quote()` (read-only liquidity check), `close_token_account()` (auto rent reclaim). |
+| `engine/manual_actions.py` | `close_trade_manually()` — real on-chain sell, backs the dashboard's Close/Close All buttons. |
+| `engine/live_equity.py` | Equity = **live wallet SOL balance only**, deliberately excludes open-position value. This is why "wallet + realized P&L" will never exactly equal a deposit while positions are open — see the balance-reconciliation section of NOTEBOOK.md if this confuses a future session again. |
+| `engine/trailing_stop.py` | The 10%-step trailing-stop staircase. `_INITIAL_STOP_PCT = 0.12` here is the ONLY real enforcement point — `settings.STOP_LOSS_PCT` is a separate, must-match-by-hand field used only for a validator, not actual behavior. |
+| `api/app.py` | Dashboard backend — status, trades, SSE stream, toggle, manual close(s). |
+| `static/s1wave_dashboard.html` | The dashboard itself. |
+
+## The two live entry filters (as of 2026-09-24)
+
+Both implemented in `workers/entry_filters.py`, checked in order, in both workers, right before a position would open:
+
+1. `is_wash_trading_rejected()` — skip if the token's most recent TIER1 evaluation before the signal was a `WASH_TRADING` rejection.
+2. `is_liquidity_too_high()` — skip if that same evaluation reports `liquidity_usd >= $30,000`.
+
+Skipped candidates are recorded (`status='wash_skipped'` / `'high_liq_skip'`), not silently dropped, specifically so a future analysis pass can measure whether these filters are actually helping. **Read the module docstring for the full numbers before changing either threshold** — they came from analyzing 262 closed shadow trades against every available metric, not guesses.
+
+## Known accounting gap (real, open, low priority but real)
+
+`ConfluenceLiveTrade.pnl_usd` = `exit_proceeds_usd - position_usd` (the *intended* entry size), not the real total lamports debited at entry (which is larger by that trade's token-account rent + network fee). Rent gets fully reclaimed on exit (confirmed working, zero stranded accounts as of 2026-09-24), so it's not a permanent loss — but it means the displayed all-time P&L is somewhat rosier than the true all-in cash-flow picture, especially at these tiny (~$0.03-0.04) position sizes where the fixed ~$0.17-0.18 rent cost per new token account is often bigger than the position itself. Full derivation (real on-chain ledger reconciliation, lamport-exact) is in NOTEBOOK.md's 2026-09-24 "balance reconciliation" sections. Not fixed as of this writing — a real, scoped potential improvement if someone wants to take it on, but don't rush a change to this formula without full test coverage; it feeds the halt-threshold math (`CONFLUENCE_LIVE_MAX_LOSS_USD`).
+
+## How past improvements got made (the playbook — repeat this)
+
+1. Pull real closed trades (shadow for volume, live for ground truth) joined against `TokenEvaluation` (TIER1's real inputs: age, liquidity, market cap, lp_burn, wash_multiplier, mint/freeze authority, buy_pressure, volume_mult) and `MomentumSignalEvent` (n_rules_cofiring, trailing_return_3min).
+2. Bucket by each metric, compute rug rate / capped mean (cap each trade at +100% — a couple of historical trades have unrealistic $0-liquidity "peak" prices that inflate a raw mean) / win rate per bucket.
+3. Cross-tab candidate filters against each other before trusting either (a lot of "liquidity" and "LP burn" signal turned out to be the same underlying population — check overlap before claiming two independent filters).
+4. Verify a real quote-level sanity check where possible (a dashboard "current price" can be badly stale — see the BLK incident in NOTEBOOK.md — always cross-check a real Jupiter quote before trusting a DexScreener snapshot for anything action-worthy).
+5. Implement as a narrow, specific, tested skip condition (see `workers/entry_filters.py`'s two functions as the template), never a broad "block everything TIER1 didn't like."
+6. **Watch the status column length.** `ConfluenceLiveTrade.status` and `ConfluenceShadowPosition.status` are `VARCHAR(16)`. A skip-status literal over 16 chars crashed the shadow worker for ~5 minutes the same day the wash-trading filter shipped. Keep new status values short and check `len()` before deploying.
+7. Deploy, then watch the *rate limit*, not just correctness — the liquidity guard's first deploy was checking Jupiter's free-tier API too often (3 positions x one check/20s) and got 100% 429'd for several minutes before anyone noticed it was silently providing zero protection. Real external APIs have real limits; a background check that "should be cheap" can still saturate a shared quota.
+
+## Resuming after a blind period (reboot, crash, long gap)
+
+1. `systemctl --user status s1wave-bot.service` — should be `active`. If not, `systemctl --user start s1wave-bot.service` (should also auto-start on boot given it's enabled + linger is on — investigate why it didn't if you find it stopped after a real reboot).
+2. `curl -s -u solana:DUGqntc_fudiuXxw https://s1wave-solana.duckdns.org/confluence/status` — check `enabled` (armed or paused?), `wallet_usd`, `open_trades`, `permanently_halted`, `daily_halted`. Don't assume any of these match what an old conversation said.
+3. `GET /confluence/live/trades?status=open` — for each open position, get a **real** Jupiter sell quote for its exact `entry_token_lamports` before trusting the dashboard's displayed P&L (see the liquidity-guard/BLK incident — a stale snapshot price can show a fake winner). The guard should be doing this automatically every 60s per position; spot-check it's actually happening (`journalctl --user -u s1wave-bot.service --since "5 min ago" | grep liquidity`) rather than assuming.
+4. Check `journalctl --user -u s1wave-bot.service --since "10 min ago"` for anything alarming (`sell_failed_critical`, repeated `quote_error`/429, `cycle_error`) before doing anything else.
+5. Only then decide whether to keep operating as-is, pause, or intervene on a specific position.
+
+## Testing discipline (keep this up)
+
+237 tests as of 2026-09-24 (`pytest -q` from `/home/solana/s1wave-bot/solanabot`, venv at `.venv`). Every real bug fix and every new filter in this codebase's history has a regression test using **real recorded numbers from the actual incident**, not synthetic round numbers — keep that convention. Run the full suite before every deploy; restart the service (`systemctl --user restart s1wave-bot.service`) after; confirm a clean start (`journalctl --user -u s1wave-bot.service --since "10 sec ago"`) before considering a change shipped.
+
+## Where the rest of the history lives
+
+`/home/solana/NOTEBOOK.md` has the full narrative — every bug, every real number, every decision, in the order it happened, across this and every other project on this machine. This file is the orientation; that file is the record. Update both when you make a real change.
