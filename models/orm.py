@@ -385,21 +385,27 @@ class ShadowTrade(Base):
 
 class MomentumSignalEvent(Base):
     """
-    Analysis-only, forward-tracking shadow experiment for the pump-timing
-    signal found by analysis/pump_timing_research.py and
+    Originally an analysis-only, forward-tracking shadow experiment for the
+    pump-timing signal found by analysis/pump_timing_research.py and
     analysis/pump_signal_quality.py (2026-09-22): a >5.3% price move over
-    a trailing 3-minute window reliably precedes a token's peak. NEVER
-    read by CapitalEngine, RiskEngine, execution.py, or any production
-    decision path — recording a row here changes nothing about what the
-    real bot does. It exists so this signal can be validated
-    PROSPECTIVELY (on tokens discovered from here forward), not just
-    retrospectively, using the token_snapshots the real pipeline already
-    writes.
+    a trailing 3-minute window reliably precedes a token's peak.
+
+    STATUS UPDATE, corrected 2026-09-24 (found stale during a bug audit):
+    this signal was since PROMOTED to be the real production entry trigger
+    when the confluence_entry_v1 pipeline was built. Both
+    workers/confluence_live_worker.py::_maybe_enter() and
+    confluence_shadow_worker.py::_open_new_positions() query this table
+    directly (n_rules_cofiring >= MIN_RULES_COFIRING, triggered_at after
+    worker start) as their candidate source, and confluence_live_worker
+    also reads buy_pressure off this same row for the third entry filter
+    (workers/entry_filters.py::is_buy_pressure_too_low). The "NEVER read
+    by any production decision path" claim that used to be here is FALSE
+    as of this correction — do not trust it, and do not assume writes here
+    are side-effect-free. Outcomes are still derived LATER from
+    token_snapshots by analysis scripts, never stored on this row itself.
 
     One row per (token, experiment_version) — the FIRST time the primary
-    signal fires for that token. Outcomes are always derived LATER from
-    token_snapshots by a future analysis script, never stored here — same
-    convention as shadow_trades.
+    signal fires for that token.
     """
 
     __tablename__ = "momentum_signal_events"
