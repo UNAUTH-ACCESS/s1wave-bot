@@ -135,6 +135,16 @@ async def _build_confluence_status() -> dict:
             select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "closed")
         )).scalar_one()
 
+        # 'unsellable' (2026-09-24) — see confluence_live_worker.py's
+        # _UNSELLABLE_AFTER_S comment: a position whose real sell kept
+        # failing long enough is downgraded here, freeing its concurrency
+        # slot (open_trades below stays exactly 'open'-only, matching what
+        # the worker's own gate counts) while remaining real, tracked
+        # money — surfaced as its own count so it's never just invisible.
+        unsellable_count = (await session.execute(
+            select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "unsellable")
+        )).scalar_one()
+
     wallet_sol: float | None = None
     wallet_error: str | None = None
     wallet_address: str | None = None
@@ -173,6 +183,7 @@ async def _build_confluence_status() -> dict:
         "all_time_realized_pnl_usd": str(all_time_pnl.quantize(Decimal("0.01"))),
         "today_realized_pnl_usd": str(today_pnl.quantize(Decimal("0.01"))),
         "open_trades": open_count,
+        "unsellable_trades": unsellable_count,
         "closed_trades": closed_count,
         "max_concurrent": settings.CONFLUENCE_LIVE_MAX_CONCURRENT,
         "exposure_pct": settings.CONFLUENCE_LIVE_EXPOSURE_PCT,
@@ -196,7 +207,13 @@ async def _build_open_trades_live() -> list[dict]:
         rows = (await session.execute(
             select(ConfluenceLiveTrade, Token.symbol, Token.mint_address)
             .join(Token, Token.id == ConfluenceLiveTrade.token_id)
-            .where(ConfluenceLiveTrade.status == "open")
+            # 'unsellable' included (2026-09-24) — a position whose real
+            # sell kept failing long enough to free its concurrency slot
+            # (see confluence_live_worker.py's _UNSELLABLE_AFTER_S) is
+            # still real, tracked money and must stay visible here, never
+            # silently disappear from the dashboard the moment its slot
+            # frees up. The `status` field lets the frontend badge it.
+            .where(ConfluenceLiveTrade.status.in_(["open", "unsellable"]))
             .order_by(ConfluenceLiveTrade.entry_time.asc())
         )).all()
 
@@ -241,6 +258,7 @@ async def _build_open_trades_live() -> list[dict]:
                 "id": str(t.id),
                 "symbol": symbol,
                 "mint": mint,
+                "status": t.status,
                 "entry_time": t.entry_time.isoformat(),
                 "entry_price": str(t.entry_price),
                 "position_usd": str(t.position_usd),
@@ -806,8 +824,11 @@ def create_app() -> FastAPI:
         if sol_price <= 0:
             raise HTTPException(status_code=503, detail="SOL price not yet available — try again in a moment")
         async with get_session() as session:
+            # 'unsellable' included (2026-09-24) — close-all should try
+            # every real, still-tracked position, not just the ones still
+            # counted against concurrency.
             open_ids = (await session.execute(
-                select(ConfluenceLiveTrade.id).where(ConfluenceLiveTrade.status == "open")
+                select(ConfluenceLiveTrade.id).where(ConfluenceLiveTrade.status.in_(["open", "unsellable"]))
             )).scalars().all()
         results = []
         for trade_id in open_ids:

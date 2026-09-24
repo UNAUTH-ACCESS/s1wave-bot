@@ -32,6 +32,7 @@ coverage here leans hardest on the things that must NEVER fail silently:
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -877,6 +878,180 @@ async def test_failed_sell_leaves_trade_open_for_retry(session, monkeypatch):
     assert row.status == "open"  # NOT closed — must be retried next cycle
     assert row.exit_tx_signature is None
     assert row.pnl_usd is None
+
+
+class TestUnsellablePositions:
+    """
+    Real incident (2026-09-24): SEND's exit failed every retry for 4+
+    minutes straight, and manually retrying at 90% slippage tolerance hit
+    the identical on-chain error — confirming it was never a slippage
+    issue, and a plain "keep retrying forever" would occupy one of
+    CONFLUENCE_LIVE_MAX_CONCURRENT's slots permanently. These tests cover
+    the fix: downgrading to status='unsellable' after
+    confluence_live_worker._UNSELLABLE_AFTER_S of continuous real sell
+    failure, which frees the concurrency slot (_open_trade_count() only
+    ever counts 'open') without ever fabricating a close — the only way
+    out is a real successful sell.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marks_unsellable_after_sustained_failure(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=15), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+        # Simulate this trade having already been failing for longer than
+        # the threshold, rather than sleeping 600s in a test.
+        import workers.confluence_live_worker as mod
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - mod._UNSELLABLE_AFTER_S - 1
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "unsellable"
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_unsellable_before_the_threshold(self, session, monkeypatch):
+        """A sell failing for less time than the threshold stays plain
+        'open' — this is just the existing retry behavior, unaffected."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_unsellable_trades_excluded_from_concurrency_count(self, session):
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        session.add(ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="unsellable",
+            entry_time=datetime.now(timezone.utc), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        ))
+        await session.flush()
+
+        with patch("workers.confluence_live_worker.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            count = await self.worker._open_trade_count()
+
+        assert count == 0  # 'unsellable' must NOT count against CONFLUENCE_LIVE_MAX_CONCURRENT
+
+    @pytest.mark.asyncio
+    async def test_load_open_trades_includes_unsellable(self, session):
+        self.worker = make_worker(session)
+        token = make_token(mint_address="MintUnsellable111111111111111111111")
+        session.add(token)
+        await session.flush()
+        session.add(ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="unsellable",
+            entry_time=datetime.now(timezone.utc), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        ))
+        await session.flush()
+
+        with patch("workers.confluence_live_worker.get_session") as mock_gs:
+            mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
+            mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
+            open_trades = await self.worker._load_open_trades()
+
+        assert token.mint_address in open_trades  # still priced/retried every cycle
+
+    @pytest.mark.asyncio
+    async def test_unsellable_trade_closes_for_real_on_a_later_successful_sell(self, session, monkeypatch):
+        """The ONLY way out of 'unsellable' — a real successful sell,
+        never a fabricated close."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="unsellable",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=20), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="recoveredsig", actual_amount=Decimal("50000000"),  # 0.05 SOL back
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "closed"
+        assert row.exit_tx_signature == "recoveredsig"
+        # proceeds = 0.05 SOL * $150 = $7.50; cost was $10 -> -$2.50
+        assert row.pnl_usd == Decimal("7.50") - Decimal("10.0")
 
 
 class TestExposurePercentageSizing:

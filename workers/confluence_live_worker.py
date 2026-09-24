@@ -183,6 +183,29 @@ _LIQUIDITY_CHECK_INTERVAL_S = 60.0
 _LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
 _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
 
+# Unsellable-position handling (2026-09-24) — real incident: SEND's exit
+# (LIQUIDITY_GUARD, fired 1s after entry into an already-drained pool)
+# failed every retry for 4+ minutes straight with the same on-chain error
+# (Meteora DAMM v2 custom error 6024) — confirmed NOT a slippage issue by
+# manually retrying at 90% slippage tolerance and getting the identical
+# failure, meaning no retry-with-wider-tolerance would ever succeed here.
+# Left as a normal 'open' position, it would occupy one of
+# CONFLUENCE_LIVE_MAX_CONCURRENT's slots FOREVER — at 5 slots, losing even
+# one or two this way permanently cripples real trading capacity, which
+# matters far more than the (usually tiny) position itself. After
+# _UNSELLABLE_AFTER_S of continuous real sell failures, the position is
+# downgraded to status='unsellable': _open_trade_count() only ever counts
+# status=='open', so this immediately frees its concurrency slot for a new
+# trade — while _load_open_trades() still includes it, so it keeps getting
+# priced and keeps getting real sell attempts every cycle, exactly as
+# before. The ONLY way out of 'unsellable' is a REAL successful sell
+# transitioning it straight to 'closed' — never fabricated, per this
+# codebase's standing rule that a close always means a real transaction
+# happened. If the pool never recovers, the position simply stays
+# 'unsellable' indefinitely, visible and honest rather than either eating
+# a slot forever or being silently marked closed with a made-up number.
+_UNSELLABLE_AFTER_S = 600.0
+
 
 class ConfluenceLiveWorker:
     """REAL on-chain execution of the confluence_entry_v1 rule. See module
@@ -213,6 +236,11 @@ class ConfluenceLiveWorker:
         # with dried-up liquidity would flood the feed for as long as it
         # stays stuck.
         self._notified_stuck_trades: set = set()
+        # Unsellable-position tracking (2026-09-24) — trade id -> time.monotonic()
+        # of the FIRST failed sell attempt for that trade (reset to absent
+        # once a sell succeeds or the trade is otherwise no longer open).
+        # See _UNSELLABLE_AFTER_S's comment for why this exists.
+        self._sell_failing_since: dict = {}
         # Liquidity guard state (2026-09-24) — trade id -> time.monotonic()
         # of the last real Jupiter quote check, so it's throttled per-trade
         # rather than per-cycle.
@@ -725,7 +753,7 @@ class ConfluenceLiveWorker:
             async with get_session() as session:
                 row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
                 row = row_result.scalar_one_or_none()
-                if row is not None and row.status == "open":
+                if row is not None and row.status in ("open", "unsellable"):
                     row.trailing_stop_floor = new_floor
                     row.high_watermark_price = new_hwm
             return
@@ -759,13 +787,35 @@ class ConfluenceLiveWorker:
                                     f"{trade.get('symbol') or trade['mint'][:8]} sell failed after all retries "
                                     f"({result.error_type}: {result.error_detail}). Position stays open and will "
                                     "keep retrying — MANUAL INTERVENTION may be needed.", trade_id=trade["id"])
+
+            first_failed_at = self._sell_failing_since.setdefault(trade["id"], time.monotonic())
+            failing_for_s = time.monotonic() - first_failed_at
+
             async with get_session() as session:
                 row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
                 row = row_result.scalar_one_or_none()
-                if row is not None and row.status == "open":
-                    row.trailing_stop_floor = new_floor
-                    row.high_watermark_price = new_hwm
-            return  # stays 'open' — retried on the next normal cycle, per module docstring
+                if row is None or row.status not in ("open", "unsellable"):
+                    return
+                row.trailing_stop_floor = new_floor
+                row.high_watermark_price = new_hwm
+                if row.status == "open" and failing_for_s >= _UNSELLABLE_AFTER_S:
+                    # See _UNSELLABLE_AFTER_S's comment — this frees the
+                    # concurrency slot (_open_trade_count() only counts
+                    # status=='open') without ever fabricating a close; the
+                    # position keeps being priced and keeps getting real
+                    # sell attempts every cycle via _load_open_trades().
+                    row.status = "unsellable"
+                    log.error("confluence_live.marked_unsellable", trade_id=str(trade["id"]),
+                              symbol=trade.get("symbol"), failing_for_s=round(failing_for_s))
+                    await self._notify(
+                        "critical", "marked_unsellable",
+                        f"{trade.get('symbol') or trade['mint'][:8]} could not be sold for "
+                        f"{round(failing_for_s / 60)}+ minutes — freed its trading slot for a new "
+                        "position, but the real position stays open and will keep being retried. "
+                        "Real money is stuck until either a sell succeeds or you close it manually.",
+                        trade_id=trade["id"],
+                    )
+            return  # stays 'open' or 'unsellable' — retried on the next normal cycle either way
 
         sol_price = Decimal(str(settings.SOL_PRICE_USD))
         exit_proceeds_usd = (Decimal(str(result.actual_amount)) / Decimal("1e9")) * sol_price if result.actual_amount else None
@@ -774,8 +824,14 @@ class ConfluenceLiveWorker:
         async with get_session() as session:
             row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
             row = row_result.scalar_one_or_none()
-            if row is None or row.status != "open":
+            # 'unsellable' included (2026-09-24) — a position downgraded
+            # there after a long run of failed sells must still be able to
+            # close for real the moment a sell actually succeeds (the pool
+            # recovering, or a human intervening some other way); this is
+            # the ONLY path 'unsellable' ever exits through.
+            if row is None or row.status not in ("open", "unsellable"):
                 return
+            was_unsellable = row.status == "unsellable"
             row.status = "closed"
             row.exit_time = now
             row.exit_price = current_price
@@ -788,6 +844,9 @@ class ConfluenceLiveWorker:
         self._last_accepted_price.pop(trade["id"], None)
         self._pending_tick.pop(trade["id"], None)
         self._notified_stuck_trades.discard(trade["id"])
+        self._sell_failing_since.pop(trade["id"], None)
+        if was_unsellable:
+            log.info("confluence_live.unsellable_recovered", trade_id=str(trade["id"]), symbol=trade.get("symbol"))
         pnl_pct = (pnl_usd / trade["position_usd"] * 100) if pnl_usd is not None and trade["position_usd"] else None
         # LIQUIDITY_GUARD is always critical regardless of pnl sign — it
         # means the snapshot price this position was being monitored
@@ -807,6 +866,15 @@ class ConfluenceLiveWorker:
     # ── loading / observation ────────────────────────────────────────────
 
     async def _load_open_trades(self) -> dict[str, dict]:
+        """
+        'unsellable' included alongside 'open' (2026-09-24) — a position
+        downgraded to 'unsellable' after a long run of failed real sells
+        (see _UNSELLABLE_AFTER_S) must keep being priced and keep getting
+        real sell attempts every cycle exactly as before; only
+        _open_trade_count()'s concurrency gate treats the two statuses
+        differently (that one still filters status=='open' only, which is
+        the entire point — it's what actually frees the slot).
+        """
         async with get_session() as session:
             result = await session.execute(
                 select(
@@ -816,7 +884,7 @@ class ConfluenceLiveWorker:
                     ConfluenceLiveTrade.trailing_stop_floor, ConfluenceLiveTrade.high_watermark_price,
                 )
                 .join(Token, Token.id == ConfluenceLiveTrade.token_id)
-                .where(ConfluenceLiveTrade.status == "open")
+                .where(ConfluenceLiveTrade.status.in_(["open", "unsellable"]))
             )
             return {
                 mint: dict(id=tid, mint=mint, symbol=symbol, entry_price=ep, entry_time=et,

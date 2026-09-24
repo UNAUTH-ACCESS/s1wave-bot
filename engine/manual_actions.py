@@ -75,7 +75,12 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         if row is None:
             return ManualCloseResult(success=False, error="Trade not found")
         trade, symbol, mint = row
-        if trade.status != "open":
+        # 'unsellable' accepted alongside 'open' (2026-09-24) — a position
+        # the worker downgraded there after too many failed real sells
+        # (see confluence_live_worker.py's _UNSELLABLE_AFTER_S) is exactly
+        # the kind of position a human might want to try manually closing;
+        # refusing it here would block the one path meant to help.
+        if trade.status not in ("open", "unsellable"):
             return ManualCloseResult(success=False, symbol=symbol, error=f"Trade is already '{trade.status}', not open")
         if not trade.entry_token_lamports:
             return ManualCloseResult(success=False, symbol=symbol, error="No recorded token amount — cannot size a sell")
@@ -126,7 +131,7 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
 
     async with get_session() as session:
         row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade_uuid))).scalar_one_or_none()
-        if row is None or row.status != "open":
+        if row is None or row.status not in ("open", "unsellable"):
             # Sold on-chain but lost the race for the DB row (should be
             # unreachable given the check above, but never silently drop a
             # real, already-executed sell's record).
