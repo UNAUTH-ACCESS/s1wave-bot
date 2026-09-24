@@ -61,12 +61,13 @@ Safety layers, all independent, all checked before every entry
 --------------------------------------------------------------------
   1. settings.CONFLUENCE_LIVE_ENABLED must be True (master switch).
   2. No more than settings.CONFLUENCE_LIVE_MAX_CONCURRENT trades already
-     OPEN (raised from 1 to 3 on 2026-09-23 — see config/settings.py's
-     comment and analysis/sl_tp_and_concurrency_sweep.py for the replay
-     analysis that motivated it: one-at-a-time trading only captured 15
-     of 196 real signals and concentrated all risk into a single bet at
-     a time, which is what produced the near-total wipeout found in an
-     earlier retroactive replay).
+     OPEN (raised from 1 to 3 on 2026-09-23, then 3 to 5 on 2026-09-24 —
+     see config/settings.py's comment and analysis/sl_tp_and_concurrency_
+     sweep.py for the replay analysis that motivated the original change:
+     one-at-a-time trading only captured 15 of 196 real signals and
+     concentrated all risk into a single bet at a time, which is what
+     produced the near-total wipeout found in an earlier retroactive
+     replay).
   3. Live wallet equity must be above CONFLUENCE_LIVE_MIN_TRADEABLE_USD
      (a dust floor, default $1) — below it, this halts PERMANENTLY (not
      just for the day) until the wallet is topped back up. Since equity
@@ -229,6 +230,22 @@ class ConfluenceLiveWorker:
         # on every check, only when the value actually changes.
         self._last_permanently_halted: bool | None = None
         self._last_daily_halted: bool | None = None
+        # Real bug found 2026-09-24, from a code-reading audit (not a live
+        # incident this time): _last_permanently_halted/_last_daily_halted
+        # both start as None, and bool != None is always True — so the
+        # very FIRST _refresh_halt_notifications() call after ANY restart
+        # looked like a transition even when nothing changed, firing
+        # "Wallet funded"/"Daily loss limit no longer in effect" as if
+        # something had just recovered, purely because the process
+        # restarted. With how many restarts happen during active
+        # development, this had been spamming misleading recovery
+        # notifications into the feed all session. Fixed: the "recovered"
+        # notifications (the announcement that something is fine) are
+        # suppressed on the first check after a restart — only a genuinely
+        # bad state (halted) still announces immediately on first check,
+        # since that IS worth knowing right away; "everything is normal"
+        # is not news just because the process restarted.
+        self._halt_state_initialized = False
         # A stuck-exit (execution.py's sell() already exhausts all retries
         # internally before ever returning failure, so every result.success
         # False IS the critical case) gets re-attempted every ~1s cycle by
@@ -409,6 +426,9 @@ class ConfluenceLiveWorker:
         if equity is None:
             return
 
+        first_check = not self._halt_state_initialized
+        self._halt_state_initialized = True
+
         perm_halted = is_permanently_halted(equity, all_time_pnl)
         if perm_halted != self._last_permanently_halted:
             self._last_permanently_halted = perm_halted
@@ -421,7 +441,10 @@ class ConfluenceLiveWorker:
                 )
                 await self._notify("critical", "permanently_halted",
                                     f"Trading halted — {reason}. A human needs to re-enable it to resume.")
-            else:
+            elif not first_check:
+                # Only a REAL recovery observed during this process's own
+                # runtime is worth announcing — not the first read after a
+                # restart merely rediscovering the same already-fine state.
                 armed_note = "trading is ARMED — may enter a position on the next signal" if settings.CONFLUENCE_LIVE_ENABLED \
                     else "trading is currently PAUSED — resume it from the dashboard when you're ready"
                 await self._notify("info", "wallet_funded",
@@ -437,7 +460,7 @@ class ConfluenceLiveWorker:
                 await self._notify("warning", "daily_loss_limit_hit",
                                     f"Daily loss limit reached (today: ${today_pnl:.2f}) — "
                                     "paused until the next UTC day.")
-            else:
+            elif not first_check:
                 await self._notify("info", "daily_loss_limit_cleared",
                                     "Daily loss limit no longer in effect.")
         if day_halted:

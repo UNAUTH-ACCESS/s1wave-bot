@@ -1458,6 +1458,60 @@ class TestInAppNotifications:
         assert recovered[0].level == "info"
 
     @pytest.mark.asyncio
+    async def test_first_check_after_restart_does_not_fire_spurious_recovery(self, session, monkeypatch):
+        """Real bug found 2026-09-24 during a code audit: _last_permanently_halted
+        and _last_daily_halted both start as None, and `False != None` is True,
+        so the very first _refresh_halt_notifications() call after ANY worker
+        restart looked like a state transition even when nothing had changed —
+        firing a fake 'Wallet funded' / 'Daily loss limit cleared' notification
+        on every deploy. A brand-new worker checking an already-healthy account
+        for the first time must stay silent."""
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            # Never halted, never checked before — this is the first read.
+            await worker._refresh_halt_notifications(Decimal("15.0"), Decimal("0"))
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert not [r for r in rows if r.event == "wallet_funded"]
+        assert not [r for r in rows if r.event == "daily_loss_limit_cleared"]
+
+    @pytest.mark.asyncio
+    async def test_first_check_still_fires_if_already_halted(self, session, monkeypatch):
+        """The fix must not suppress a genuinely bad first read — only the
+        'recovered' side is dangerous to fire spuriously."""
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            await worker._refresh_halt_notifications(Decimal("0.02"), Decimal("0"))  # dust, first-ever check
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert len([r for r in rows if r.event == "permanently_halted"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_still_fires_for_a_real_transition_after_first_check(self, session, monkeypatch):
+        """A real recovery observed later in the SAME process's lifetime must
+        still notify — the fix only suppresses the first read after restart."""
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            await worker._refresh_halt_notifications(Decimal("15.0"), Decimal("0"))  # first check, healthy, silent
+            await worker._refresh_halt_notifications(Decimal("0.02"), Decimal("0"))  # real halt
+            await worker._refresh_halt_notifications(Decimal("15.0"), Decimal("0"))  # real recovery
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        funded = [r for r in rows if r.event == "wallet_funded"]
+        halted = [r for r in rows if r.event == "permanently_halted"]
+        assert len(halted) == 1
+        assert len(funded) == 1
+
+    @pytest.mark.asyncio
     async def test_halt_notifications_fire_even_while_trading_is_disabled(self, session, monkeypatch):
         """Real regression, found live 2026-09-24: a deposit landed while
         the user had manually paused trading (CONFLUENCE_LIVE_ENABLED=False)
@@ -1479,6 +1533,21 @@ class TestInAppNotifications:
         funded = [r for r in rows if r.event == "wallet_funded"]
         assert len(funded) == 1
         assert "PAUSED" in funded[0].message  # message reflects the real armed/paused state
+
+    @pytest.mark.asyncio
+    async def test_first_check_does_not_fire_spurious_daily_recovery(self, session, monkeypatch):
+        """Same restart bug, daily-halt side: a fresh worker's first-ever
+        check on a day that is NOT loss-limited must not announce
+        'daily_loss_limit_cleared' — nothing actually cleared, it was never set."""
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            await worker._refresh_halt_notifications(Decimal("15.0"), Decimal("0"))
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert not [r for r in rows if r.event == "daily_loss_limit_cleared"]
 
     @pytest.mark.asyncio
     async def test_daily_halted_notifies_once_across_many_checks(self, session, monkeypatch):
