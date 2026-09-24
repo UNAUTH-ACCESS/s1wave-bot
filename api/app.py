@@ -212,6 +212,31 @@ async def _build_open_trades_live() -> list[dict]:
             live_pnl_pct = None
             if current_price is not None and t.entry_price:
                 live_pnl_pct = float((current_price - t.entry_price) / t.entry_price * 100)
+
+            # Frozen-price detection (2026-09-24) — current_price_age_s below
+            # only measures how recently the worker successfully POLLED, not
+            # how long the VALUE has actually been unchanged. Found live: a
+            # position sat at the exact same price for 5+ hours (DexScreener
+            # kept answering, the underlying pool just went dead) while
+            # every single poll refreshed current_price_age_s back to ~0 —
+            # the "(stale)" warning (which only fires on polling lag) never
+            # fired even once. This looks back for the most recent
+            # observation with a DIFFERENT price to find how long the
+            # current value has really been frozen.
+            price_frozen_for_s = None
+            if current_price is not None:
+                last_different = (await session.execute(
+                    select(ConfluenceLiveObservation.observed_at)
+                    .where(
+                        ConfluenceLiveObservation.trade_id == t.id,
+                        ConfluenceLiveObservation.price_usd != current_price,
+                    )
+                    .order_by(desc(ConfluenceLiveObservation.observed_at))
+                    .limit(1)
+                )).scalar_one_or_none()
+                frozen_since = last_different or t.entry_time
+                price_frozen_for_s = (datetime.now(timezone.utc) - frozen_since).total_seconds()
+
             out.append({
                 "id": str(t.id),
                 "symbol": symbol,
@@ -223,6 +248,7 @@ async def _build_open_trades_live() -> list[dict]:
                 "current_price_age_s": (
                     (datetime.now(timezone.utc) - latest_obs.observed_at).total_seconds() if latest_obs else None
                 ),
+                "price_frozen_for_s": price_frozen_for_s,
                 "live_pnl_pct": round(live_pnl_pct, 2) if live_pnl_pct is not None else None,
                 "live_pnl_usd": (
                     round(float(t.position_usd) * live_pnl_pct / 100, 4) if live_pnl_pct is not None else None

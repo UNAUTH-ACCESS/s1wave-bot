@@ -511,7 +511,16 @@ function renderOpenPositions(openLive) {
     const pnl = t.live_pnl_pct;
     const pnlClass = pnl > 0 ? 'tp' : pnl < 0 ? 'tn' : '';
     const stale = t.current_price_age_s !== null && t.current_price_age_s > 5;
-    const priceHtml = `$${Number(t.entry_price).toPrecision(4)} → ${t.current_price !== null ? '$'+Number(t.current_price).toPrecision(4) : '—'}${stale ? ' <span style="color:var(--warn)">(stale)</span>' : ''}`;
+    // Frozen-price warning (2026-09-24) — distinct from "(stale)" above,
+    // which only catches the worker failing to POLL. This catches DexScreener
+    // successfully answering with the exact same price for a long time (a
+    // real position sat frozen for 5+ hours this way, un-flagged, before a
+    // manual close revealed the real market had actually moved). >=5min
+    // frozen is worth a visible warning; briefer pauses are normal noise.
+    const frozenS = t.price_frozen_for_s;
+    const frozen = frozenS !== null && frozenS !== undefined && frozenS > 300;
+    const frozenLabel = frozen ? (frozenS > 3600 ? `${(frozenS/3600).toFixed(1)}h` : `${Math.round(frozenS/60)}m`) : null;
+    const priceHtml = `$${Number(t.entry_price).toPrecision(4)} → ${t.current_price !== null ? '$'+Number(t.current_price).toPrecision(4) : '—'}${stale ? ' <span style="color:var(--warn)">(stale)</span>' : ''}${frozen ? ` <span style="color:var(--danger)" title="Price hasn't changed in ${frozenLabel} despite fresh polling — the displayed P&amp;L may not reflect what a real sell would get. Verify with a real quote before trusting it.">(frozen ${frozenLabel})</span>` : ''}`;
     const pnlHtml = pnl !== null ? (pnl>=0?'+':'')+pnl.toFixed(1)+'%' : '—';
 
     let tr = openPositionRows.get(t.id);
@@ -580,7 +589,7 @@ async function loadLiveTrades() {
   renderTradeHistory(closed);
   // Fallback render (no live price yet) — the SSE stream immediately
   // supersedes this with current_price/live_pnl_pct once connected.
-  renderOpenPositions(open.map(t => ({ ...t, current_price: null, current_price_age_s: null, live_pnl_pct: null })));
+  renderOpenPositions(open.map(t => ({ ...t, current_price: null, current_price_age_s: null, price_frozen_for_s: null, live_pnl_pct: null })));
 }
 
 async function loadShadowTrades() {
