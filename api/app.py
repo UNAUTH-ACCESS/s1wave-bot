@@ -273,6 +273,22 @@ async def _build_open_trades_live() -> list[dict]:
                 ),
                 "trailing_stop_floor": str(t.trailing_stop_floor) if t.trailing_stop_floor is not None else None,
                 "high_watermark_price": str(t.high_watermark_price) if t.high_watermark_price is not None else None,
+                # Real, verified price (2026-09-25) — an actual Jupiter sell
+                # quote for the exact held size, refreshed on the liquidity
+                # guard's ~60s cadence (workers/confluence_live_worker.py's
+                # _check_liquidity_guard()). This is what the dashboard
+                # should show as the trustworthy number: current_price above
+                # is a raw DexScreener snapshot that can sit still ("frozen")
+                # on thin liquidity even when nothing is wrong — real_price
+                # is what a sell would actually get right now. NULL until
+                # the first real check completes for a brand-new position.
+                "real_price": str(t.real_price) if t.real_price is not None else None,
+                "real_pnl_pct": float(t.real_pnl_pct) if t.real_pnl_pct is not None else None,
+                "real_price_checked_at": t.real_price_checked_at.isoformat() if t.real_price_checked_at else None,
+                "real_price_age_s": (
+                    (datetime.now(timezone.utc) - t.real_price_checked_at).total_seconds()
+                    if t.real_price_checked_at else None
+                ),
             })
         return out
 
@@ -924,6 +940,11 @@ def create_app() -> FastAPI:
                 "pnl_usd": str(t.pnl_usd) if t.pnl_usd is not None else None,
                 "position_usd": str(t.position_usd),
                 "error_detail": t.error_detail,
+                # See _build_open_trades_live()'s comment — a real Jupiter
+                # sell quote for the exact held size, not a market snapshot.
+                "real_price": str(t.real_price) if t.real_price is not None else None,
+                "real_pnl_pct": float(t.real_pnl_pct) if t.real_pnl_pct is not None else None,
+                "real_price_checked_at": t.real_price_checked_at.isoformat() if t.real_price_checked_at else None,
             }
             for t, symbol, mint in rows
         ]

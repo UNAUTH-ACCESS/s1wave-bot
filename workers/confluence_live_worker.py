@@ -750,6 +750,15 @@ class ConfluenceLiveWorker:
         already-worse-than-any-normal-stop real P&L. Returns (None, None)
         if the check isn't due yet for this trade, the quote failed (never
         treat a failed check as "safe"), or neither threshold is crossed.
+
+        Side effect (2026-09-25): whenever a real check actually runs
+        (i.e. isn't skipped by the throttle above), persists the implied
+        real_price/real_pnl_pct/real_price_checked_at onto the trade row
+        regardless of the crisis outcome — this is what lets the
+        dashboard show a verified, actually-tradeable price instead of the
+        raw DexScreener snapshot, which can sit still ("frozen") on thin
+        liquidity even when nothing is wrong. See models.orm's
+        ConfluenceLiveTrade.real_price docstring.
         """
         trade_id = trade["id"]
         now_mono = time.monotonic()
@@ -772,14 +781,23 @@ class ConfluenceLiveWorker:
 
         real_proceeds_usd = (Decimal(quote["out_lamports"]) / Decimal("1e9")) * sol_price
         real_pnl_pct = (real_proceeds_usd / position_usd) - 1
+        # Decimals unknown here without a balance lookup — nearly all
+        # pump.fun-originated SPL tokens use 6, same documented
+        # approximation as execution.py's own post-trade-balance fallback.
+        implied_price = real_proceeds_usd / (Decimal(trade["entry_token_lamports"]) / Decimal(10 ** 6))
+
+        async with get_session() as session:
+            row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade_id))
+            row = row_result.scalar_one_or_none()
+            if row is not None and row.status in ("open", "unsellable"):
+                row.real_price = implied_price
+                row.real_pnl_pct = real_pnl_pct * 100
+                row.real_price_checked_at = datetime.now(timezone.utc)
 
         if quote["price_impact_pct"] >= _LIQUIDITY_CRISIS_IMPACT_PCT or real_pnl_pct <= _LIQUIDITY_CRISIS_PNL_FLOOR_PCT:
-            # Decimals unknown here without a balance lookup — nearly all
-            # pump.fun-originated SPL tokens use 6, same documented
-            # approximation as execution.py's own post-trade-balance
-            # fallback. Informational only: the real sell that follows
-            # sizes itself from entry_token_lamports directly, never this.
-            implied_price = real_proceeds_usd / (Decimal(trade["entry_token_lamports"]) / Decimal(10 ** 6))
+            # Informational only beyond this point: the real sell that
+            # follows sizes itself from entry_token_lamports directly,
+            # never from implied_price.
             log.warning("confluence_live.liquidity_crisis_detected", trade_id=str(trade_id),
                         mint=trade["mint"], price_impact_pct=str(quote["price_impact_pct"]),
                         real_pnl_pct=str(real_pnl_pct))

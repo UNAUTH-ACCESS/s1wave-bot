@@ -725,74 +725,134 @@ class TestLiquidityGuard:
     real-quote-based guard added to close that gap.
     """
 
-    def setup_method(self):
-        with patch("workers.confluence_live_worker.ExecutionEngine"):
-            self.worker = ConfluenceLiveWorker(asyncio.Event())
-        self.trade = dict(
-            id=uuid.uuid4(), mint="SomeMint", symbol="TEST",
-            entry_price=Decimal("0.0001"), entry_time=datetime.now(timezone.utc) - timedelta(minutes=5),
+    def _make_trade_row(self, session, token):
+        return ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=5), entry_price=Decimal("0.0001"),
             entry_token_lamports=500_000_000, position_usd=Decimal("0.04"),
         )
 
+    async def _setup(self, session):
+        """Real DB-backed trade row (2026-09-25: _check_liquidity_guard now
+        persists real_price/real_pnl_pct onto this row on every real check,
+        so these tests need one to exist, not just a plain dict)."""
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        row = self._make_trade_row(session, token)
+        session.add(row)
+        await session.flush()
+        self.trade = dict(
+            id=row.id, mint="SomeMint", symbol="TEST",
+            entry_price=row.entry_price, entry_time=row.entry_time,
+            entry_token_lamports=row.entry_token_lamports, position_usd=row.position_usd,
+        )
+        return row
+
     @pytest.mark.asyncio
-    async def test_fires_on_high_price_impact(self, monkeypatch):
+    async def test_fires_on_high_price_impact(self, session, monkeypatch):
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
         self.worker._execution.get_sell_quote = AsyncMock(return_value={
             "out_lamports": 79842, "price_impact_pct": Decimal("1"),  # 100% impact, matches the real BLK quote
         })
-        reason, price = await self.worker._check_liquidity_guard(self.trade)
+        ctx = patched_session(session)
+        try:
+            reason, price = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
         assert reason == "LIQUIDITY_GUARD"
         assert price is not None
 
     @pytest.mark.asyncio
-    async def test_fires_on_bad_real_pnl_even_with_low_impact(self, monkeypatch):
+    async def test_fires_on_bad_real_pnl_even_with_low_impact(self, session, monkeypatch):
         """A pool can show low reported price impact while still paying out
         far less than the position cost — the real-P&L floor catches what
         the impact-percentage check alone might miss."""
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
         # position_usd=0.04; proceeds worth ~$0.02 -> real pnl ~ -50%, impact reported low
         lamports_for_half = int((Decimal("0.02") / Decimal("116.0")) * Decimal("1e9"))
         self.worker._execution.get_sell_quote = AsyncMock(return_value={
             "out_lamports": lamports_for_half, "price_impact_pct": Decimal("0.05"),
         })
-        reason, price = await self.worker._check_liquidity_guard(self.trade)
+        ctx = patched_session(session)
+        try:
+            reason, price = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
         assert reason == "LIQUIDITY_GUARD"
 
     @pytest.mark.asyncio
-    async def test_does_not_fire_when_healthy(self, monkeypatch):
+    async def test_does_not_fire_when_healthy(self, session, monkeypatch):
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
         # proceeds roughly matching position cost, negligible impact
         lamports_at_cost = int((Decimal("0.04") / Decimal("116.0")) * Decimal("1e9"))
         self.worker._execution.get_sell_quote = AsyncMock(return_value={
             "out_lamports": lamports_at_cost, "price_impact_pct": Decimal("0.01"),
         })
-        reason, price = await self.worker._check_liquidity_guard(self.trade)
+        ctx = patched_session(session)
+        try:
+            reason, price = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
         assert reason is None
         assert price is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_quote_fails(self, monkeypatch):
+    async def test_returns_none_when_quote_fails(self, session, monkeypatch):
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
         self.worker._execution.get_sell_quote = AsyncMock(return_value=None)
         reason, price = await self.worker._check_liquidity_guard(self.trade)
         assert reason is None
         assert price is None
 
     @pytest.mark.asyncio
-    async def test_throttled_to_one_real_quote_per_interval(self, monkeypatch):
+    async def test_throttled_to_one_real_quote_per_interval(self, session, monkeypatch):
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
         self.worker._execution.get_sell_quote = AsyncMock(return_value={
             "out_lamports": 1, "price_impact_pct": Decimal("0.01"),
         })
-        await self.worker._check_liquidity_guard(self.trade)
-        await self.worker._check_liquidity_guard(self.trade)  # immediately again
-        assert self.worker._execution.get_sell_quote.await_count == 1  # second call skipped, not due yet
+        ctx = patched_session(session)
+        try:
+            await self.worker._check_liquidity_guard(self.trade)
+            await self.worker._check_liquidity_guard(self.trade)  # immediately again
+            assert self.worker._execution.get_sell_quote.await_count == 1  # second call skipped, not due yet
 
-        # Simulate the interval having elapsed.
-        import workers.confluence_live_worker as mod
-        self.worker._last_liquidity_check[self.trade["id"]] -= mod._LIQUIDITY_CHECK_INTERVAL_S + 1
-        await self.worker._check_liquidity_guard(self.trade)
-        assert self.worker._execution.get_sell_quote.await_count == 2
+            # Simulate the interval having elapsed.
+            import workers.confluence_live_worker as mod
+            self.worker._last_liquidity_check[self.trade["id"]] -= mod._LIQUIDITY_CHECK_INTERVAL_S + 1
+            await self.worker._check_liquidity_guard(self.trade)
+            assert self.worker._execution.get_sell_quote.await_count == 2
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_persists_real_price_on_every_real_check_not_just_crisis(self, session, monkeypatch):
+        """2026-09-25: the whole point of the dashboard fix — a HEALTHY
+        real check must still persist real_price/real_pnl_pct/
+        real_price_checked_at, not only a crisis one."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        row = await self._setup(session)
+        lamports_at_cost = int((Decimal("0.04") / Decimal("116.0")) * Decimal("1e9"))
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": lamports_at_cost, "price_impact_pct": Decimal("0.01"),
+        })
+        ctx = patched_session(session)
+        try:
+            reason, _ = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
+
+        assert reason is None  # healthy, no crisis
+        refreshed = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == row.id))).scalar_one()
+        assert refreshed.real_price is not None
+        assert refreshed.real_pnl_pct is not None
+        assert refreshed.real_price_checked_at is not None
 
     @pytest.mark.asyncio
     async def test_maybe_exit_uses_guard_reason_and_price_over_snapshot(self, session, monkeypatch):

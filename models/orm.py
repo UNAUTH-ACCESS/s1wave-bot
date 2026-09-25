@@ -598,6 +598,20 @@ class ConfluenceLiveTrade(Base):
     # (floor = initial_floor(entry_price), hwm = entry_price).
     high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    # Real, verified price (2026-09-25) — a real Jupiter sell quote for the
+    # exact held size, computed by the SAME check as the liquidity guard
+    # (_check_liquidity_guard(), throttled to _LIQUIDITY_CHECK_INTERVAL_S
+    # per trade), persisted here regardless of whether it crosses the
+    # crisis threshold so the dashboard can show it. Added after the user
+    # kept being confused by a DexScreener-sourced price sitting still
+    # ("frozen") — that's real, thin-liquidity market behavior, not a bug
+    # (see workers/confluence_live_worker.py's frozen-price analysis), but
+    # showing the actually-tradeable number instead removes the confusion
+    # entirely. NULL until the first real check completes for a new
+    # position (up to _LIQUIDITY_CHECK_INTERVAL_S after entry).
+    real_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    real_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
+    real_price_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     def __repr__(self) -> str:
         return f"<ConfluenceLiveTrade token={self.token_id} status={self.status}>"

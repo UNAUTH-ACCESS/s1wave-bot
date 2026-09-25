@@ -508,19 +508,28 @@ function renderOpenPositions(openLive) {
 
   openLive.forEach(t => {
     seen.add(t.id);
-    const pnl = t.live_pnl_pct;
+    // Real, verified price (2026-09-25) — an actual Jupiter sell quote for
+    // the exact held size (workers/confluence_live_worker.py's liquidity
+    // guard, refreshed ~60s per position), not the raw DexScreener
+    // snapshot. This is what the dashboard now shows as the primary
+    // number: the snapshot can sit still ("frozen") on thin liquidity for
+    // a long time while still being perfectly real and tradeable — that
+    // used to read as broken. Falls back to the snapshot-based estimate,
+    // clearly labeled, only for the first ~60s of a brand-new position
+    // before its first real check has happened yet.
+    const hasReal = t.real_price !== null && t.real_price !== undefined;
+    const pnl = hasReal ? t.real_pnl_pct : t.live_pnl_pct;
     const pnlClass = pnl > 0 ? 'tp' : pnl < 0 ? 'tn' : '';
-    const stale = t.current_price_age_s !== null && t.current_price_age_s > 5;
-    // Frozen-price warning (2026-09-24) — distinct from "(stale)" above,
-    // which only catches the worker failing to POLL. This catches DexScreener
-    // successfully answering with the exact same price for a long time (a
-    // real position sat frozen for 5+ hours this way, un-flagged, before a
-    // manual close revealed the real market had actually moved). >=5min
-    // frozen is worth a visible warning; briefer pauses are normal noise.
-    const frozenS = t.price_frozen_for_s;
-    const frozen = frozenS !== null && frozenS !== undefined && frozenS > 300;
-    const frozenLabel = frozen ? (frozenS > 3600 ? `${(frozenS/3600).toFixed(1)}h` : `${Math.round(frozenS/60)}m`) : null;
-    const priceHtml = `$${Number(t.entry_price).toPrecision(4)} → ${t.current_price !== null ? '$'+Number(t.current_price).toPrecision(4) : '—'}${stale ? ' <span style="color:var(--warn)">(stale)</span>' : ''}${frozen ? ` <span style="color:var(--danger)" title="Price hasn't changed in ${frozenLabel} despite fresh polling — the displayed P&amp;L may not reflect what a real sell would get. Verify with a real quote before trusting it.">(frozen ${frozenLabel})</span>` : ''}`;
+    const realAgeS = t.real_price_age_s !== undefined && t.real_price_age_s !== null
+      ? t.real_price_age_s
+      : (t.real_price_checked_at ? (Date.now() - new Date(t.real_price_checked_at).getTime()) / 1000 : null);
+    const realAgeLabel = realAgeS !== null && realAgeS !== undefined
+      ? (realAgeS > 90 ? `${Math.round(realAgeS/60)}m ago — overdue, watch this` : `${Math.round(realAgeS)}s ago`)
+      : null;
+    const shownPrice = hasReal ? Number(t.real_price) : (t.current_price !== null ? Number(t.current_price) : null);
+    const priceHtml = hasReal
+      ? `$${Number(t.entry_price).toPrecision(4)} → $${shownPrice.toPrecision(4)} <span style="color:var(--muted)" title="A real Jupiter sell quote for this exact position, not a market snapshot — this is what selling right now would actually get.">(verified ${realAgeLabel})</span>`
+      : `$${Number(t.entry_price).toPrecision(4)} → ${shownPrice !== null ? '$'+shownPrice.toPrecision(4) : '—'} <span style="color:var(--muted)" title="No real sell quote yet for this brand-new position — this is only a market snapshot until the first check completes.">(checking…)</span>`;
     const pnlHtml = pnl !== null ? (pnl>=0?'+':'')+pnl.toFixed(1)+'%' : '—';
     // 'unsellable' badge (2026-09-24) — a position whose real sell kept
     // failing long enough that it stopped counting against your
