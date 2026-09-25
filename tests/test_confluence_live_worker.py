@@ -1146,6 +1146,187 @@ class TestSellCoordinationWithManualClose:
         finish_sell(str(trade.id))
 
 
+class TestSellRetryBackoff:
+    """
+    Real incident, 2026-09-25 (user: 'why no trades'): SEND's exit reason
+    (TIME_EXIT, permanently true forever once past max_hold_seconds)
+    re-triggered a full real sell attempt on every ~1s poll cycle, all day,
+    long after it was already known to be stuck. Confirmed live: a
+    genuinely fillable new buy (Luckin) failed with swap_build_failed
+    because Jupiter's shared /swap endpoint 429'd at the exact same
+    instant SEND's own nonstop retry loop was hitting it — the bot's own
+    stuck position was starving its real trade execution of API quota.
+    These tests cover the fix: once a sell has been failing longer than
+    _SELL_BACKOFF_AFTER_S, real attempts are spaced to at most one per
+    _SELL_BACKOFF_INTERVAL_S.
+    """
+
+    def _make_trade(self, session):
+        token = make_token()
+        session.add(token)
+        return token
+
+    @pytest.mark.asyncio
+    async def test_first_failure_is_never_backed_off(self, session, monkeypatch):
+        """A fresh failure (never recorded before) must attempt immediately
+        — backoff only applies to a sell already known to be failing."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = self._make_trade(session)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backs_off_once_failing_past_the_threshold(self, session, monkeypatch):
+        """Once a sell has been failing longer than _SELL_BACKOFF_AFTER_S
+        and a real attempt happened recently, the next cycle must NOT
+        submit another real sell."""
+        import workers.confluence_live_worker as mod
+
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = self._make_trade(session)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=15), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        # Already failing well past the backoff threshold, and a real
+        # attempt was just made a moment ago (well within the backoff
+        # interval) — the upcoming cycle must skip entirely.
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - mod._SELL_BACKOFF_AFTER_S - 5
+        self.worker._last_sell_attempt[trade.id] = time.monotonic()
+        self.worker._execution.sell = AsyncMock(
+            side_effect=AssertionError("must not submit a real sell while backed off")
+        )
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retries_again_once_the_backoff_interval_elapses(self, session, monkeypatch):
+        """Backed off, but the interval has since elapsed — must attempt again."""
+        import workers.confluence_live_worker as mod
+
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = self._make_trade(session)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=15), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - mod._SELL_BACKOFF_AFTER_S - 5
+        self.worker._last_sell_attempt[trade.id] = time.monotonic() - mod._SELL_BACKOFF_INTERVAL_S - 1
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_successful_sell_clears_the_backoff_state(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = self._make_trade(session)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        # Failing a long time (past the backoff threshold), but the last
+        # attempt was far enough back that this cycle is allowed to try
+        # again — this time it succeeds, and cleanup must remove both.
+        import workers.confluence_live_worker as mod
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - 100
+        self.worker._last_sell_attempt[trade.id] = time.monotonic() - mod._SELL_BACKOFF_INTERVAL_S - 1
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="sig", actual_amount=Decimal("5000000"),
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_awaited_once()
+        assert trade.id not in self.worker._last_sell_attempt
+        assert trade.id not in self.worker._sell_failing_since
+
+
 class TestExposurePercentageSizing:
     """config/settings.py's CONFLUENCE_LIVE_EXPOSURE_PCT formula
     (2026-09-23, replacing an earlier fixed-stake-plus-profit-share

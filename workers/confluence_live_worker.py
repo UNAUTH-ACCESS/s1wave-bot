@@ -180,7 +180,13 @@ CONFIRMATION_TOLERANCE = 0.5
 # falls through to the normal snapshot logic, exactly as if the guard
 # didn't exist) while looking deployed and active. Widened to 60s — still
 # catches a liquidity crisis well within the timeframe it matters, at a
-# request rate real trading has run at all session without a single 429.
+# request rate this guard alone never 429s at.
+#
+# CORRECTION, 2026-09-25: "real trading has run without a single 429"
+# stopped being true the same day a position (SEND) went unsellable — its
+# own endless sell-retry loop, not this guard, was the thing that started
+# saturating Jupiter's shared rate limit and blocking real new buys. See
+# _SELL_BACKOFF_AFTER_S below, which fixes that.
 _LIQUIDITY_CHECK_INTERVAL_S = 60.0
 _LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
 _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
@@ -207,6 +213,24 @@ _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L alread
 # 'unsellable' indefinitely, visible and honest rather than either eating
 # a slot forever or being silently marked closed with a made-up number.
 _UNSELLABLE_AFTER_S = 600.0
+
+# Sell-retry backoff for a persistently-failing exit (2026-09-25) — real,
+# live incident: SEND's exit reason (TIME_EXIT, permanently true forever
+# once past max_hold_seconds) re-triggered a full real sell attempt (a
+# quote + swap-build + submit, itself internally retried up to
+# _MAX_SELL_RETRIES times 2s apart) on every single ~1s poll cycle, all
+# day, long after it was already known to be stuck. This wasn't just
+# wasted effort — confirmed live, 2026-09-25 05:45:51: a genuinely
+# fillable new buy (Luckin) failed with swap_build_failed because
+# Jupiter's shared /swap endpoint 429'd at the exact same instant SEND's
+# own nonstop retry loop was hitting it. The bot's own stuck position was
+# starving its real trade execution of API quota. A confirmed-drained
+# pool does not get less drained by retrying every few seconds — once a
+# sell has been failing longer than _SELL_BACKOFF_AFTER_S, space real
+# attempts out to at most one per _SELL_BACKOFF_INTERVAL_S. Still catches
+# a real recovery within half a minute; costs nothing real to slow down.
+_SELL_BACKOFF_AFTER_S = 30.0
+_SELL_BACKOFF_INTERVAL_S = 30.0
 
 
 class ConfluenceLiveWorker:
@@ -258,6 +282,10 @@ class ConfluenceLiveWorker:
         # once a sell succeeds or the trade is otherwise no longer open).
         # See _UNSELLABLE_AFTER_S's comment for why this exists.
         self._sell_failing_since: dict = {}
+        # Sell-retry backoff (2026-09-25) — trade id -> time.monotonic() of
+        # the last real sell attempt, once that trade has been failing
+        # longer than _SELL_BACKOFF_AFTER_S. See that constant's comment.
+        self._last_sell_attempt: dict = {}
         # Liquidity guard state (2026-09-24) — trade id -> time.monotonic()
         # of the last real Jupiter quote check, so it's throttled per-trade
         # rather than per-cycle.
@@ -794,15 +822,33 @@ class ConfluenceLiveWorker:
                                     "token amount. MANUAL INTERVENTION NEEDED.", trade_id=trade["id"])
             return
 
+        trade_id_str = str(trade["id"])
+
+        # See _SELL_BACKOFF_AFTER_S's comment — a sell that's been failing
+        # for a while gets retried at most once every _SELL_BACKOFF_INTERVAL_S
+        # instead of every cycle, so a permanently stuck position can't
+        # starve the shared Jupiter rate limit that real, fillable trades
+        # also depend on. `.get()` (never `.setdefault()`) — this must not
+        # be the thing that starts the failure-duration clock; that's
+        # _sell_failing_since's job, set only after an actual failed attempt.
+        # Keyed by trade["id"] (the raw UUID), matching _sell_failing_since's
+        # own key — NOT trade_id_str, which is a separate string form used
+        # only for sell_coordination/logging below.
+        failing_since = self._sell_failing_since.get(trade["id"])
+        if failing_since is not None and (time.monotonic() - failing_since) >= _SELL_BACKOFF_AFTER_S:
+            last_attempt = self._last_sell_attempt.get(trade["id"])
+            if last_attempt is not None and (time.monotonic() - last_attempt) < _SELL_BACKOFF_INTERVAL_S:
+                return
+
         # See engine/sell_coordination.py — a manual dashboard close can be
         # mid-flight for this exact trade right now. Skip this cycle's sell
         # entirely rather than racing it; the next cycle (~1s later) will
         # either see the position already closed (manual close won) or
         # retry normally (manual close failed/wasn't for this trade).
-        trade_id_str = str(trade["id"])
         if not try_start_sell(trade_id_str):
             log.info("confluence_live.exit_skipped_concurrent_sell", trade_id=trade_id_str)
             return
+        self._last_sell_attempt[trade["id"]] = time.monotonic()
         try:
             log.info("confluence_live.exit_attempted", trade_id=trade_id_str, reason=reason)
             result = await self._execution.sell(
@@ -883,6 +929,7 @@ class ConfluenceLiveWorker:
         self._pending_tick.pop(trade["id"], None)
         self._notified_stuck_trades.discard(trade["id"])
         self._sell_failing_since.pop(trade["id"], None)
+        self._last_sell_attempt.pop(trade["id"], None)
         if was_unsellable:
             log.info("confluence_live.unsellable_recovered", trade_id=str(trade["id"]), symbol=trade.get("symbol"))
         pnl_pct = (pnl_usd / trade["position_usd"] * 100) if pnl_usd is not None and trade["position_usd"] else None
