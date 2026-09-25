@@ -83,6 +83,10 @@ def make_worker(session, enabled=True) -> ConfluenceLiveWorker:
     # the normal snapshot-based _check_exit() path exactly as before it
     # existed. Tests that DO care override this explicitly.
     worker._execution.get_sell_quote = AsyncMock(return_value=None)
+    # Default: no real balance data, so the balance-zero reconciliation
+    # check (2026-09-25, see the SEND incident) never fires for tests that
+    # don't care about it — None means "unknown," never treated as zero.
+    worker._execution.get_token_balance_raw = AsyncMock(return_value=None)
     return worker
 
 
@@ -1437,6 +1441,217 @@ class TestSellRetryBackoff:
         self.worker._execution.sell.assert_awaited_once()
         assert trade.id not in self.worker._last_sell_attempt
         assert trade.id not in self.worker._sell_failing_since
+
+
+class TestBalanceAlreadyZeroReconciliation:
+    """
+    Real incident, 2026-09-25 (SEND): a real sell succeeded on-chain 5
+    seconds after entry, but the service happened to restart mid-
+    confirmation-poll, so the DB write never happened — the trade was left
+    'open' with real tokens already gone. Every subsequent retry then
+    failed on-chain (insufficient balance) with an error indistinguishable
+    from a genuinely drained pool, for DAYS, until a manual forensic
+    on-chain lookup found the real, already-successful sell. These tests
+    cover the fix: once a sell has already failed at least once, a
+    CONFIRMED-zero real balance check (never a lookup failure, which stays
+    None) stops further pointless retries and flags the trade for manual
+    reconciliation instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_confirmed_zero_balance_marks_for_reconciliation(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - 5  # already failed at least once
+        self.worker._execution.get_token_balance_raw = AsyncMock(return_value=(0, 6))  # confirmed zero
+        self.worker._execution.sell = AsyncMock(
+            side_effect=AssertionError("must not attempt another sell once balance is confirmed zero")
+        )
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "balance_zero"
+        assert row.pnl_usd is None  # never fabricated — real proceeds are unknown without forensics
+        assert row.exit_time is None
+        assert trade.id not in self.worker._sell_failing_since  # cleaned up, not retried forever
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_failure_is_never_treated_as_zero(self, session, monkeypatch):
+        """get_token_balance_raw returning None means 'unknown,' not 'zero'
+        — a transient RPC hiccup must never short-circuit a real retry."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._sell_failing_since[trade.id] = time.monotonic() - 5
+        self.worker._execution.get_token_balance_raw = AsyncMock(return_value=None)  # lookup failed, unknown
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_awaited_once()  # still retried normally
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.status == "open"
+
+    @pytest.mark.asyncio
+    async def test_first_failure_never_checks_balance(self, session, monkeypatch):
+        """The balance check only makes sense once a sell has already
+        failed at least once — checking on a fresh, first-time exit
+        attempt would add real RPC load for no benefit."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 150.0)
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("1.00"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("10.0"),
+        )
+        session.add(trade)
+        await session.flush()
+
+        self.worker._execution.get_token_balance_raw = AsyncMock(
+            side_effect=AssertionError("must not check balance on a first-time failure")
+        )
+        self.worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=False, error_type="SELL_FAILED_CRITICAL", error_detail="on-chain program error",
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await self.worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        self.worker._execution.sell.assert_awaited_once()
+
+
+class TestPeriodicRentSweep:
+    """
+    Real incident, 2026-09-25 (SEND): the only existing rent-reclaim path
+    (execution.py's close_token_account(), called right after a sell this
+    engine itself just executed) structurally cannot recover an account
+    that went to zero any other way — SEND's went unreclaimed for a full
+    day. _maybe_sweep_rent() is the general periodic safety net: calls
+    ExecutionEngine.sweep_dead_token_accounts() on _RENT_SWEEP_INTERVAL_S,
+    regardless of CONFLUENCE_LIVE_ENABLED, and never lets a failure there
+    break the cycle that triggered it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sweeps_on_the_first_cycle_without_waiting_a_full_interval(self, session):
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(return_value=[])
+        await worker._maybe_sweep_rent()
+        worker._execution.sweep_dead_token_accounts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_does_not_sweep_again_before_the_interval_elapses(self, session):
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(return_value=[])
+        await worker._maybe_sweep_rent()
+        await worker._maybe_sweep_rent()
+        worker._execution.sweep_dead_token_accounts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sweeps_again_once_the_interval_elapses(self, session):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(return_value=[])
+        await worker._maybe_sweep_rent()
+        worker._last_rent_sweep -= mod._RENT_SWEEP_INTERVAL_S + 1
+        await worker._maybe_sweep_rent()
+        assert worker._execution.sweep_dead_token_accounts.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_notifies_when_something_was_reclaimed(self, session):
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(return_value=["SIG1"])
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_sweep_rent()
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert any(r.event == "rent_swept" for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_no_notification_when_nothing_reclaimed(self, session):
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(return_value=[])
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_sweep_rent()
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert not any(r.event == "rent_swept" for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_failure_never_raises(self, session):
+        worker = make_worker(session)
+        worker._execution.sweep_dead_token_accounts = AsyncMock(side_effect=RuntimeError("RPC outage"))
+        await worker._maybe_sweep_rent()  # must not raise
 
 
 class TestExposurePercentageSizing:

@@ -224,6 +224,17 @@ _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT = Decimal("0.15")  # snapshot-based unrealiz
 # a slot forever or being silently marked closed with a made-up number.
 _UNSELLABLE_AFTER_S = 600.0
 
+# Periodic rent sweep (2026-09-25) — real incident: SEND's already-empty
+# token account sat unreclaimed for a full day (see the balance-zero
+# reconciliation section) because the only existing reclaim path
+# (execution.py's close_token_account(), called right after a sell this
+# engine itself just executed) structurally cannot recover an account
+# that went to zero any other way. This calls ExecutionEngine's general
+# sweep_dead_token_accounts() on this interval — housekeeping, not
+# time-sensitive, so a wide interval is fine and keeps this off the
+# critical path.
+_RENT_SWEEP_INTERVAL_S = 1800.0  # 30 minutes
+
 # Sell-retry backoff for a persistently-failing exit (2026-09-25) — real,
 # live incident: SEND's exit reason (TIME_EXIT, permanently true forever
 # once past max_hold_seconds) re-triggered a full real sell attempt (a
@@ -300,6 +311,10 @@ class ConfluenceLiveWorker:
         # of the last real Jupiter quote check, so it's throttled per-trade
         # rather than per-cycle.
         self._last_liquidity_check: dict = {}
+        # Periodic rent sweep (2026-09-25) — see _RENT_SWEEP_INTERVAL_S's
+        # comment. None means "never run yet," so the very first cycle
+        # doesn't wait a full interval before the first sweep.
+        self._last_rent_sweep: float | None = None
         self._execution = ExecutionEngine(
             paper_override=False,
             wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
@@ -339,6 +354,7 @@ class ConfluenceLiveWorker:
         today_pnl = await self._load_today_realized_pnl() if equity is not None else Decimal("0")
         all_time_pnl = await self._load_all_time_realized_pnl() if equity is not None else Decimal("0")
         await self._refresh_halt_notifications(equity, today_pnl, all_time_pnl)
+        await self._maybe_sweep_rent()
 
         if settings.CONFLUENCE_LIVE_ENABLED:
             await self._maybe_enter()
@@ -503,6 +519,31 @@ class ConfluenceLiveWorker:
                                     "Daily loss limit no longer in effect.")
         if day_halted:
             log.warning("confluence_live.daily_loss_limit_hit", today_pnl=str(today_pnl), equity_usd=str(equity))
+
+    async def _maybe_sweep_rent(self) -> None:
+        """
+        See _RENT_SWEEP_INTERVAL_S's comment — periodic housekeeping, runs
+        regardless of CONFLUENCE_LIVE_ENABLED (same reasoning as halt
+        notifications: reclaiming real stranded money isn't an entry
+        decision, a paused user still benefits from it). Never lets a
+        sweep failure break the trading cycle that triggered it.
+        """
+        now_mono = time.monotonic()
+        if self._last_rent_sweep is not None and (now_mono - self._last_rent_sweep) < _RENT_SWEEP_INTERVAL_S:
+            return
+        self._last_rent_sweep = now_mono
+        try:
+            reclaimed = await self._execution.sweep_dead_token_accounts()
+        except Exception as exc:
+            log.warning("confluence_live.rent_sweep_failed", error_type=type(exc).__name__, error=str(exc))
+            return
+        if reclaimed:
+            log.info("confluence_live.rent_swept", count=len(reclaimed), tx_signatures=reclaimed)
+            await self._notify(
+                "info", "rent_swept",
+                f"Reclaimed rent from {len(reclaimed)} dead token account"
+                f"{'s' if len(reclaimed) != 1 else ''} during a routine sweep.",
+            )
 
     async def _safe_to_enter(self) -> bool:
         equity = await self._get_equity_usd()
@@ -890,6 +931,51 @@ class ConfluenceLiveWorker:
         if failing_since is not None and (time.monotonic() - failing_since) >= _SELL_BACKOFF_AFTER_S:
             last_attempt = self._last_sell_attempt.get(trade["id"])
             if last_attempt is not None and (time.monotonic() - last_attempt) < _SELL_BACKOFF_INTERVAL_S:
+                return
+
+        # Real incident, 2026-09-25 (SEND): a sell can succeed on-chain but
+        # never get recorded if this process restarts mid-confirmation-poll
+        # — the recovered process then keeps retrying a swap for tokens
+        # that are ALREADY GONE, forever, producing an on-chain rejection
+        # indistinguishable from a genuinely drained pool (confirmed by
+        # forensics days later: the real sell landed 5 seconds after entry,
+        # the service happened to restart mid-poll, and every retry since
+        # then failed only because there was nothing left to sell). Once a
+        # sell has already failed at least once for this trade, verify the
+        # REAL on-chain balance before burning another attempt — a
+        # CONFIRMED zero (never a lookup failure, which get_token_balance_raw
+        # deliberately returns as None, not zero) means the position is
+        # already resolved on-chain and no further attempt can ever
+        # succeed. Flags it for reconciliation rather than fabricating a
+        # pnl_usd this process cannot know without the kind of forensic
+        # on-chain lookup that resolved the real SEND incident.
+        if failing_since is not None:
+            real_balance = await self._execution.get_token_balance_raw(trade["mint"])
+            if real_balance is not None and real_balance[0] == 0:
+                log.error("confluence_live.balance_already_zero", trade_id=trade_id_str,
+                          symbol=trade.get("symbol"), mint=trade["mint"])
+                async with get_session() as session:
+                    row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade["id"]))
+                    row = row_result.scalar_one_or_none()
+                    if row is not None and row.status in ("open", "unsellable"):
+                        row.status = "balance_zero"
+                        row.error_detail = (
+                            "Real on-chain balance confirmed zero — this position was already sold "
+                            "for real at some point (most likely a sell that succeeded on-chain right "
+                            "as this service restarted mid-confirmation-poll), but the exact proceeds "
+                            "are unknown without a manual on-chain lookup of the wallet's transaction "
+                            "history around entry_time. No further automatic sell will be attempted."
+                        )
+                await self._notify(
+                    "critical", "balance_already_zero",
+                    f"{trade.get('symbol') or trade['mint'][:8]} already shows a real on-chain balance "
+                    "of zero — it was likely already sold successfully but never recorded (see the "
+                    "SEND incident, 2026-09-25). No further automatic sell will be attempted; the real "
+                    "proceeds need a manual on-chain lookup to close out the ledger accurately.",
+                    trade_id=trade["id"],
+                )
+                self._sell_failing_since.pop(trade["id"], None)
+                self._last_sell_attempt.pop(trade["id"], None)
                 return
 
         # See engine/sell_coordination.py — a manual dashboard close can be

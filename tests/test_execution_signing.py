@@ -526,6 +526,89 @@ async def test_execute_sell_reclaims_rent_after_a_confirmed_sell(monkeypatch):
     engine.close_token_account.assert_awaited_once_with("SoldOutMint")
 
 
+# ── sweep_dead_token_accounts() — periodic rent sweep (2026-09-25) ──────────
+#
+# Real incident: SEND's real sell succeeded on-chain seconds after entry,
+# but this process happened to restart mid-confirmation-poll, so the DB
+# write never happened and close_token_account() (called only right after
+# a sell THIS engine itself just executed) never ran for it — the account
+# sat unreclaimed for a full day. This is the general safety net: find
+# every zero-balance account this wallet owns, regardless of how it went
+# to zero, and close it.
+
+class FakeAccountEntry:
+    def __init__(self, mint: str, amount: str):
+        self.account = type("Acc", (), {
+            "data": type("Data", (), {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": amount, "decimals": 6}}}})(),
+        })()
+
+
+class FakeListResp:
+    def __init__(self, rows):
+        self.value = rows
+
+
+@pytest.mark.asyncio
+async def test_sweep_closes_only_zero_balance_accounts():
+    """Scans both the classic Token program and Token-2022 — here only the
+    classic program has any accounts (matching every real trade so far),
+    Token-2022 comes back empty."""
+    engine = make_engine()
+    from engine.execution import _TOKEN_PROGRAM_ID
+
+    async def fake_list(owner, opts, commitment=None):
+        if str(opts.program_id) == _TOKEN_PROGRAM_ID:
+            return FakeListResp([
+                FakeAccountEntry("DeadMint1111111111111111111111111111111111", "0"),
+                FakeAccountEntry("AliveMint111111111111111111111111111111111", "500"),
+                FakeAccountEntry("DeadMint2222222222222222222222222222222222", "0"),
+            ])
+        return FakeListResp([])  # Token-2022 — nothing here
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_list
+    engine.close_token_account = AsyncMock(side_effect=["SIG1", "SIG2"])
+
+    reclaimed = await engine.sweep_dead_token_accounts()
+
+    assert reclaimed == ["SIG1", "SIG2"]
+    calls = [c.args[0] for c in engine.close_token_account.await_args_list]
+    assert "DeadMint1111111111111111111111111111111111" in calls
+    assert "DeadMint2222222222222222222222222222222222" in calls
+    assert "AliveMint111111111111111111111111111111111" not in calls
+
+
+@pytest.mark.asyncio
+async def test_sweep_returns_empty_when_nothing_to_reclaim():
+    engine = make_engine()
+
+    async def fake_list(owner, opts, commitment=None):
+        return FakeListResp([FakeAccountEntry("AliveMint111111111111111111111111111111111", "500")])
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_list
+    engine.close_token_account = AsyncMock(side_effect=AssertionError("must not close a live account"))
+
+    reclaimed = await engine.sweep_dead_token_accounts()
+    assert reclaimed == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_survives_a_listing_failure():
+    engine = make_engine()
+
+    async def fake_list(owner, opts, commitment=None):
+        raise RuntimeError("simulated RPC outage")
+
+    engine._rpc.get_token_accounts_by_owner_json_parsed = fake_list
+    reclaimed = await engine.sweep_dead_token_accounts()
+    assert reclaimed == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_returns_empty_in_paper_mode():
+    engine = ExecutionEngine(paper_override=True)
+    reclaimed = await engine.sweep_dead_token_accounts()
+    assert reclaimed == []
+
 
 # ── get_sell_quote() — liquidity guard fix (2026-09-24) ─────────────────────
 #

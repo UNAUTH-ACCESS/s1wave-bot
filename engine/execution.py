@@ -68,6 +68,8 @@ log = get_logger(__name__)
 _JUPITER_QUOTE_URL = "{base}/quote"
 _JUPITER_SWAP_URL  = "{base}/swap"
 _SOL_MINT          = "So11111111111111111111111111111111111111112"
+_TOKEN_PROGRAM_ID      = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 _CONFIRM_TIMEOUT_S = 60
 _CONFIRM_POLL_S    = 2
 _MAX_SELL_RETRIES  = 3
@@ -327,6 +329,51 @@ class ExecutionEngine:
             log.warning("execution.close_account_failed", mint=mint,
                         error_type=type(exc).__name__, error=str(exc))
             return None
+
+    async def sweep_dead_token_accounts(self) -> list[str]:
+        """
+        Periodic, general safety net for stranded rent (2026-09-25) — real
+        incident: SEND's real sell succeeded on-chain seconds after entry,
+        but this process happened to restart mid-confirmation-poll, so the
+        DB write never happened and close_token_account() never ran for
+        it. Its account sat unreclaimed for a full day, invisible, until a
+        manual on-chain forensic lookup found it. close_token_account() is
+        called right after a sell THIS engine itself just executed — it
+        structurally cannot recover an account that went to zero any other
+        way. This scans every token account this wallet actually owns
+        (both the classic Token program and Token-2022 — a real trade
+        confirmed only the former is in use so far, but this should not
+        assume that stays true forever) and closes any with a REAL,
+        confirmed zero balance, reusing close_token_account()'s own tested
+        CloseAccount logic. Meant to be called occasionally (a live worker
+        on some interval), not every cycle — this is housekeeping, not a
+        time-sensitive check. Returns the real reclaim tx signatures
+        actually submitted; empty if nothing needed reclaiming.
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            return []
+        from solana.rpc.models import TokenAccountOpts
+        from solders.pubkey import Pubkey
+
+        reclaimed: list[str] = []
+        for program_id in (_TOKEN_PROGRAM_ID, _TOKEN_2022_PROGRAM_ID):
+            try:
+                resp = await self._rpc.get_token_accounts_by_owner_json_parsed(
+                    self._keypair.pubkey(), TokenAccountOpts(program_id=Pubkey.from_string(program_id)),
+                )
+            except Exception as exc:
+                log.warning("execution.sweep_dead_accounts_list_failed", program_id=program_id,
+                            error_type=type(exc).__name__, error=str(exc))
+                continue
+            for entry in resp.value:
+                info = entry.account.data.parsed["info"]["tokenAmount"]
+                if int(info["amount"]) != 0:
+                    continue
+                mint = entry.account.data.parsed["info"]["mint"]
+                sig = await self.close_token_account(mint)
+                if sig:
+                    reclaimed.append(sig)
+        return reclaimed
 
     async def buy(
         self,
