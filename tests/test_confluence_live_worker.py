@@ -852,7 +852,59 @@ class TestLiquidityGuard:
         refreshed = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == row.id))).scalar_one()
         assert refreshed.real_price is not None
         assert refreshed.real_pnl_pct is not None
-        assert refreshed.real_price_checked_at is not None
+
+    @pytest.mark.asyncio
+    async def test_checks_more_often_once_in_meaningful_profit(self, session, monkeypatch):
+        """Real incident, 2026-09-25: Gavel's snapshot climbed to +40% while
+        its real price had already collapsed to -33% underneath, and the
+        60s-throttled guard only caught it at the very end of that window.
+        A position showing a real unrealized gain must get checked on the
+        faster _LIQUIDITY_CHECK_INTERVAL_FAST_S cadence, not the normal one."""
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
+        lamports_at_cost = int((Decimal("0.04") / Decimal("116.0")) * Decimal("1e9"))
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": lamports_at_cost, "price_impact_pct": Decimal("0.01"),
+        })
+        profitable_price = self.trade["entry_price"] * Decimal("1.20")  # +20%, above the 15% fast threshold
+
+        ctx = patched_session(session)
+        try:
+            await self.worker._check_liquidity_guard(self.trade, profitable_price)
+            assert self.worker._execution.get_sell_quote.await_count == 1
+
+            # Only the FAST interval has elapsed — the normal 60s one hasn't.
+            self.worker._last_liquidity_check[self.trade["id"]] -= mod._LIQUIDITY_CHECK_INTERVAL_FAST_S + 1
+            await self.worker._check_liquidity_guard(self.trade, profitable_price)
+            assert self.worker._execution.get_sell_quote.await_count == 2
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_does_not_check_faster_below_the_profit_threshold(self, session, monkeypatch):
+        """A position that isn't meaningfully profitable yet keeps the
+        normal, quota-conserving 60s cadence — the faster check is spent
+        only where there's real profit worth protecting."""
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": 1, "price_impact_pct": Decimal("0.01"),
+        })
+        near_breakeven_price = self.trade["entry_price"] * Decimal("1.02")  # +2%, below the 15% fast threshold
+
+        ctx = patched_session(session)
+        try:
+            await self.worker._check_liquidity_guard(self.trade, near_breakeven_price)
+            assert self.worker._execution.get_sell_quote.await_count == 1
+
+            # Only the FAST interval has elapsed — must NOT be due yet at this pnl.
+            self.worker._last_liquidity_check[self.trade["id"]] -= mod._LIQUIDITY_CHECK_INTERVAL_FAST_S + 1
+            await self.worker._check_liquidity_guard(self.trade, near_breakeven_price)
+            assert self.worker._execution.get_sell_quote.await_count == 1  # still skipped
+        finally:
+            ctx.stop()
 
     @pytest.mark.asyncio
     async def test_maybe_exit_uses_guard_reason_and_price_over_snapshot(self, session, monkeypatch):

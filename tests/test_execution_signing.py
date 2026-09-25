@@ -49,7 +49,7 @@ from solders.signature import Signature
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 
-from engine.execution import ExecutionEngine
+from engine.execution import ExecutionEngine, ExecutionResult
 
 
 def make_jupiter_shaped_tx_bytes(fee_payer: Keypair) -> bytes:
@@ -231,6 +231,7 @@ async def test_execute_buy_computes_dimensionally_correct_price_from_real_balanc
     engine = make_engine()
     engine._get_quote = AsyncMock(return_value={"outAmount": "1709821287"})
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._check_entry_cost = AsyncMock(return_value=None)  # safe to proceed — not what this test covers
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
     engine._confirm_tx = AsyncMock(return_value=True)
     engine.get_token_balance_raw = AsyncMock(return_value=(2167016274, 6))  # the real LUCKYCATT numbers
@@ -259,6 +260,7 @@ async def test_execute_buy_falls_back_when_real_balance_unavailable(monkeypatch)
     engine = make_engine()
     engine._get_quote = AsyncMock(return_value={"outAmount": "1709821287"})
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._check_entry_cost = AsyncMock(return_value=None)  # safe to proceed — not what this test covers
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
     engine._confirm_tx = AsyncMock(return_value=True)
     engine.get_token_balance_raw = AsyncMock(return_value=None)
@@ -273,6 +275,140 @@ async def test_execute_buy_falls_back_when_real_balance_unavailable(monkeypatch)
     assert result.actual_amount == Decimal("1709821287")
     expected_price = Decimal("1.05") / (Decimal("1709821287") / Decimal(10 ** 6))
     assert result.actual_price == expected_price
+
+
+# ── _check_entry_cost() — freshly-migrated-pool cost ceiling (2026-09-25) ───
+#
+# Real incident: two buys (Bybit, NUUC) each cost ~$0.55 instead of their
+# intended ~$0.19 — both were the first-ever trade against a just-migrated
+# pool, and Solana made our transaction pay to create the pool's own
+# internal vault accounts (not ours, never reclaimable). These tests cover
+# the pre-flight simulation that now catches this BEFORE any real money
+# moves.
+
+class FakeBalanceResp:
+    def __init__(self, value: int):
+        self.value = value
+
+
+class FakeSimAccount:
+    def __init__(self, lamports: int):
+        self.lamports = lamports
+
+
+class FakeSimResult:
+    def __init__(self, accounts=None, err=None):
+        self.accounts = accounts
+        self.err = err
+
+
+class FakeSimResp:
+    def __init__(self, value: FakeSimResult):
+        self.value = value
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_check_allows_a_normal_single_account_entry():
+    """Real numbers from a normal trade (ROLL): ~111K lamports swap
+    principal + ~1.49M rent + a small fee — comfortably under the ceiling."""
+    engine = make_engine()
+    tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
+    sol_lamports = 111_067
+    pre = 10_000_000
+    projected_post = pre - 111_067 - 1_488_440 - 5_000  # normal total real cost
+
+    engine._rpc.get_balance = AsyncMock(return_value=FakeBalanceResp(pre))
+    engine._rpc.simulate_transaction = AsyncMock(
+        return_value=FakeSimResp(FakeSimResult(accounts=[FakeSimAccount(projected_post)]))
+    )
+
+    result = await engine._check_entry_cost(tx_bytes, sol_lamports)
+    assert result is None  # safe to proceed
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_check_rejects_a_freshly_migrated_pool():
+    """Real numbers from the actual Bybit incident: ~4.75M lamports real
+    cost against a ~135K intended swap — must be rejected, not submitted."""
+    engine = make_engine()
+    tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
+    sol_lamports = 134_730
+    pre = 10_000_000
+    projected_post = pre - 4_785_561  # the real Bybit incident's total cost
+
+    engine._rpc.get_balance = AsyncMock(return_value=FakeBalanceResp(pre))
+    engine._rpc.simulate_transaction = AsyncMock(
+        return_value=FakeSimResp(FakeSimResult(accounts=[FakeSimAccount(projected_post)]))
+    )
+
+    result = await engine._check_entry_cost(tx_bytes, sol_lamports)
+    assert result is not None
+    assert result.success is False
+    assert result.error_type == "entry_too_expensive"
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_check_rejects_when_simulation_shows_a_real_failure():
+    engine = make_engine()
+    tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
+
+    engine._rpc.get_balance = AsyncMock(return_value=FakeBalanceResp(10_000_000))
+    engine._rpc.simulate_transaction = AsyncMock(
+        return_value=FakeSimResp(FakeSimResult(accounts=None, err={"InstructionError": [2, "Custom"]}))
+    )
+
+    result = await engine._check_entry_cost(tx_bytes, 100_000)
+    assert result is not None
+    assert result.error_type == "simulated_failure"
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_check_fails_closed_when_unverifiable():
+    """No account data back from the simulation — must abort rather than
+    proceed blind, per the 'protect the money first' priority."""
+    engine = make_engine()
+    tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
+
+    engine._rpc.get_balance = AsyncMock(return_value=FakeBalanceResp(10_000_000))
+    engine._rpc.simulate_transaction = AsyncMock(
+        return_value=FakeSimResp(FakeSimResult(accounts=None, err=None))
+    )
+
+    result = await engine._check_entry_cost(tx_bytes, 100_000)
+    assert result is not None
+    assert result.error_type == "entry_cost_unverifiable"
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_check_fails_closed_on_rpc_error():
+    engine = make_engine()
+    tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
+
+    engine._rpc.get_balance = AsyncMock(side_effect=RuntimeError("RPC hiccup"))
+
+    result = await engine._check_entry_cost(tx_bytes, 100_000)
+    assert result is not None
+    assert result.error_type == "entry_cost_check_error"
+
+
+@pytest.mark.asyncio
+async def test_execute_buy_aborts_before_ever_signing_when_too_expensive():
+    """Integration: _execute_buy() must never call _sign_and_submit() at
+    all when the cost check rejects — this is what makes it free (no real
+    transaction submitted) rather than just a nicer error message."""
+    engine = make_engine()
+    engine._get_quote = AsyncMock(return_value={"outAmount": "1709821287"})
+    engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
+    engine._check_entry_cost = AsyncMock(return_value=ExecutionResult(
+        success=False, error_type="entry_too_expensive", error_detail="too expensive",
+    ))
+    engine._sign_and_submit = AsyncMock(side_effect=AssertionError("must never sign a rejected entry"))
+
+    result = await engine._execute_buy(mint="SomeMint", sol_lamports=100_000, position_usd=Decimal("0.02"))
+
+    assert result.success is False
+    assert result.error_type == "entry_too_expensive"
+    engine._sign_and_submit.assert_not_awaited()
 
 
 # ── close_token_account() — rent-reclaim fix (2026-09-24) ───────────────────

@@ -191,6 +191,16 @@ _LIQUIDITY_CHECK_INTERVAL_S = 60.0
 _LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
 _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
 
+# Adaptive faster check for a position in real profit (2026-09-25) — see
+# _check_liquidity_guard()'s docstring for the Gavel incident this closes:
+# a snapshot showing +40% while the real price had already collapsed to
+# -33%, only caught at the very end of a 60s window. 30s halves that
+# worst-case gap for the (usually few) positions actually worth protecting,
+# without repeating the ~20s-for-everything rate-limit incident this
+# module's history already has.
+_LIQUIDITY_CHECK_INTERVAL_FAST_S = 30.0
+_LIQUIDITY_CHECK_FAST_THRESHOLD_PCT = Decimal("0.15")  # snapshot-based unrealized gain that earns the faster check
+
 # Unsellable-position handling (2026-09-24) — real incident: SEND's exit
 # (LIQUIDITY_GUARD, fired 1s after entry into an already-drained pool)
 # failed every retry for 4+ minutes straight with the same on-chain error
@@ -735,7 +745,9 @@ class ConfluenceLiveWorker:
             return "TIME_EXIT", new_floor, new_hwm
         return None, new_floor, new_hwm
 
-    async def _check_liquidity_guard(self, trade: dict) -> tuple[str | None, Decimal | None]:
+    async def _check_liquidity_guard(
+        self, trade: dict, current_price: Decimal | None = None,
+    ) -> tuple[str | None, Decimal | None]:
         """
         Real-executable-liquidity backstop — see this module's constants
         section and ExecutionEngine.get_sell_quote()'s docstring for the
@@ -759,11 +771,33 @@ class ConfluenceLiveWorker:
         raw DexScreener snapshot, which can sit still ("frozen") on thin
         liquidity even when nothing is wrong. See models.orm's
         ConfluenceLiveTrade.real_price docstring.
+
+        Adaptive interval (2026-09-25) — real incident: Gavel's DexScreener
+        snapshot climbed steadily to +40% while its REAL price had already
+        collapsed to -33% underneath, and the 60s-throttled guard only
+        caught it once, at the very end of that window — the snapshot
+        never showed anything wrong even once. A position showing a real
+        unrealized gain is exactly the one worth protecting fastest (there
+        is real profit that a sudden dump can take back), so this checks
+        every _LIQUIDITY_CHECK_INTERVAL_FAST_S instead of
+        _LIQUIDITY_CHECK_INTERVAL_S once the snapshot-based unrealized gain
+        crosses _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT. Deliberately NOT
+        applied to every position — that was tried once already (~20s for
+        everything) and it saturated Jupiter's shared rate limit; this
+        only tightens the check for the (usually few) positions actually
+        worth protecting.
         """
         trade_id = trade["id"]
         now_mono = time.monotonic()
+
+        interval = _LIQUIDITY_CHECK_INTERVAL_S
+        if current_price is not None and trade.get("entry_price"):
+            unrealized_pct = (current_price - trade["entry_price"]) / trade["entry_price"]
+            if unrealized_pct >= _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT:
+                interval = _LIQUIDITY_CHECK_INTERVAL_FAST_S
+
         last_check = self._last_liquidity_check.get(trade_id)
-        if last_check is not None and (now_mono - last_check) < _LIQUIDITY_CHECK_INTERVAL_S:
+        if last_check is not None and (now_mono - last_check) < interval:
             return None, None
         self._last_liquidity_check[trade_id] = now_mono
 
@@ -809,7 +843,7 @@ class ConfluenceLiveWorker:
         current_floor = trade.get("trailing_stop_floor") or initial_floor(trade["entry_price"])
         current_hwm = trade.get("high_watermark_price") or trade["entry_price"]
 
-        guard_reason, guard_price = await self._check_liquidity_guard(trade)
+        guard_reason, guard_price = await self._check_liquidity_guard(trade, current_price)
         if guard_reason is not None:
             # Overrides the snapshot-based decision entirely — the whole
             # point is that the snapshot price is the thing that's wrong

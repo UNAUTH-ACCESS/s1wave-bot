@@ -73,6 +73,24 @@ _CONFIRM_POLL_S    = 2
 _MAX_SELL_RETRIES  = 3
 _SELL_RETRY_DELAY_S = 2.0
 
+# Entry cost ceiling (2026-09-25) — real incident: two buys (Bybit, NUUC)
+# each cost ~$0.55 instead of their intended ~$0.19. Both happened to be
+# the FIRST-EVER trade against a just-migrated pool (pump.fun's own AMM
+# program, confirmed by inspecting the real transaction's account deltas):
+# Solana charges whoever's transaction first touches an uninitialized
+# account for its rent, so our buy paid to create the POOL's own internal
+# vault accounts — money that went to accounts we don't own and can never
+# reclaim, on top of our own position. At a ~$0.015 position size, that's
+# 20-35x the intended size in one unavoidable, un-refundable cost — the
+# opposite of "protect the money first."
+#
+# One normal entry (a single destination token account for us) costs
+# ~1.49M lamports of real rent + the swap principal + a small fee — see
+# _check_entry_cost()'s docstring for how this ceiling was chosen: comfortable
+# margin above that normal case, solidly below the ~4.6M-lamport-of-extra-
+# overhead case that actually happened.
+_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
+
 
 @dataclass
 class ExecutionResult:
@@ -500,6 +518,14 @@ class ExecutionEngine:
                     error_detail="Failed to build swap transaction",
                 )
 
+            # Step 2.5: Pre-flight cost check (2026-09-25) — see
+            # _check_entry_cost()'s docstring for the real incident. Free
+            # (a simulation, never a real transaction) — this is the last
+            # chance to walk away before real money moves.
+            cost_rejection = await self._check_entry_cost(tx_bytes, sol_lamports)
+            if cost_rejection is not None:
+                return cost_rejection
+
             # Step 3: Sign and submit
             tx_sig = await self._sign_and_submit(tx_bytes)
             if not tx_sig:
@@ -708,6 +734,78 @@ class ExecutionEngine:
         except Exception as exc:
             log.error("execution.swap_build_error", error=str(exc))
             return None
+
+    async def _check_entry_cost(self, tx_bytes: bytes, sol_lamports: int) -> ExecutionResult | None:
+        """
+        Real incident, 2026-09-25 — see _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS's
+        comment for the full story: a buy can silently cost 20-35x its
+        intended size when it happens to be the first trade against a
+        freshly-migrated pool, because Solana makes whoever's transaction
+        first touches the pool's own uninitialized vault accounts pay their
+        rent. Simulating the built transaction (free — no fee, no rent,
+        nothing committed to the chain) and checking the PROJECTED real
+        wallet balance change against a ceiling, before ever signing and
+        submitting for real, lets this codebase walk away from an expensive
+        route for the cost of one RPC call instead of real money.
+
+        Returns an ExecutionResult(success=False, ...) if the entry should
+        be aborted (caller must return it immediately, never calling
+        _sign_and_submit) — either because it's projected to cost too much,
+        or because we couldn't verify the cost at all (fails CLOSED: an
+        unverifiable projection is treated the same as an expensive one,
+        since a missed trade costs nothing but a bad one costs real money).
+        Returns None if it's safe to proceed.
+        """
+        try:
+            pre_balance_resp = await self._rpc.get_balance(self._keypair.pubkey())
+            pre_lamports = pre_balance_resp.value
+
+            unsigned = VersionedTransaction.from_bytes(tx_bytes)
+            tx = VersionedTransaction(unsigned.message, [self._keypair])
+            sim = await self._rpc.simulate_transaction(
+                tx, sig_verify=True, accounts_addresses=[self._keypair.pubkey()],
+            )
+
+            if sim.value.err is not None:
+                log.warning("execution.entry_cost_check_simulated_failure",
+                            error=str(sim.value.err))
+                return ExecutionResult(
+                    success=False, error_type="simulated_failure",
+                    error_detail=f"Pre-flight simulation shows this would fail on-chain: {sim.value.err}",
+                )
+
+            accounts = sim.value.accounts
+            if not accounts or accounts[0] is None:
+                log.warning("execution.entry_cost_check_unverifiable",
+                            reason="simulation returned no account data for our wallet")
+                return ExecutionResult(
+                    success=False, error_type="entry_cost_unverifiable",
+                    error_detail="Could not verify the real entry cost before submitting — skipped to protect capital.",
+                )
+
+            projected_post_lamports = accounts[0].lamports
+            projected_cost = pre_lamports - projected_post_lamports
+            ceiling = sol_lamports + _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS
+
+            if projected_cost > ceiling:
+                log.warning("execution.entry_too_expensive",
+                            projected_cost_lamports=projected_cost, ceiling_lamports=ceiling,
+                            sol_lamports=sol_lamports)
+                return ExecutionResult(
+                    success=False, error_type="entry_too_expensive",
+                    error_detail=(
+                        f"Real projected cost ({projected_cost} lamports) exceeds the "
+                        f"{ceiling} lamport ceiling — likely a freshly-created pool requiring "
+                        "extra, unreclaimable vault-account rent. Skipped to protect capital."
+                    ),
+                )
+            return None
+        except Exception as exc:
+            log.warning("execution.entry_cost_check_failed", error_type=type(exc).__name__, error=str(exc))
+            return ExecutionResult(
+                success=False, error_type="entry_cost_check_error",
+                error_detail=f"Could not verify the real entry cost before submitting ({type(exc).__name__}) — skipped to protect capital.",
+            )
 
     async def _sign_and_submit(self, tx_bytes: bytes) -> str | None:
         """
