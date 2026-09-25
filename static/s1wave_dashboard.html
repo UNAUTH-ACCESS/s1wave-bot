@@ -349,7 +349,7 @@ function renderStatusCards(status, shadow) {
   const c4 = `
     <div class="clabel">Shadow Benchmark (paper)</div>
     <div class="bn ${wrClass}">${pct(wr)}</div>
-    <div class="bu">WIN RATE · ${shadow.closed} CLOSED, ${shadow.open} OPEN</div>
+    <div class="bu">WIN RATE · ${shadow.closed} CLOSED, ${shadow.open} OPEN <span style="color:var(--muted)" title="Scoped to trades entered since the current entry-filter set went fully live (${shadow.current_filters_since || 'n/a'}) — mixing in trades from before a filter shipped understates real performance. All-time: ${shadow.all_time ? pct(shadow.all_time.win_rate)+' win, '+shadow.all_time.closed+' closed' : 'n/a'}.">(current filters)ⓘ</span></div>
     <div class="sr"><span class="sl">RUG RATE</span><span class="sv r">${pct(shadow.rug_rate)}</span></div>
     <div class="sr"><span class="sl">MEDIAN TRADE</span><span class="sv g">${pct(shadow.median_pnl_pct)}</span></div>
   `;
@@ -383,7 +383,7 @@ function loadPerf(shadow) {
       <div class="pi"><div class="pil">MEAN (CAPPED +100%)</div><div class="piv ${shadow.mean_pnl_pct_capped>0?'g':'r'}">${pct(shadow.mean_pnl_pct_capped)}</div></div>
     </div>
     <div style="margin-top:14px">${rows}</div>
-    <div class="note">Raw mean is skewed by 2 outlier trades whose peak price shows $0 recorded liquidity — a real order wouldn't fill there. Capped mean is the realistic number to trust.</div>
+    <div class="note">Raw mean is skewed by 2 outlier trades whose peak price shows $0 recorded liquidity — a real order wouldn't fill there. Capped mean is the realistic number to trust. All numbers above are scoped to trades since the current entry filters went fully live (${shadow.current_filters_since || 'n/a'})${shadow.all_time ? ` — all-time (mixing older filter regimes): ${pct(shadow.all_time.win_rate)} win rate, ${pct(shadow.all_time.mean_pnl_pct_capped)} capped mean, ${shadow.all_time.closed} closed` : ''}.</div>
   `;
 }
 

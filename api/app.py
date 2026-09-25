@@ -9,6 +9,7 @@ Confluence (the current, real strategy — see api/app.py's own section
 comment below for why the ones after it are frozen/historical):
 GET /confluence/status          — kill switch, wallet balance, equity, gates
 GET /confluence/live/trades     — real, on-chain confluence_entry_v1 trades
+GET /confluence/live/stats      — real-money win rate/rug rate, current-filters vs all-time (2026-09-25)
 GET /confluence/notifications   — in-app notification history (2026-09-24)
 GET /confluence/stream          — SSE: live status + open trades w/ live
                                    price + notifications, ~1s cadence (2026-09-24)
@@ -57,6 +58,7 @@ from sqlalchemy import select, func, desc, and_
 
 from engine.live_equity import compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
+from workers.entry_filters import CURRENT_FILTER_REGIME_SINCE
 
 from config.logging import log_file_path
 from config.settings import settings
@@ -192,6 +194,45 @@ async def _build_confluence_status() -> dict:
         "daily_loss_limit_usd": str(daily_limit.quantize(Decimal("0.01"))) if daily_limit is not None else None,
         "min_tradeable_usd": settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,
         "max_loss_usd": settings.CONFLUENCE_LIVE_MAX_LOSS_USD,
+    }
+
+
+def _compute_pct_stats(rows: list[tuple]) -> dict:
+    """
+    Shared win-rate/rug-rate/mean-pnl computation (2026-09-25), used by
+    both the shadow and live stats endpoints so the two are computed the
+    same way and can never quietly drift apart. `rows` is a list of
+    (pnl_pct, exit_reason) tuples — pnl_pct as a plain float or None.
+
+    Two trades in the shadow dataset are single-tick jumps to a price
+    still live hours later with real volume (not reverted glitches) but
+    both show $0 recorded liquidity — a real sell order would not
+    realistically fill near that price. Capping each trade's counted gain
+    at +100% (see analysis/sl_tp_and_concurrency_sweep.py's
+    REALISTIC_FILL_CAP) is the honest number for decision-making; the raw
+    mean is reported too, but the capped one is what should actually be
+    trusted.
+    """
+    n = len(rows)
+    pnls = [float(p) for p, _ in rows if p is not None]
+    wins = [p for p in pnls if p > 0]
+    rugs = [p for p in pnls if p <= -0.40]
+    reasons: dict[str, int] = {}
+    for _, reason in rows:
+        reasons[reason or "unknown"] = reasons.get(reason or "unknown", 0) + 1
+
+    REALISTIC_FILL_CAP = 1.0
+    capped = [min(p, REALISTIC_FILL_CAP) for p in pnls]
+
+    return {
+        "closed": n,
+        "win_rate": round(len(wins) / n, 4) if n else None,
+        "median_pnl_pct": round(sorted(pnls)[len(pnls) // 2], 4) if pnls else None,
+        "mean_pnl_pct_raw": round(sum(pnls) / len(pnls), 4) if pnls else None,
+        "mean_pnl_pct_capped": round(sum(capped) / len(capped), 4) if capped else None,
+        "rug_rate": round(len(rugs) / n, 4) if n else None,
+        "rug_avg_pnl_pct": round(sum(rugs) / len(rugs), 4) if rugs else None,
+        "exit_reasons": reasons,
     }
 
 
@@ -908,6 +949,39 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.get("/confluence/live/stats", tags=["confluence"])
+    async def confluence_live_stats() -> dict:
+        """
+        Real-money equivalent of /confluence/shadow/stats (2026-09-25) —
+        same _compute_pct_stats() helper, same current-filters-vs-all-time
+        split, so the two can be compared apples-to-apples and neither can
+        silently drift from the other's definition of win_rate/rug_rate/etc.
+        pnl_pct here is derived (pnl_usd / position_usd * 100) since
+        ConfluenceLiveTrade stores absolute dollars, not a percentage.
+        """
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(ConfluenceLiveTrade.pnl_usd, ConfluenceLiveTrade.position_usd,
+                       ConfluenceLiveTrade.exit_reason, ConfluenceLiveTrade.entry_time)
+                .where(ConfluenceLiveTrade.status == "closed")
+            )).all()
+
+        def to_pct_rows(source):
+            return [
+                (float(pnl_usd / position_usd * 100) if pnl_usd is not None and position_usd else None, reason)
+                for pnl_usd, position_usd, reason, _ in source
+            ]
+
+        all_rows = to_pct_rows(rows)
+        current_rows = to_pct_rows([r for r in rows if r[3] >= CURRENT_FILTER_REGIME_SINCE])
+
+        current_stats = _compute_pct_stats(current_rows)
+        return {
+            "current_filters_since": CURRENT_FILTER_REGIME_SINCE.isoformat(),
+            **current_stats,
+            "all_time": _compute_pct_stats(all_rows),
+        }
+
     @app.get("/confluence/live/trades", tags=["confluence"])
     async def confluence_live_trades(
         status: str = Query(default="open"),
@@ -951,45 +1025,39 @@ def create_app() -> FastAPI:
 
     @app.get("/confluence/shadow/stats", tags=["confluence"])
     async def confluence_shadow_stats() -> dict:
-        """Aggregate stats for the confluence_entry_v1 paper benchmark."""
+        """
+        Aggregate stats for the confluence_entry_v1 paper benchmark.
+
+        Top-level fields are scoped to entry_time >=
+        entry_filters.CURRENT_FILTER_REGIME_SINCE (2026-09-25) — real
+        problem this fixes: a single all-time number mixes trades from
+        before and after each entry filter shipped, which can look
+        misleadingly bad (a live win rate that looked like 36% turned out
+        to be 66%, matching this same shadow benchmark, once trades from
+        before all 3 current filters existed were excluded). `all_time`
+        nests the same shape computed over every closed trade ever, for
+        anyone who wants the full history. Update CURRENT_FILTER_REGIME_SINCE
+        whenever a filter ships and both views stay honest without anyone
+        having to remember to ask for this cut by hand again.
+        """
         async with get_session() as session:
             open_count = (await session.execute(
                 select(func.count()).select_from(ConfluenceShadowPosition).where(ConfluenceShadowPosition.status == "open")
             )).scalar_one()
             closed = (await session.execute(
-                select(ConfluenceShadowPosition.pnl_pct, ConfluenceShadowPosition.exit_reason)
+                select(ConfluenceShadowPosition.pnl_pct, ConfluenceShadowPosition.exit_reason, ConfluenceShadowPosition.entry_time)
                 .where(ConfluenceShadowPosition.status == "closed")
             )).all()
 
-        n = len(closed)
-        pnls = [float(p) for p, _ in closed if p is not None]
-        wins = [p for p in pnls if p > 0]
-        rugs = [p for p in pnls if p <= -0.40]
-        reasons: dict[str, int] = {}
-        for _, reason in closed:
-            reasons[reason or "unknown"] = reasons.get(reason or "unknown", 0) + 1
+        all_rows = [(p, r) for p, r, _ in closed]
+        current_rows = [(p, r) for p, r, t in closed if t >= CURRENT_FILTER_REGIME_SINCE]
 
-        # Two trades in this dataset are single-tick jumps to a price still
-        # live hours later with real volume (not reverted glitches) but both
-        # show $0 recorded liquidity — a real sell order would not
-        # realistically fill near that price. Capping each trade's counted
-        # gain at +100% (see analysis/sl_tp_and_concurrency_sweep.py's
-        # REALISTIC_FILL_CAP) is the honest number for decision-making; the
-        # raw mean is reported too, but the capped one is what should
-        # actually be trusted.
-        REALISTIC_FILL_CAP = 1.0
-        capped = [min(p, REALISTIC_FILL_CAP) for p in pnls]
-
+        current_stats = _compute_pct_stats(current_rows)
         return {
             "open": open_count,
-            "closed": n,
-            "win_rate": round(len(wins) / n, 4) if n else None,
-            "median_pnl_pct": round(sorted(pnls)[len(pnls) // 2], 4) if pnls else None,
-            "mean_pnl_pct_raw": round(sum(pnls) / len(pnls), 4) if pnls else None,
-            "mean_pnl_pct_capped": round(sum(capped) / len(capped), 4) if capped else None,
-            "rug_rate": round(len(rugs) / n, 4) if n else None,
-            "rug_avg_pnl_pct": round(sum(rugs) / len(rugs), 4) if rugs else None,
-            "exit_reasons": reasons,
+            "current_filters_since": CURRENT_FILTER_REGIME_SINCE.isoformat(),
+            **current_stats,
+            "all_time": _compute_pct_stats(all_rows),
         }
 
     @app.get("/confluence/shadow/positions", tags=["confluence"])

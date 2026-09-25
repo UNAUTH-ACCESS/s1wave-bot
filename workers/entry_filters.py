@@ -105,7 +105,7 @@ synchronous function, not async.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -116,6 +116,22 @@ from models.orm import TokenEvaluation
 WASH_TRADING_REASON = "WASH_TRADING"
 LIQUIDITY_CEILING_USD = Decimal("30000")
 BUY_PRESSURE_FLOOR = Decimal("0.97")
+
+# Single source of truth for "since when has the CURRENT full filter set
+# been live" (2026-09-25) — the moment the last of these three filters
+# (buy-pressure) went live, found from the first-ever low_bp_skip row's
+# entry_time. Real problem this fixes: a stats view mixing trades from
+# before and after a filter shipped produces a misleading number (a live
+# win rate that looked like 36% turned out to be 66% — matching the shadow
+# benchmark — once trades from before all 3 filters existed were excluded).
+# api/app.py's stats endpoints use this to report BOTH the honest all-time
+# number and the "since current rules" one side by side, so nobody has to
+# remember to ask for this cut by hand again.
+#
+# UPDATE THIS whenever a new entry filter ships (or an existing one's
+# threshold changes materially) — it should always reflect the moment the
+# CURRENTLY active filter combination first became fully live together.
+CURRENT_FILTER_REGIME_SINCE = datetime(2026, 9, 25, 1, 29, 50, tzinfo=timezone.utc)
 
 
 async def is_wash_trading_rejected(
