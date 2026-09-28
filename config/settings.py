@@ -174,7 +174,22 @@ class Settings(BaseSettings):
     # all show up in it for free) without a separate profit-redeployment
     # knob, and is inherently protective: after a loss, equity is smaller,
     # so the very next position is automatically smaller too.
-    CONFLUENCE_LIVE_EXPOSURE_PCT: Annotated[float, Field(gt=0, le=1)] = 0.015
+    #
+    # 2026-09-28: raised 1.5% -> 50% (total, still / 5 slots = 10% of
+    # equity per slot), per the user's explicit instruction after the
+    # real on-chain audit trail found the account's real losses were
+    # driven almost entirely by a fixed-dollar fee floor, not bad signal
+    # quality: average real fee per trade (~$0.25, mostly the
+    # non-reclaimable Pump.fun protocol-fee account) was ~91% of the
+    # average ~$0.29 real position size at 1.5%. At the post-top-up
+    # equity (~$11.30, after the user added $7), 50% total / 5 slots
+    # produces ~$1.13/trade — fee ratio drops to ~22%, the level judged
+    # to actually give the entry signal's real edge (validated the same
+    # day against a 3x-bigger 403-trade shadow sample — see NOTEBOOK.md's
+    # 2026-09-28 entry) room to show up in the real dollar P&L instead of
+    # being pre-determined by fixed costs. MAX_CONCURRENT stayed at 5
+    # (user's explicit instruction, not raised alongside this).
+    CONFLUENCE_LIVE_EXPOSURE_PCT: Annotated[float, Field(gt=0, le=1)] = 0.50
     # Real daily-loss circuit breaker, separate from the paper one
     # CapitalEngine/RiskEngine already have — halts new live entries for
     # the rest of the UTC day if today's realized real P&L drops below
