@@ -467,18 +467,21 @@ async def test_entry_cost_check_allows_a_normal_single_account_entry():
 
 
 @pytest.mark.asyncio
-async def test_entry_cost_check_now_allows_the_bybit_incident_magnitude():
+async def test_entry_cost_check_rejects_a_freshly_migrated_pool():
     """Real numbers from the actual Bybit incident: ~4.75M lamports real
-    cost against a ~135K intended swap. Originally this was rejected
-    (ceiling 2.2M) — RAISED to 5.0M on 2026-09-28 after checking what the
-    ceiling was actually blocking: 16 real live entries this size or
-    smaller, 14 of 15 with a known outcome would have WON (93.3%, see
-    _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS's comment for the full analysis).
-    This exact overhead (~4.65M) sits right in the middle of that same
-    well-characterized, usually-profitable band — there was never
-    anything that made the Bybit trade specifically worse than the ones
-    that turned out to be big winners, just that it was the first one
-    anyone noticed the cost on."""
+    cost against a ~135K intended swap — must be rejected, not submitted.
+
+    2026-09-28: briefly raised this ceiling to 5.0M (which would have
+    ALLOWED this exact case) after a shadow-position counterfactual
+    showed 14/15 similarly-rejected tokens would have won big. Reverted
+    back to 2.2M the same day on stronger, if smaller, evidence: the
+    first 3 real live entries the raise actually let through were all
+    exited by the liquidity guard within 0.3-2 seconds — a real sell
+    quote for the full position showed the freshly-migrated pool
+    couldn't be round-tripped yet, something the shadow counterfactual
+    (price-only, never executes a real sell) could never have caught.
+    See _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS's comment for the full story
+    before changing this again."""
     engine = make_engine()
     tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
     sol_lamports = 134_730
@@ -491,15 +494,16 @@ async def test_entry_cost_check_now_allows_the_bybit_incident_magnitude():
     )
 
     result = await engine._check_entry_cost(tx_bytes, sol_lamports)
-    assert result is None  # safe to proceed
+    assert result is not None
+    assert result.success is False
+    assert result.error_type == "entry_too_expensive"
 
 
 @pytest.mark.asyncio
-async def test_entry_cost_check_still_rejects_something_beyond_the_observed_band():
-    """The ceiling isn't gone, just recalibrated to the real, observed
-    ~4.6-4.75M-lamport band — something meaningfully beyond every case
-    actually seen (e.g. multiple missing accounts, not just one pool's
-    vaults) must still be caught."""
+async def test_entry_cost_check_rejects_something_even_more_extreme():
+    """A cost well beyond even the Bybit-incident magnitude (e.g.
+    multiple missing accounts, not just one pool's vaults) must still be
+    caught."""
     engine = make_engine()
     tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
     sol_lamports = 134_730

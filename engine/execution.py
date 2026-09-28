@@ -86,30 +86,31 @@ _SELL_RETRY_DELAY_S = 2.0
 # 20-35x the intended size in one unavoidable, un-refundable cost — the
 # opposite of "protect the money first."
 #
-# RAISED 2.2M -> 5.0M lamports (2026-09-28), after checking what this
-# ceiling was actually rejecting: 16 real live entries blocked as
-# "entry_too_expensive" since this shipped, every one of them ALSO opened
-# as a shadow position (shadow has no real transaction cost, so it's an
-# exact counterfactual — same signal, same entry/exit rules, same 1s
-# monitoring). Result: 14 of 15 closed would have WON (93.3%), mean
-# +48.8% raw / +39.1% capped, the one loss a small -13.3% stop-loss, not
-# a rug. Mechanistically this makes sense: "first trade against a
-# freshly-migrated pool" is the same population workers/entry_filters.py's
-# liquidity ceiling already identified as the strategy's best-performing
-# segment — this cost gate and that filter were pointing at the same
-# tokens from opposite directions. The real overhead observed clusters
-# tightly at ~4.6-4.75M lamports every time (including the original
-# Bybit/NUUC incident, ~4.65M) — a common, predictable, usually-profitable
-# fixed cost, not the rare blowout the original 2.2M ceiling assumed. Also
-# a $0.50ish fixed cost was crushing at the ~$0.015-0.29 positions this
-# was calibrated against; it's a much smaller bite at the ~$1+ positions
-# CONFLUENCE_LIVE_EXPOSURE_PCT=0.50 now produces. 5.0M clears every
-# observed case (max ~4.73M) with real margin while still catching
-# anything genuinely more extreme than what's actually been seen.
+# RAISED 2.2M -> 5.0M lamports, then REVERTED back to 2.2M, both on
+# 2026-09-28. The raise was backed by real evidence: a shadow-position
+# counterfactual on the 16 tokens this ceiling had rejected showed 14/15
+# would have WON (93.3%, mean +48.8% raw / +39.1% capped) — see this
+# session's git history for the full analysis. But shadow only measures
+# PRICE over a long hold; it never has to execute a real sell, so it
+# never tested whether a freshly-migrated pool has enough REAL DEPTH to
+# round-trip a live position. It doesn't, at least not immediately: of
+# the first 3 real live entries let through by the raise (DISNEY, LOADPAD,
+# xSOL), all 3 were exited by the liquidity guard within 0.3-2 SECONDS of
+# entry — its very first check runs immediately with no grace period, and
+# a real sell quote for the full position showed >=35% price impact on
+# all three (price itself barely moved; the loss was almost entirely the
+# fixed vault-creation cost, ~$0.2-0.4 each). Reverted back to 2.2M on
+# that real, if small (n=3), live-money evidence rather than the larger
+# but execution-blind shadow sample. If this gets revisited, the more
+# targeted fix is probably a short grace period before the liquidity
+# guard's FIRST check on a freshly-entered position (giving a newly
+# migrated pool a moment to deepen) rather than only moving this ceiling
+# again — untried as of this writing.
+#
 # One normal entry (a single destination token account for us) costs
 # ~1.49M lamports of real rent + the swap principal + a small fee — see
 # _check_entry_cost()'s docstring for the exact math.
-_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 5_000_000
+_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
 
 # withdraw_sol() (2026-09-28): a plain System Program transfer's real
 # network fee is ~5,000 lamports — this reserve is comfortably above that,
