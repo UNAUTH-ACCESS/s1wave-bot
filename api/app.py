@@ -205,7 +205,7 @@ async def _build_confluence_status() -> dict:
         "closed_trades": closed_count,
         "max_concurrent": settings.CONFLUENCE_LIVE_MAX_CONCURRENT,
         "exposure_pct": settings.CONFLUENCE_LIVE_EXPOSURE_PCT,
-        "permanently_halted": is_permanently_halted(equity, all_time_pnl),
+        "permanently_halted": is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD),
         "daily_halted": is_daily_halted(equity, today_pnl),
         "daily_loss_limit_usd": str(daily_limit.quantize(Decimal("0.01"))) if daily_limit is not None else None,
         "min_tradeable_usd": settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,

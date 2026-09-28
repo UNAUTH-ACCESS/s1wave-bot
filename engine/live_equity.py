@@ -93,17 +93,46 @@ def compute_position_usd(equity_usd: Decimal) -> Decimal:
     return max(Decimal("0"), min(position_usd, ceiling))
 
 
-def is_permanently_halted(equity_usd: Decimal | None, all_time_pnl_usd: Decimal | None = None) -> bool:
+def is_permanently_halted(
+    equity_usd: Decimal | None, all_time_pnl_usd: Decimal | None = None, deposit_usd: Decimal | None = None,
+) -> bool:
     """Unknown equity (None) is treated as NOT halted here — a transient RPC
     failure must block new entries via the caller's own None-handling
     upstream (no equity to size against), not masquerade as a halt state.
     all_time_pnl_usd is optional so existing callers that only care about
     the dust floor don't break; omitting it just skips the lifetime-loss
-    check, it never itself causes a halt."""
+    check, it never itself causes a halt.
+
+    CRITICAL FIX, 2026-09-28: all_time_pnl_usd (a sum of per-trade pnl_usd)
+    was confirmed, via a full on-chain audit, to understate real losses by
+    6.36x in aggregate — built from INTENDED swap amounts, missing a
+    mandatory, non-reclaimable Pump.fun protocol-fee cost on some sells.
+    Real consequence found live: CONFLUENCE_LIVE_MAX_LOSS_USD (set to
+    $3.00) had ALREADY been breached in reality (real loss ~$6.71 against
+    a $10.65 deposit) while this function kept reporting "not halted",
+    because it only ever saw the understated -$1.21 figure. Trading kept
+    running past its own stated stop-loss the whole time.
+
+    deposit_usd (optional) lets a caller ALSO check the ground-truth gap
+    (current equity vs. the wallet's one real deposit) — this doesn't
+    depend on any per-trade attribution at all, so it can't be fooled the
+    same way. Deliberately a parameter, not DEPOSIT_USD baked in directly:
+    that constant is real, production-specific data, and hardcoding it
+    here would make this shared function's behavior depend on unrelated
+    real-world state inside tests that pass their own arbitrary equity
+    numbers. The real call site (confluence_live_worker.py) passes
+    deposit_usd=DEPOSIT_USD explicitly. Halts on EITHER signal crossing
+    the limit, whichever is worse; omitting deposit_usd just skips this
+    check, same as omitting all_time_pnl_usd skips that one.
+    """
     if equity_usd is not None and equity_usd <= Decimal(str(settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD)):
         return True
     if all_time_pnl_usd is not None and all_time_pnl_usd <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):
         return True
+    if equity_usd is not None and deposit_usd is not None:
+        real_loss = equity_usd - deposit_usd
+        if real_loss <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):
+            return True
     return False
 
 

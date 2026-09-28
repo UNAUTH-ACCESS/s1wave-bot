@@ -2174,6 +2174,34 @@ class TestInAppNotifications:
         assert "3.00" in halt_rows[0].message  # names the configured limit, not just the number lost
 
     @pytest.mark.asyncio
+    async def test_real_deposit_gap_halt_names_the_real_reason_not_dust_floor(self, session, monkeypatch):
+        """Real bug found deploying the 2026-09-28 deposit-gap fix: a halt
+        from THIS check was reported as 'wallet balance $4.35 is below the
+        $1.00 minimum' — false on its face (4.35 > 1.00) since the message
+        logic only knew about two of what are now three halt conditions.
+        Real numbers from that incident."""
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(mod, "DEPOSIT_USD", Decimal("10.65"))
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            # equity=$4.35, recorded all_time_pnl only -$1.21 (looks fine on
+            # its own) — but real loss against the $10.65 deposit is $6.30,
+            # well past the $3 cap.
+            await worker._refresh_halt_notifications(Decimal("4.35"), Decimal("0"), Decimal("-1.21"))
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        halt_rows = [r for r in rows if r.event == "permanently_halted"]
+        assert len(halt_rows) == 1
+        message = halt_rows[0].message
+        assert "below the $1.00 minimum" not in message  # the wrong, misleading reason
+        assert "real loss" in message
+        assert "10.65" in message  # names the real deposit, not just the limit
+
+    @pytest.mark.asyncio
     async def test_max_loss_usd_does_not_halt_below_the_limit(self, session, monkeypatch):
         monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
         worker = make_worker(session)
@@ -2322,6 +2350,12 @@ class TestInAppNotifications:
     @pytest.mark.asyncio
     async def test_daily_halted_notifies_once_across_many_checks(self, session, monkeypatch):
         monkeypatch.setattr(settings, "CONFLUENCE_LIVE_DAILY_LOSS_LIMIT_PCT", 0.5)
+        # 2026-09-28: is_permanently_halted() now also checks equity against
+        # the real DEPOSIT_USD constant — this test's equity=$4 dummy value
+        # would otherwise collide with that real-world number and trip a
+        # permanent halt before daily-halt logic (what this test actually
+        # covers) ever runs. A large ceiling here isolates the two checks.
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 1000.0)
         worker = make_worker(session)
         ctx = patched_session(session)
         try:

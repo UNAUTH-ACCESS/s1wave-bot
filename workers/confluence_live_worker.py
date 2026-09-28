@@ -135,7 +135,7 @@ from database.engine import get_session
 from engine.execution import ExecutionEngine
 from engine.sell_coordination import finish_sell, try_start_sell
 from engine.live_equity import (
-    compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
+    DEPOSIT_USD, compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
 )
 from engine.trailing_stop import initial_floor, update_trailing_stop
 from models.orm import (
@@ -483,16 +483,36 @@ class ConfluenceLiveWorker:
         first_check = not self._halt_state_initialized
         self._halt_state_initialized = True
 
-        perm_halted = is_permanently_halted(equity, all_time_pnl)
+        perm_halted = is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD)
         if perm_halted != self._last_permanently_halted:
             self._last_permanently_halted = perm_halted
             if perm_halted:
+                # Three independent halt conditions (2026-09-28: added the
+                # real-deposit-gap one) — report whichever ACTUALLY
+                # matched, not just guess "dust floor" as the fallback.
+                # Real bug found deploying that exact fix: a real halt from
+                # the new deposit-gap check got reported as "wallet balance
+                # $4.35 is below the $1.00 minimum" — false on its face
+                # (4.35 > 1.00) and pointing at the wrong cause entirely.
                 max_loss_hit = all_time_pnl <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
-                reason = (
-                    f"realized losses reached the ${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} test-phase limit "
-                    f"(all-time: ${all_time_pnl:.2f})" if max_loss_hit else
-                    f"wallet balance ${equity:.2f} is below the ${settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD:.2f} minimum"
-                )
+                real_loss = (equity - DEPOSIT_USD) if equity is not None else None
+                deposit_gap_hit = real_loss is not None and real_loss <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
+                dust_floor_hit = equity is not None and equity <= Decimal(str(settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD))
+                if max_loss_hit:
+                    reason = (
+                        f"realized losses reached the ${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} test-phase limit "
+                        f"(all-time: ${all_time_pnl:.2f})"
+                    )
+                elif deposit_gap_hit:
+                    reason = (
+                        f"real loss against the ${DEPOSIT_USD:.2f} deposit reached the "
+                        f"${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} limit (wallet: ${equity:.2f}, "
+                        f"real loss: ${real_loss:.2f})"
+                    )
+                elif dust_floor_hit:
+                    reason = f"wallet balance ${equity:.2f} is below the ${settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD:.2f} minimum"
+                else:
+                    reason = "an unknown safety gate"  # should be unreachable — is_permanently_halted() found nothing new
                 await self._notify("critical", "permanently_halted",
                                     f"Trading halted — {reason}. A human needs to re-enable it to resume.")
             elif not first_check:
@@ -552,7 +572,7 @@ class ConfluenceLiveWorker:
             return False
 
         all_time_pnl = await self._load_all_time_realized_pnl()
-        if is_permanently_halted(equity, all_time_pnl):
+        if is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD):
             return False
 
         today_pnl = await self._load_today_realized_pnl()
