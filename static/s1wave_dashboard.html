@@ -67,6 +67,8 @@
   .wlabel input { font-family:'Space Mono',monospace; font-size:13px; padding:9px 10px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--bright); }
   .wlabel input:focus { outline:none; border-color:var(--danger); }
   .withdraw-hint { margin-top:10px; font-size:11px; color:var(--muted); line-height:1.5; }
+  .baseline-note { margin-top:10px; font-size:10.5px; color:var(--muted); line-height:1.5; }
+  .baseline-note a { color:var(--accent2); }
   .btn.toggle.resume-halted { border-color:rgba(255,68,68,.6); color:#fff; background:rgba(255,68,68,.85); }
   .btn.toggle.resume-halted:hover { background:rgba(255,68,68,1); }
 
@@ -488,6 +490,7 @@ function loadGates(status) {
         : dayHalt ? '⏸ Daily loss limit hit — paused until next UTC day.'
         : '✓ All clear — new entries permitted (subject to CONFLUENCE_LIVE_ENABLED).'}
     </div>
+    ${!permHalt ? `<div class="baseline-note">Drawdown baseline set ${status.halt_override_acknowledged_at ? absoluteTime(status.halt_override_acknowledged_at) : 'at the original deposit'} — after a top-up or withdrawal, <a href="#" onclick="recalibrateBaseline(event)">recalibrate to the current balance</a>.</div>` : ''}
   `;
 }
 
@@ -934,6 +937,28 @@ async function resumeHaltedTrading() {
     alert('Failed to resume: ' + e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '⚠ RESUME HALTED TRADING'; }
+  }
+}
+
+// ── Recalibrate the drawdown baseline (2026-09-28) ──────────────────────
+// Same underlying endpoint as the halted-only RESUME button, now also
+// usable any time — a deposit only ever widens the real safety cushion
+// (harmless either way), but the whole point of switching the cap to a
+// percentage was for it to track the CURRENT balance, so this exists for
+// "I just added funds, make the 30% apply to the new number now" rather
+// than waiting for the baseline to drift back into relevance on its own.
+async function recalibrateBaseline(evt) {
+  if (evt) evt.preventDefault();
+  const equity = lastStatus.equity_usd ? `$${lastStatus.equity_usd}` : 'the current balance';
+  const pctLabel = lastStatus.max_loss_pct !== undefined ? `${(lastStatus.max_loss_pct * 100).toFixed(0)}%` : 'the configured %';
+  if (!confirm(`Recalibrate the drawdown baseline to ${equity} right now?\n\nThe ${pctLabel} drawdown cap will be measured from this balance going forward, not the old one.`)) return;
+  try {
+    const res = await fetch(BASE + '/confluence/resume-halted', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || ('HTTP ' + res.status));
+    await loadStatusCards();
+  } catch (e) {
+    alert('Failed to recalibrate: ' + e.message);
   }
 }
 

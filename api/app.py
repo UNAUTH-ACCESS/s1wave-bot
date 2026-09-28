@@ -942,20 +942,24 @@ def create_app() -> FastAPI:
     @app.post("/confluence/resume-halted", tags=["confluence"])
     async def confluence_resume_halted() -> dict:
         """
-        Acknowledge a permanent halt and resume trading (2026-09-28) — the
-        dashboard's RESUME HALTED TRADING button. Deliberately NOT a
-        simple re-enable: see engine/halt_override.py and
-        models.orm.ConfluenceLiveHaltOverride for the full design — this
-        resets the safety check's baseline to right now rather than
-        disabling it, so the same CONFLUENCE_LIVE_MAX_LOSS_PCT cap keeps
-        protecting every dollar from this point forward. Does NOT touch
-        CONFLUENCE_LIVE_ENABLED — if trading was manually paused before
-        the halt, it stays paused; this only clears
-        is_permanently_halted()'s block on new entries.
+        Reset the drawdown-cap baseline to right now (2026-09-28) — the
+        dashboard's RESUME HALTED TRADING button, and ALSO (2026-09-28,
+        broadened) usable any time a deposit or other deliberate capital
+        change means CONFLUENCE_LIVE_MAX_LOSS_PCT should be measured
+        against the new balance instead of a stale one — a real gap found
+        the same day a $7 top-up landed while an old halt's baseline
+        ($4.33) was still in effect: the 30% cap stayed pinned to the old
+        number instead of the fresh $11+ balance until this was called
+        again. Originally required `permanently_halted` to be true; that
+        restriction is gone since acknowledging a fresh baseline is a
+        strictly safe operation whether or not a halt is currently active
+        — see engine/halt_override.py and models.orm.ConfluenceLiveHaltOverride
+        for the full baseline-reset design. Does NOT touch
+        CONFLUENCE_LIVE_ENABLED — if trading was manually paused, it stays
+        paused; this only resets is_permanently_halted()'s reference point.
         """
         status = await _build_confluence_status()
-        if not status["permanently_halted"]:
-            raise HTTPException(status_code=400, detail="Trading is not currently halted — nothing to resume.")
+        was_halted = status["permanently_halted"]
         if status["equity_usd"] is None:
             raise HTTPException(status_code=503, detail="Wallet balance not available — try again in a moment.")
         equity_usd = Decimal(status["equity_usd"])
@@ -967,7 +971,8 @@ def create_app() -> FastAPI:
                 level="warning",
                 event="halt_resumed",
                 message=(
-                    f"Halt acknowledged and trading RESUMED from the dashboard. "
+                    (f"Halt acknowledged and trading RESUMED from the dashboard. " if was_halted
+                     else "Drawdown-cap baseline recalibrated to the current balance. ") +
                     f"New baseline: equity ${equity_usd:.2f}, all-time P&L ${all_time_pnl_usd:.2f} — "
                     f"the {settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} drawdown cap (${new_max_loss_usd:.2f}) now "
                     f"protects every dollar from this point forward."
