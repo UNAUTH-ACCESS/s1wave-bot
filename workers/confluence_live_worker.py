@@ -127,7 +127,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 
 from config.logging import get_logger
 from config.settings import settings
@@ -235,6 +235,30 @@ _UNSELLABLE_AFTER_S = 600.0
 # critical path.
 _RENT_SWEEP_INTERVAL_S = 1800.0  # 30 minutes
 
+# Real-audit-trail backfill (2026-09-28) — "make the audit system more
+# robust": the 71 trades closed before entry_real_sol_lamports/
+# exit_real_sol_lamports existed have real transaction signatures already
+# stored but no real-delta data. This self-heals them using the exact same
+# real, on-chain lookup (ExecutionEngine.get_real_tx_delta()) as every live
+# trade already gets — no manual forensic script needed ever again.
+# real_pnl_usd is intentionally left NULL for backfilled trades even once
+# entry+exit are known — the historical rent-reclaim transaction's
+# signature was never stored anywhere, so it can't be included without
+# guessing, and a real_pnl_usd computed from only 2 of 3 components would
+# be the same kind of misleading partial number this whole fix exists to
+# eliminate. entry_real_sol_lamports/exit_real_sol_lamports are still
+# hugely more accurate than nothing.
+#
+# Batch size covers the entire historical backlog in one sweep (2026-09-28,
+# corrected from an initial 5/hour that would have taken 15+ hours to
+# finish a one-time 71-trade catch-up) — 142 gentle, spaced-out lookups
+# take under a minute. Once the backlog is cleared, this sweep finds
+# nothing to do and costs nothing; the interval only matters for however
+# many sweeps it takes to fully catch up, never for steady-state.
+_AUDIT_BACKFILL_INTERVAL_S = 900.0     # 15 minutes between sweeps
+_AUDIT_BACKFILL_BATCH_SIZE = 200        # comfortably above the historical backlog
+_AUDIT_BACKFILL_LOOKUP_DELAY_S = 0.4    # gentle pacing between RPC calls
+
 # Sell-retry backoff for a persistently-failing exit (2026-09-25) — real,
 # live incident: SEND's exit reason (TIME_EXIT, permanently true forever
 # once past max_hold_seconds) re-triggered a full real sell attempt (a
@@ -315,6 +339,9 @@ class ConfluenceLiveWorker:
         # comment. None means "never run yet," so the very first cycle
         # doesn't wait a full interval before the first sweep.
         self._last_rent_sweep: float | None = None
+        # Real-audit-trail backfill (2026-09-28) — see
+        # _AUDIT_BACKFILL_INTERVAL_S's comment. None means "never run yet."
+        self._last_audit_backfill: float | None = None
         self._execution = ExecutionEngine(
             paper_override=False,
             wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
@@ -355,6 +382,7 @@ class ConfluenceLiveWorker:
         all_time_pnl = await self._load_all_time_realized_pnl() if equity is not None else Decimal("0")
         await self._refresh_halt_notifications(equity, today_pnl, all_time_pnl)
         await self._maybe_sweep_rent()
+        await self._maybe_backfill_audit_trail()
 
         if settings.CONFLUENCE_LIVE_ENABLED:
             await self._maybe_enter()
@@ -565,6 +593,76 @@ class ConfluenceLiveWorker:
                 f"{'s' if len(reclaimed) != 1 else ''} during a routine sweep.",
             )
 
+    async def _maybe_backfill_audit_trail(self) -> None:
+        """
+        See _AUDIT_BACKFILL_INTERVAL_S's comment. Runs regardless of
+        CONFLUENCE_LIVE_ENABLED (same reasoning as the rent sweep and halt
+        notifications — this is historical housekeeping, not an entry
+        decision). Never lets a backfill failure break the trading cycle
+        that triggered it; a trade that fails to backfill this sweep just
+        gets picked up again next time (the WHERE clause below is what
+        makes this naturally idempotent — a row leaves the query the
+        moment it's filled in).
+        """
+        now_mono = time.monotonic()
+        if self._last_audit_backfill is not None and (now_mono - self._last_audit_backfill) < _AUDIT_BACKFILL_INTERVAL_S:
+            return
+        self._last_audit_backfill = now_mono
+
+        try:
+            async with get_session() as session:
+                rows = (await session.execute(
+                    select(ConfluenceLiveTrade)
+                    .where(
+                        ConfluenceLiveTrade.status == "closed",
+                        or_(
+                            ConfluenceLiveTrade.entry_real_sol_lamports.is_(None),
+                            ConfluenceLiveTrade.exit_real_sol_lamports.is_(None),
+                        ),
+                    )
+                    .order_by(ConfluenceLiveTrade.entry_time.asc())
+                    .limit(_AUDIT_BACKFILL_BATCH_SIZE)
+                )).scalars().all()
+                trade_ids = [row.id for row in rows]
+                needs = [
+                    (row.id, row.entry_tx_signature if row.entry_real_sol_lamports is None else None,
+                     row.exit_tx_signature if row.exit_real_sol_lamports is None else None)
+                    for row in rows
+                ]
+        except Exception as exc:
+            log.warning("confluence_live.audit_backfill_query_failed", error_type=type(exc).__name__, error=str(exc))
+            return
+
+        if not needs:
+            return
+
+        filled_count = 0
+        for trade_id, entry_tx, exit_tx in needs:
+            entry_result = None
+            exit_result = None
+            if entry_tx:
+                entry_result = await self._execution.get_real_tx_delta(entry_tx)
+                await asyncio.sleep(_AUDIT_BACKFILL_LOOKUP_DELAY_S)
+            if exit_tx:
+                exit_result = await self._execution.get_real_tx_delta(exit_tx)
+                await asyncio.sleep(_AUDIT_BACKFILL_LOOKUP_DELAY_S)
+            if entry_result is None and exit_result is None:
+                continue  # both lookups failed (or nothing needed) — retried next sweep
+
+            async with get_session() as session:
+                row_result = await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade_id))
+                row = row_result.scalar_one_or_none()
+                if row is None:
+                    continue
+                if entry_result is not None:
+                    row.entry_real_sol_lamports, row.entry_network_fee_lamports = entry_result
+                if exit_result is not None:
+                    row.exit_real_sol_lamports, row.exit_network_fee_lamports = exit_result
+            filled_count += 1
+
+        if filled_count:
+            log.info("confluence_live.audit_backfilled", count=filled_count, trade_ids=[str(t) for t in trade_ids])
+
     async def _safe_to_enter(self) -> bool:
         equity = await self._get_equity_usd()
         if equity is None:
@@ -754,6 +852,7 @@ class ConfluenceLiveWorker:
                 # that found entry_sol_lamports above (the intended amount)
                 # understated real spend by 6.36x in aggregate.
                 entry_real_sol_lamports=result.actual_sol_lamports,
+                entry_network_fee_lamports=result.network_fee_lamports,
             )
             session.add(row)
             await session.flush()  # populate row.id for the notification below
@@ -1097,6 +1196,7 @@ class ConfluenceLiveWorker:
             # is known — a missing one (e.g. reclaim never fired) leaves
             # real_pnl_usd NULL rather than a partial, misleading number.
             row.exit_real_sol_lamports = result.actual_sol_lamports
+            row.exit_network_fee_lamports = result.network_fee_lamports
             row.reclaim_tx_signature = result.reclaim_tx_signature
             row.reclaim_sol_lamports = result.reclaim_sol_lamports
             if (row.entry_real_sol_lamports is not None and result.actual_sol_lamports is not None):

@@ -125,6 +125,11 @@ class ExecutionResult:
     actual_price:   Decimal | None = None
     actual_amount:  Decimal | None = None   # token lamports bought
     actual_sol_lamports: int | None = None
+    # Network fee actually charged for THIS swap transaction (2026-09-28,
+    # second pass on the same incident) — itemized separately from
+    # actual_sol_lamports so a per-trade fee breakdown ("network fee: X,
+    # other on-chain costs: Y") can be shown instead of one opaque total.
+    network_fee_lamports: int | None = None
     # Reclaim tracking (2026-09-28) — the rent-reclaim CloseAccount runs as
     # its OWN, separate transaction right after a sell, and its signature
     # and amount were never captured against the trade before. Only ever
@@ -633,7 +638,7 @@ class ExecutionEngine:
             # Step 4: Confirm — also captures this wallet's REAL SOL delta
             # for this transaction (see ExecutionResult.actual_sol_lamports),
             # at no extra RPC cost since it's read from the same confirm response.
-            confirmed, real_sol_delta = await self._confirm_tx_with_delta(tx_sig)
+            confirmed, real_sol_delta, network_fee = await self._confirm_tx_with_delta(tx_sig)
             if not confirmed:
                 return ExecutionResult(
                     success=False,
@@ -681,6 +686,7 @@ class ExecutionEngine:
                 actual_price=actual_price,
                 actual_amount=actual_amount,
                 actual_sol_lamports=real_sol_delta,
+                network_fee_lamports=network_fee,
             )
 
     async def _execute_sell(
@@ -738,7 +744,7 @@ class ExecutionEngine:
             # account (never owned by this wallet, never reclaimable) cost
             # more than the entire quoted proceeds, turning a trade the old
             # accounting called profitable into a real net loss.
-            confirmed, real_sol_delta = await self._confirm_tx_with_delta(tx_sig)
+            confirmed, real_sol_delta, network_fee = await self._confirm_tx_with_delta(tx_sig)
             if not confirmed:
                 return ExecutionResult(
                     success=False,
@@ -788,6 +794,7 @@ class ExecutionEngine:
                 actual_price=actual_price,
                 actual_amount=Decimal(str(sol_out)),
                 actual_sol_lamports=real_sol_delta,
+                network_fee_lamports=network_fee,
                 reclaim_tx_signature=reclaim_tx_signature,
                 reclaim_sol_lamports=reclaim_sol_lamports,
             )
@@ -973,22 +980,28 @@ class ExecutionEngine:
             await asyncio.sleep(_CONFIRM_POLL_S)
         return False
 
-    async def _confirm_tx_with_delta(self, tx_sig: str) -> tuple[bool, int | None]:
+    async def _confirm_tx_with_delta(self, tx_sig: str) -> tuple[bool, int | None, int | None]:
         """
         Same polling loop as _confirm_tx(), plus this wallet's REAL SOL
-        balance delta for the transaction — read from the same response
-        already being fetched to confirm it, so this costs no extra RPC
-        call. Added 2026-09-28 after finding entry_sol_lamports (the
-        intended swap amount) understated real spend by 6.36x in
+        balance delta AND the real network fee paid — both read from the
+        same response already being fetched to confirm it, so this costs
+        no extra RPC call. Added 2026-09-28 after finding entry_sol_lamports
+        (the intended swap amount) understated real spend by 6.36x in
         aggregate: network fees, this wallet's own rent, and — the
         dominant one — a mandatory Pump.fun protocol-fee token account
         (owned by Pump.fun's fee collector, never this wallet, never
         reclaimable) were all invisible to the old accounting. See
         ExecutionResult.actual_sol_lamports's docstring for the full
-        incident. Returns (confirmed, real_delta_lamports) — delta is None
-        if confirmed but this wallet's own balance couldn't be found in
-        the transaction's account list (should be unreachable — this
-        wallet is always the fee payer — but never treated as zero).
+        incident. The fee is itemized SEPARATELY from delta (2026-09-28,
+        second pass — "all fees and capital paid" needed to be visible
+        per-component, not just as one lump real number) so the dashboard
+        can show "network fee: X, other on-chain costs: Y" instead of one
+        opaque total.
+
+        Returns (confirmed, real_delta_lamports, network_fee_lamports) —
+        both are None if confirmed but this wallet's own balance couldn't
+        be found in the transaction's account list (should be unreachable
+        — this wallet is always the fee payer — but never treated as zero).
         """
         sig = Signature.from_string(tx_sig)
         deadline = time.monotonic() + _CONFIRM_TIMEOUT_S
@@ -1003,7 +1016,7 @@ class ExecutionEngine:
                     meta = resp.value.transaction.meta
                     if meta.err is not None:
                         log.error("execution.tx_error_on_chain", tx_sig=tx_sig, err=str(meta.err))
-                        return False, None
+                        return False, None, None
                     keys = resp.value.transaction.transaction.message.account_keys
                     wallet_str = str(self._keypair.pubkey())
                     delta = None
@@ -1013,9 +1026,41 @@ class ExecutionEngine:
                             break
                     if delta is None:
                         log.warning("execution.confirm_delta_wallet_not_found", tx_sig=tx_sig)
-                    return True, delta
+                    return True, delta, meta.fee
             except Exception as exc:
                 log.warning("execution.confirm_poll_error", tx_sig=tx_sig,
                             error_type=type(exc).__name__, error=str(exc))
             await asyncio.sleep(_CONFIRM_POLL_S)
-        return False, None
+        return False, None, None
+
+    async def get_real_tx_delta(self, tx_sig: str) -> tuple[int, int] | None:
+        """
+        One-shot (non-polling) real balance delta + network fee for an
+        ALREADY-LANDED transaction — the backfill counterpart to
+        _confirm_tx_with_delta() above, used by
+        confluence_live_worker.py's _backfill_real_audit_trail() to fill
+        in entry_real_sol_lamports/exit_real_sol_lamports for trades closed
+        before 2026-09-28 (when this tracking didn't exist yet), using
+        their already-stored real tx signatures. Returns None on any
+        failure (RPC error, tx not found, this wallet not in the account
+        list) — the backfill must skip and retry later, never guess.
+        """
+        try:
+            resp = await self._rpc.get_transaction(
+                Signature.from_string(tx_sig), commitment=Confirmed, max_supported_transaction_version=0,
+            )
+            if resp.value is None:
+                return None
+            meta = resp.value.transaction.meta
+            if meta.err is not None:
+                return None
+            keys = resp.value.transaction.transaction.message.account_keys
+            wallet_str = str(self._keypair.pubkey())
+            for i, k in enumerate(keys):
+                if str(k) == wallet_str:
+                    return meta.post_balances[i] - meta.pre_balances[i], meta.fee
+            return None
+        except Exception as exc:
+            log.warning("execution.get_real_tx_delta_failed", tx_sig=tx_sig,
+                        error_type=type(exc).__name__, error=str(exc))
+            return None

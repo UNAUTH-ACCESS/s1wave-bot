@@ -183,6 +183,7 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         # models/orm.py for the full audit behind this. Mirrors
         # confluence_live_worker.py's own successful-exit branch exactly.
         row.exit_real_sol_lamports = result.actual_sol_lamports
+        row.exit_network_fee_lamports = result.network_fee_lamports
         row.reclaim_tx_signature = result.reclaim_tx_signature
         row.reclaim_sol_lamports = result.reclaim_sol_lamports
         if row.entry_real_sol_lamports is not None and result.actual_sol_lamports is not None:

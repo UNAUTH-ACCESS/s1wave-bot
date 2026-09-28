@@ -16,6 +16,9 @@ GET /confluence/stream          — SSE: live status + open trades w/ live
 GET /confluence/shadow/stats    — paper-benchmark win rate, rug rate, etc.
 GET /confluence/shadow/positions — paper-only open/closed positions
 GET /confluence/shadow/curve    — cumulative pnl_pct series for a chart
+GET /confluence/summary         — one-shot plain-text report, e.g. `curl
+                                   .../confluence/summary` from a phone
+                                   terminal (2026-09-28)
 
 Legacy (old scorer/S1Wave pipeline, removed 2026-09-23 — these tables are
 frozen historical data, not live):
@@ -53,7 +56,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select, func, desc, and_
 
 from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
@@ -147,6 +150,16 @@ async def _build_confluence_status() -> dict:
             select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "unsellable")
         )).scalar_one()
 
+        # 'balance_zero' (2026-09-25) — see confluence_live_worker.py's
+        # balance-already-zero reconciliation: a position confirmed already
+        # resolved on-chain with real proceeds unknown without a manual
+        # forensic lookup. Was previously invisible on the dashboard —
+        # surfaced here the same way 'unsellable' already is, so it's
+        # never silently forgotten.
+        balance_zero_count = (await session.execute(
+            select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "balance_zero")
+        )).scalar_one()
+
         # Real, on-chain-verified account reconciliation (2026-09-28) — see
         # engine/live_equity.py's DEPOSIT_USD docstring for the full audit:
         # all_time_realized_pnl_usd above (a sum of per-trade pnl_usd,
@@ -202,6 +215,7 @@ async def _build_confluence_status() -> dict:
         "today_realized_pnl_usd": str(today_pnl.quantize(Decimal("0.01"))),
         "open_trades": open_count,
         "unsellable_trades": unsellable_count,
+        "balance_zero_trades": balance_zero_count,
         "closed_trades": closed_count,
         "max_concurrent": settings.CONFLUENCE_LIVE_MAX_CONCURRENT,
         "exposure_pct": settings.CONFLUENCE_LIVE_EXPOSURE_PCT,
@@ -262,6 +276,48 @@ def _compute_pct_stats(rows: list[tuple]) -> dict:
         "rug_rate": round(len(rugs) / n, 4) if n else None,
         "rug_avg_pnl_pct": round(sum(rugs) / len(rugs), 4) if rugs else None,
         "exit_reasons": reasons,
+    }
+
+
+def _build_fee_breakdown(t: ConfluenceLiveTrade) -> dict:
+    """
+    Itemized real fee breakdown for one trade (2026-09-28, "all fees and
+    capital paid"). network_fee is the real Solana fee actually charged
+    (entry + exit combined); other_onchain_cost is whatever's left in the
+    real deltas beyond the intended swap amounts and those network fees —
+    this wallet's own token-account rent, and/or the non-reclaimable
+    Pump.fun protocol-fee account (see ConfluenceLiveTrade.
+    entry_real_sol_lamports's docstring in models/orm.py). Every field is
+    None unless every input it needs is known — never a partial guess.
+    """
+    network_fee_lamports = None
+    if t.entry_network_fee_lamports is not None or t.exit_network_fee_lamports is not None:
+        network_fee_lamports = (t.entry_network_fee_lamports or 0) + (t.exit_network_fee_lamports or 0)
+
+    other_onchain_cost_lamports = None
+    if (
+        t.entry_real_sol_lamports is not None and t.exit_real_sol_lamports is not None
+        and t.entry_sol_lamports is not None and t.exit_sol_lamports is not None
+        and network_fee_lamports is not None
+    ):
+        real_total = abs(t.entry_real_sol_lamports) + abs(t.exit_real_sol_lamports)
+        intended_total = abs(t.entry_sol_lamports) + abs(t.exit_sol_lamports)
+        other_onchain_cost_lamports = real_total - intended_total - network_fee_lamports
+
+    sol_price = Decimal(str(settings.SOL_PRICE_USD)) if settings.SOL_PRICE_USD else None
+
+    def to_usd(lamports):
+        if lamports is None or sol_price is None:
+            return None
+        return str((Decimal(lamports) / Decimal("1e9") * sol_price).quantize(Decimal("0.0001")))
+
+    return {
+        "network_fee_lamports": network_fee_lamports,
+        "network_fee_usd": to_usd(network_fee_lamports),
+        "other_onchain_cost_lamports": other_onchain_cost_lamports,
+        "other_onchain_cost_usd": to_usd(other_onchain_cost_lamports),
+        "reclaim_sol_lamports": t.reclaim_sol_lamports,
+        "reclaim_usd": to_usd(t.reclaim_sol_lamports),
     }
 
 
@@ -1063,6 +1119,23 @@ def create_app() -> FastAPI:
                 "reclaim_tx_signature": t.reclaim_tx_signature,
                 "reclaim_sol_lamports": t.reclaim_sol_lamports,
                 "real_pnl_usd": str(t.real_pnl_usd) if t.real_pnl_usd is not None else None,
+                "real_pnl_pct_of_capital": (
+                    str((t.real_pnl_usd / (Decimal(str(abs(t.entry_real_sol_lamports))) / Decimal("1e9") * Decimal(str(settings.SOL_PRICE_USD))) * 100).quantize(Decimal("0.01")))
+                    if t.real_pnl_usd is not None and t.entry_real_sol_lamports and settings.SOL_PRICE_USD else None
+                ),
+                # Itemized fee breakdown (2026-09-28, "all fees and capital
+                # paid") — network fee is the real Solana fee per
+                # transaction; other_onchain_cost_lamports is whatever's
+                # left in the real delta beyond the intended swap amount
+                # and the network fee (rent for this wallet's own token
+                # account, and/or the non-reclaimable Pump.fun protocol-fee
+                # account — see entry_real_sol_lamports's docstring). Only
+                # computed when every input is known.
+                "fees": _build_fee_breakdown(t),
+                "capital_paid_usd": (
+                    str((Decimal(str(abs(t.entry_real_sol_lamports))) / Decimal("1e9") * Decimal(str(settings.SOL_PRICE_USD))).quantize(Decimal("0.0001")))
+                    if t.entry_real_sol_lamports is not None and settings.SOL_PRICE_USD else None
+                ),
                 "solscan_url": f"https://solscan.io/token/{mint}",
             }
             for t, symbol, mint in rows
@@ -1104,6 +1177,89 @@ def create_app() -> FastAPI:
             **current_stats,
             "all_time": _compute_pct_stats(all_rows),
         }
+
+    @app.get("/confluence/summary", tags=["confluence"], response_class=PlainTextResponse)
+    async def confluence_summary() -> str:
+        """
+        One-shot, plain-text performance report (2026-09-28) — "things that
+        would make me prompt the software from Termux to see its
+        performance": reading 3-4 separate JSON endpoints from a phone
+        terminal to get the full picture is exactly the friction this
+        removes. `curl <host>/confluence/summary` (with the same Basic Auth
+        as the dashboard) gives the whole story in one screen: armed state,
+        real wallet numbers (including the real-vs-deposit gap, not just
+        the recorded figure), open positions, and both live and shadow
+        performance since the current entry filters. Reuses the exact same
+        building blocks as the JSON endpoints, so it can never show a
+        different number than the dashboard does.
+        """
+        status, open_trades, live_stats, shadow_stats = await asyncio.gather(
+            _build_confluence_status(), _build_open_trades_live(), confluence_live_stats(), confluence_shadow_stats(),
+        )
+
+        lines = []
+        lines.append("S1WAVE — PERFORMANCE SUMMARY")
+        lines.append(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        lines.append("")
+        # A trade can only actually fire when BOTH the manual switch is
+        # armed AND no safety gate is tripped — state these as one clear
+        # verdict rather than two separately-true facts that read as
+        # contradictory ("ARMED — HALTED").
+        if status["permanently_halted"]:
+            trading_line = "Trading: 🛑 HALTED by safety gate — needs a human to clear, regardless of the switch"
+        elif status["daily_halted"]:
+            trading_line = "Trading: ⏸️  PAUSED — daily loss limit hit, resumes automatically next UTC day"
+        elif status["enabled"]:
+            trading_line = "Trading: ✅ ARMED — may enter a position on the next qualifying signal"
+        else:
+            trading_line = "Trading: ⏸️  PAUSED — manually switched off from the dashboard"
+        lines.append(trading_line)
+        lines.append(f"Wallet:  {status['wallet_sol']:.4f} SOL (${status['wallet_usd']:.2f})" if status["wallet_sol"] is not None else "Wallet:  unknown (RPC error)")
+        lines.append(f"Deposit: ${status['deposit_usd']} — real gap vs. deposit: ${status['deposit_vs_balance_gap_usd']}")
+        real_pnl_note = (
+            f"${status['real_all_time_pnl_usd']} across {status['real_pnl_known_trades']}/{status['closed_trades']} trades"
+            if status["real_pnl_known_trades"] > 0
+            else f"not yet known for any of {status['closed_trades']} trades — needs each one's rent-reclaim tx, "
+                 "never captured before 2026-09-28; entry/exit real costs ARE known per-trade, see /confluence/live/trades"
+        )
+        lines.append(f"Recorded all-time P&L: ${status['all_time_realized_pnl_usd']}  (real, verified: {real_pnl_note})")
+        lines.append(f"Today's P&L: ${status['today_realized_pnl_usd']}")
+        lines.append("")
+        lines.append(f"Positions: {status['open_trades']} open / {status['max_concurrent']} max"
+                      + (f", {status['unsellable_trades']} unsellable" if status["unsellable_trades"] else "")
+                      + (f", {status['balance_zero_trades']} need reconciliation" if status.get("balance_zero_trades") else "")
+                      + f" — {status['closed_trades']} closed all-time")
+        if open_trades:
+            for t in open_trades:
+                price_note = f"verified {round(t['real_price_age_s'])}s ago" if t.get("real_price_age_s") is not None else "checking…"
+                pnl = t.get("real_pnl_pct") if t.get("real_price") is not None else t.get("live_pnl_pct")
+                pnl_str = f"{pnl:+.1f}%" if pnl is not None else "—"
+                lines.append(f"  · {t['symbol'] or t['mint'][:8]}: {pnl_str} (${t['position_usd']}, {price_note})"
+                             + ("  [STUCK]" if t["status"] == "unsellable" else ""))
+        # NOTE: _compute_pct_stats()'s own fields are NOT uniformly scaled —
+        # win_rate/rug_rate are fractions (0.6667 = 66.67%) but
+        # mean_pnl_pct_capped/median_pnl_pct are already percentages
+        # (-5.2092 means -5.2092%, not -520.92%). _fmt_frac/_fmt_pct below
+        # match that existing convention rather than silently "fixing" it
+        # here and drifting from what the JSON endpoints report.
+        def _fmt_frac(x):
+            return f"{x*100:.1f}%" if x is not None else "—"
+
+        def _fmt_pct(x):
+            return f"{x:+.1f}%" if x is not None else "—"
+
+        lines.append("")
+        lines.append(f"LIVE   (since current filters, {live_stats['closed']} closed): "
+                      f"win rate {_fmt_frac(live_stats['win_rate'])}, capped mean {_fmt_pct(live_stats['mean_pnl_pct_capped'])}, rug rate {_fmt_frac(live_stats['rug_rate'])}")
+        lines.append(f"       all-time ({live_stats['all_time']['closed']} closed): "
+                      f"win rate {_fmt_frac(live_stats['all_time']['win_rate'])}, capped mean {_fmt_pct(live_stats['all_time']['mean_pnl_pct_capped'])}")
+        lines.append(f"SHADOW (since current filters, {shadow_stats['closed']} closed): "
+                      f"win rate {_fmt_frac(shadow_stats['win_rate'])}, capped mean {_fmt_pct(shadow_stats['mean_pnl_pct_capped'])}, rug rate {_fmt_frac(shadow_stats['rug_rate'])}")
+        lines.append(f"       all-time ({shadow_stats['all_time']['closed']} closed): "
+                      f"win rate {_fmt_frac(shadow_stats['all_time']['win_rate'])}, capped mean {_fmt_pct(shadow_stats['all_time']['mean_pnl_pct_capped'])}")
+        lines.append("")
+        lines.append("Full detail: GET /confluence/status, /confluence/live/trades, /confluence/live/stats, /confluence/shadow/stats")
+        return "\n".join(lines) + "\n"
 
     @app.get("/confluence/shadow/positions", tags=["confluence"])
     async def confluence_shadow_positions(

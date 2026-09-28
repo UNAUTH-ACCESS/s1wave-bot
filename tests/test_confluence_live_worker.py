@@ -1824,6 +1824,182 @@ class TestPeriodicRentSweep:
         await worker._maybe_sweep_rent()  # must not raise
 
 
+class TestAuditTrailBackfill:
+    """
+    Real problem, 2026-09-28 ("make the audit system more robust"): 71
+    trades closed before entry_real_sol_lamports/exit_real_sol_lamports
+    existed have real tx signatures stored but no real-delta data.
+    _maybe_backfill_audit_trail() self-heals them a few at a time using
+    the same real on-chain lookup every live trade already gets — no
+    manual forensic script ever needed again.
+    """
+
+    def _make_backfillable_trade(self, session, token, **overrides):
+        defaults = dict(
+            token_id=token.id, n_rules_cofiring=2, status="closed",
+            entry_time=datetime.now(timezone.utc) - timedelta(hours=1), entry_price=Decimal("0.0001"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("0.02"),
+            entry_tx_signature="entrysig", exit_tx_signature="exitsig",
+            exit_time=datetime.now(timezone.utc), exit_reason="TIME_EXIT", pnl_usd=Decimal("0.001"),
+        )
+        defaults.update(overrides)
+        return ConfluenceLiveTrade(**defaults)
+
+    @pytest.mark.asyncio
+    async def test_backfills_missing_entry_and_exit_real_deltas(self, session):
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = self._make_backfillable_trade(session, token)
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(side_effect=[
+            (-1603733, 5000),   # entry lookup
+            (-1429987, 38564),  # exit lookup
+        ])
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.entry_real_sol_lamports == -1603733
+        assert row.entry_network_fee_lamports == 5000
+        assert row.exit_real_sol_lamports == -1429987
+        assert row.exit_network_fee_lamports == 38564
+        # Never fabricated: no reclaim signature was ever stored for this
+        # historical trade, so real_pnl_usd must stay NULL, not a partial
+        # entry+exit-only number.
+        assert row.real_pnl_usd is None
+
+    @pytest.mark.asyncio
+    async def test_skips_trades_that_already_have_both_real_deltas(self, session):
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = self._make_backfillable_trade(
+            session, token, entry_real_sol_lamports=-100, exit_real_sol_lamports=50,
+        )
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(
+            side_effect=AssertionError("must not look up a trade that's already fully backfilled")
+        )
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_only_looks_up_the_missing_side(self, session):
+        """A trade missing only exit_real_sol_lamports must not re-fetch
+        the entry side that's already known."""
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = self._make_backfillable_trade(session, token, entry_real_sol_lamports=-1603733)
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(return_value=(-1429987, 38564))
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+        worker._execution.get_real_tx_delta.assert_awaited_once_with("exitsig")
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.entry_real_sol_lamports == -1603733  # untouched
+        assert row.exit_real_sol_lamports == -1429987
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_leaves_the_trade_for_the_next_sweep(self, session):
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = self._make_backfillable_trade(session, token)
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(return_value=None)  # both lookups fail
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.entry_real_sol_lamports is None
+        assert row.exit_real_sol_lamports is None
+
+    @pytest.mark.asyncio
+    async def test_respects_the_batch_size_limit(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        # Use a small batch size for this test regardless of the real
+        # constant — the real one covers the entire historical backlog in
+        # one sweep (200+), which would mean this test doing 400+ real
+        # asyncio.sleep(_AUDIT_BACKFILL_LOOKUP_DELAY_S) pacing waits.
+        monkeypatch.setattr(mod, "_AUDIT_BACKFILL_BATCH_SIZE", 5)
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        for _ in range(5 + 3):
+            session.add(self._make_backfillable_trade(session, token))
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(return_value=(-100, 5000))
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+        # 2 lookups (entry+exit) per trade, capped at the batch size.
+        assert worker._execution.get_real_tx_delta.await_count == 5 * 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_backfill_again_before_the_interval_elapses(self, session):
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        session.add(self._make_backfillable_trade(session, token))
+        await session.flush()
+
+        worker._execution.get_real_tx_delta = AsyncMock(return_value=(-100, 5000))
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_backfill_audit_trail()
+            call_count_after_first = worker._execution.get_real_tx_delta.await_count
+            await worker._maybe_backfill_audit_trail()
+        finally:
+            ctx.stop()
+
+        assert worker._execution.get_real_tx_delta.await_count == call_count_after_first  # no new calls
+
+    @pytest.mark.asyncio
+    async def test_a_query_failure_never_raises(self, session, monkeypatch):
+        worker = make_worker(session)
+        with patch("workers.confluence_live_worker.get_session", side_effect=RuntimeError("DB outage")):
+            await worker._maybe_backfill_audit_trail()  # must not raise
+
+
 class TestExposurePercentageSizing:
     """config/settings.py's CONFLUENCE_LIVE_EXPOSURE_PCT formula
     (2026-09-23, replacing an earlier fixed-stake-plus-profit-share

@@ -128,6 +128,20 @@
   .cb.paused { background:rgba(255,184,0,.05);  border:1px solid rgba(255,184,0,.2);  color:var(--warn); }
   .cb.halt   { background:rgba(255,68,68,.05);  border:1px solid rgba(255,68,68,.2);  color:var(--danger); }
 
+  /* "Needs attention" banner (2026-09-28) — a halt, an unsellable position,
+     or a balance-zero reconciliation gap used to be visible only by
+     reading individual cards/notifications closely. This surfaces any of
+     them as one unmissable strip at the top of the page. */
+  #attention:empty { display:none; }
+  .attn-banner {
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:12px 16px; border-radius:10px; margin-bottom:18px;
+    font-family:'Space Mono',monospace; font-size:11px; line-height:1.5;
+    background:rgba(255,68,68,.08); border:1px solid rgba(255,68,68,.3); color:var(--bright);
+  }
+  .attn-banner .attn-icon { font-size:15px; }
+  .attn-banner b { color:var(--danger); }
+
   .tbl { width:100%; border-collapse:collapse; font-family:'Space Mono',monospace; font-size:10px; }
   .tbl th {
     text-align:left; padding:8px 10px; color:var(--muted);
@@ -144,6 +158,11 @@
     background:rgba(255,255,255,.05); color:var(--muted);
   }
   .tablewrap { overflow-x: auto; }
+  /* Scrollable trade/position history (2026-09-28) — keeps a long history
+     from pushing the rest of the page down indefinitely; sticky header so
+     column names stay visible while scrolling. */
+  .scrollable-table { max-height: 480px; overflow-y: auto; }
+  .scrollable-table .tbl thead th { position: sticky; top: 0; z-index: 1; }
 
   /* Live connection indicator (header) */
   .livedot { width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; }
@@ -156,24 +175,31 @@
     color:var(--muted); text-transform:uppercase;
   }
 
-  /* Notification feed */
-  .notif-list { display:flex; flex-direction:column; gap:6px; max-height:340px; overflow-y:auto; }
+  /* Notification feed (2026-09-28: restructured for readability — a
+     labeled header line per entry instead of one dense run-on line) */
+  .notif-list { display:flex; flex-direction:column; gap:8px; max-height:420px; overflow-y:auto; padding-right:2px; }
   .notif-row {
-    display:flex; gap:10px; align-items:flex-start; padding:9px 11px;
-    border-radius:8px; font-family:'Space Mono',monospace; font-size:10px; line-height:1.5;
+    display:flex; gap:10px; align-items:flex-start; padding:10px 12px;
+    border-radius:8px; font-family:'Space Mono',monospace; font-size:11px; line-height:1.55;
     border:1px solid var(--border); background:rgba(255,255,255,.015);
   }
   .notif-row.info     { border-color:rgba(0,255,135,.2); }
   .notif-row.warning  { border-color:rgba(255,184,0,.25); background:rgba(255,184,0,.03); }
   .notif-row.critical { border-color:rgba(255,68,68,.35); background:rgba(255,68,68,.05); }
-  .notif-badge {
-    flex-shrink:0; width:6px; height:6px; border-radius:50%; margin-top:5px;
+  .notif-icon { flex-shrink:0; font-size:13px; line-height:1.4; margin-top:1px; }
+  .notif-body { flex:1; min-width:0; }
+  .notif-head {
+    display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+    margin-bottom:3px;
   }
-  .notif-row.info .notif-badge     { background:var(--accent); }
-  .notif-row.warning .notif-badge  { background:var(--warn); }
-  .notif-row.critical .notif-badge { background:var(--danger); }
-  .notif-msg { flex:1; color:var(--text); }
-  .notif-time { color:var(--muted); font-size:9px; white-space:nowrap; }
+  .notif-label {
+    font-size:9px; letter-spacing:.6px; text-transform:uppercase; font-weight:700;
+  }
+  .notif-row.info .notif-label     { color:var(--accent); }
+  .notif-row.warning .notif-label  { color:var(--warn); }
+  .notif-row.critical .notif-label { color:var(--danger); }
+  .notif-msg { color:var(--text); word-break:break-word; }
+  .notif-time { color:var(--muted); font-size:9px; white-space:nowrap; cursor:default; }
 
   /* Toast pop-ups for brand-new notifications */
   #toasts {
@@ -247,6 +273,7 @@
   </header>
 
   <div id="toasts"></div>
+  <div id="attention"></div>
 
   <!-- Row 1: 4 status cards — fixed .card wrappers, only their inner HTML is
        ever replaced (see renderStatusCards). Recreating the .card element
@@ -312,8 +339,28 @@ const short = (s, n=10) => s ? (s.length > n ? s.slice(0,n)+'…' : s) : '—';
 
 let lastShadow = {};
 
+function renderAttentionBanner(status) {
+  const items = [];
+  if (status.permanently_halted) {
+    items.push(`<span><b>TRADING HALTED</b> — a human needs to re-enable it from the dashboard.</span>`);
+  }
+  if (status.daily_halted) {
+    items.push(`<span><b>Daily loss limit hit</b> — paused until the next UTC day.</span>`);
+  }
+  if (status.unsellable_trades > 0) {
+    items.push(`<span><b>${status.unsellable_trades}</b> position${status.unsellable_trades>1?'s':''} <b>unsellable</b> — real money stuck, being retried automatically.</span>`);
+  }
+  if (status.balance_zero_trades > 0) {
+    items.push(`<span><b>${status.balance_zero_trades}</b> position${status.balance_zero_trades>1?'s':''} need${status.balance_zero_trades>1?'':'s'} <b>manual reconciliation</b> — already resolved on-chain, real proceeds unknown.</span>`);
+  }
+  const el = document.getElementById('attention');
+  if (!items.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="attn-banner"><span class="attn-icon">🚨</span>${items.join(' &nbsp;·&nbsp; ')}</div>`;
+}
+
 function renderStatusCards(status, shadow) {
   shadow = shadow || lastShadow || {};
+  renderAttentionBanner(status);
   const armed = status.enabled;
   const c1 = `
     <div class="clabel">Live Switch</div>
@@ -453,7 +500,7 @@ function ensureOpenPositionsTable() {
       <span style="display:flex;align-items:center;gap:8px"><div class="dot"></div>Open positions <span style="color:var(--muted);font-weight:400">— live price, streamed every ~1s</span></span>
       <button class="btn" id="closeAllBtn" onclick="closeAllPositions()" style="border-color:rgba(255,68,68,.35);color:var(--danger)">⛔ CLOSE ALL</button>
     </div>
-    <div class="tablewrap"><table class="tbl">
+    <div class="tablewrap scrollable-table"><table class="tbl">
       <thead><tr><th>Token</th><th>Opened</th><th>Size</th><th>Entry → Current price</th><th>P&amp;L</th><th></th></tr></thead>
       <tbody id="openpositions-body"></tbody>
     </table></div>
@@ -533,7 +580,15 @@ function renderOpenPositions(openLive) {
     const priceHtml = hasReal
       ? `$${Number(t.entry_price).toPrecision(4)} → $${shownPrice.toPrecision(4)} <span style="color:var(--muted)" title="A real Jupiter sell quote for this exact position, not a market snapshot — this is what selling right now would actually get.">(verified ${realAgeLabel})</span>`
       : `$${Number(t.entry_price).toPrecision(4)} → ${shownPrice !== null ? '$'+shownPrice.toPrecision(4) : '—'} <span style="color:var(--muted)" title="No real sell quote yet for this brand-new position — this is only a market snapshot until the first check completes.">(checking…)</span>`;
-    const pnlHtml = pnl !== null ? (pnl>=0?'+':'')+pnl.toFixed(1)+'%' : '—';
+    // $ amount alongside % (2026-09-28, "% loss or gain, dollar amount")
+    // — derived client-side (position_usd * pnl / 100) since the API
+    // reports the percentage; good enough for an at-a-glance live figure,
+    // the real, on-chain-verified $ number is what shows once this
+    // position closes.
+    const pnlUsdEstimate = pnl !== null ? (Number(t.position_usd) * pnl / 100) : null;
+    const pnlHtml = pnl !== null
+      ? `${(pnl>=0?'+':'')+pnl.toFixed(1)}% <span style="color:var(--muted)">(${pnlUsdEstimate>=0?'+':''}${usd(pnlUsdEstimate)})</span>`
+      : '—';
     // 'unsellable' badge (2026-09-24) — a position whose real sell kept
     // failing long enough that it stopped counting against your
     // concurrent-slot limit (see confluence_live_worker.py's
@@ -541,14 +596,17 @@ function renderOpenPositions(openLive) {
     // retried every cycle — must stay visible, not vanish along with its
     // freed slot.
     const unsellable = t.status === 'unsellable';
-    const symbolHtml = `${t.symbol || '—'}${unsellable ? ' <span style="color:var(--danger)" title="Real sell has been failing repeatedly — this position freed its trading slot but is still open and still being retried automatically.">⛔ STUCK</span>' : ''}`;
+    const symbolLink = t.mint
+      ? `<a href="https://solscan.io/token/${t.mint}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">${t.symbol || short(t.mint, 6)}</a>`
+      : (t.symbol || '—');
+    const symbolHtml = `${symbolLink}${unsellable ? ' <span style="color:var(--danger)" title="Real sell has been failing repeatedly — this position freed its trading slot but is still open and still being retried automatically.">⛔ STUCK</span>' : ''}`;
 
     let tr = openPositionRows.get(t.id);
     if (!tr) {
       tr = document.createElement('tr');
       tr.innerHTML = `
         <td class="cell-symbol"></td>
-        <td class="cell-opened">${ago(t.entry_time)}</td>
+        <td class="cell-opened" title="${absoluteTime(t.entry_time)}">${ago(t.entry_time)}</td>
         <td>$${Number(t.position_usd).toFixed(2)}</td>
         <td class="cell-price"></td>
         <td class="cell-pnl"></td>
@@ -559,6 +617,7 @@ function renderOpenPositions(openLive) {
     }
     tr.querySelector('.cell-symbol').innerHTML = symbolHtml;
     tr.querySelector('.cell-opened').textContent = ago(t.entry_time);
+    tr.querySelector('.cell-opened').title = absoluteTime(t.entry_time);
     tr.querySelector('.cell-price').innerHTML = priceHtml;
     const pnlCell = tr.querySelector('.cell-pnl');
     pnlCell.innerHTML = pnlHtml;
@@ -595,7 +654,25 @@ function renderTradeHistory(closed) {
     const primaryPnl = hasReal ? t.real_pnl_usd : t.pnl_usd;
     const primaryClass = parseFloat(primaryPnl) > 0 ? 'tp' : parseFloat(primaryPnl) < 0 ? 'tn' : '';
     const disagrees = hasReal && t.pnl_usd !== null && Math.abs(parseFloat(t.real_pnl_usd) - parseFloat(t.pnl_usd)) > 0.001;
+    const pctHtml = hasReal && t.real_pnl_pct_of_capital !== null && t.real_pnl_pct_of_capital !== undefined
+      ? `${parseFloat(t.real_pnl_pct_of_capital) >= 0 ? '+' : ''}${Number(t.real_pnl_pct_of_capital).toFixed(1)}%`
+      : '—';
     const pnlHtml = `${primaryPnl !== null ? usd(primaryPnl) : '—'}${hasReal ? ' <span style="color:var(--muted)" title="Real, on-chain-verified net P&L — entry + exit + rent reclaim, from actual wallet balance deltas, not the intended swap amount.">✓</span>' : ''}${disagrees ? ` <span style="color:var(--warn);font-size:9px" title="Recorded (intended-amount) figure: ${usd(t.pnl_usd)} — differs from the real on-chain result.">≠rec</span>` : ''}`;
+    // Fee breakdown (2026-09-28, "all fees and capital paid") — a single
+    // "Fees" cell showing the total real cost, with the itemized pieces
+    // (network fee vs. the non-reclaimable Pump.fun-style overhead) in a
+    // tooltip rather than 3 more columns fighting for space.
+    const fees = t.fees || {};
+    const networkFee = fees.network_fee_usd !== null && fees.network_fee_usd !== undefined ? parseFloat(fees.network_fee_usd) : null;
+    const otherFee = fees.other_onchain_cost_usd !== null && fees.other_onchain_cost_usd !== undefined ? parseFloat(fees.other_onchain_cost_usd) : null;
+    const totalFees = (networkFee !== null || otherFee !== null) ? (networkFee || 0) + (otherFee || 0) : null;
+    const feesTitle = totalFees !== null
+      ? `Network fee: ${usd(networkFee || 0)} · Other on-chain cost (rent/protocol fees): ${usd(otherFee || 0)}${fees.reclaim_usd ? ` · Rent reclaimed back: +${usd(fees.reclaim_usd)}` : ''}`
+      : 'Fee breakdown not available for this trade (closed before the real-audit-trail fix, or not yet backfilled).';
+    const feesHtml = totalFees !== null ? `<span title="${feesTitle}">${usd(totalFees)}ⓘ</span>` : '<span style="color:var(--muted)">—</span>';
+    const capitalHtml = t.capital_paid_usd !== null && t.capital_paid_usd !== undefined
+      ? `<span title="Real capital actually spent at entry, from the wallet's own balance delta — not the intended ${usd(t.position_usd)} target size.">${usd(t.capital_paid_usd)}</span>`
+      : `<span style="color:var(--muted)" title="Real capital not yet known for this trade.">~${usd(t.position_usd)}</span>`;
     const tokenLink = t.mint ? `<a href="${t.solscan_url || ('https://solscan.io/token/' + t.mint)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">${t.symbol || short(t.mint, 6)}</a>` : (t.symbol || '—');
     const txLinks = [
       t.entry_tx ? `<a href="https://solscan.io/tx/${t.entry_tx}" target="_blank" rel="noopener" style="color:var(--muted)">entry</a>` : null,
@@ -605,18 +682,20 @@ function renderTradeHistory(closed) {
     <tr>
       <td>${tokenLink}</td>
       <td><span class="etag">${t.status}</span></td>
-      <td>${ago(t.entry_time)}</td>
-      <td>$${Number(t.position_usd).toFixed(2)}</td>
+      <td title="${absoluteTime(t.entry_time)}">${ago(t.entry_time)}</td>
+      <td>${capitalHtml}</td>
+      <td>${feesHtml}</td>
       <td>${t.exit_reason || '—'}</td>
+      <td class="${primaryClass}">${pctHtml}</td>
       <td class="${primaryClass}">${pnlHtml}</td>
       <td style="font-size:9px">${txLinks || '—'}</td>
     </tr>
   `;
   }).join('');
   document.getElementById('livetrades').innerHTML = `
-    <div class="ctitle"><div class="dot"></div>Trade history (closed) <span style="color:var(--muted);font-weight:400">— real, on-chain trades. P&amp;L marked ✓ is verified against actual wallet balance deltas.</span></div>
-    <div class="tablewrap"><table class="tbl">
-      <thead><tr><th>Token</th><th>Status</th><th>Entry</th><th>Size</th><th>Exit reason</th><th>P&amp;L</th><th>Tx</th></tr></thead>
+    <div class="ctitle"><div class="dot"></div>Trade history (closed) <span style="color:var(--muted);font-weight:400">— real, on-chain trades. P&amp;L marked ✓ is verified against actual wallet balance deltas. Scroll for more.</span></div>
+    <div class="tablewrap scrollable-table"><table class="tbl">
+      <thead><tr><th>Token</th><th>Status</th><th>Entry</th><th>Capital</th><th>Fees</th><th>Exit reason</th><th>%</th><th>P&amp;L</th><th>Tx</th></tr></thead>
       <tbody>${closedTrs}</tbody>
     </table></div>
   `;
@@ -625,7 +704,7 @@ function renderTradeHistory(closed) {
 async function loadLiveTrades() {
   const [open, closed] = await Promise.all([
     get('/confluence/live/trades?status=open&limit=20'),
-    get('/confluence/live/trades?status=closed&limit=10'),
+    get('/confluence/live/trades?status=closed&limit=50'),
   ]);
   lastClosedTrades = closed;
   renderTradeHistory(closed);
@@ -673,14 +752,39 @@ let seenNotifIds = new Set();
 // already recorded in seenNotifIds, however the two sources race.
 let notifsBaselineLoaded = false;
 
-function levelLabel(level) {
-  return level === 'critical' ? '⛔ CRITICAL' : level === 'warning' ? '⚠ WARNING' : 'ℹ INFO';
+// Friendly event labels + icons (2026-09-28, "notification section more
+// readable") — the raw event slug (e.g. "balance_already_zero") meant
+// nothing at a glance; this gives every known event a plain-English
+// header and a distinct icon so the feed is scannable without reading
+// every message in full.
+const EVENT_INFO = {
+  entry_filled:              { icon: '🟢', label: 'Position opened' },
+  entry_failed:              { icon: '🚫', label: 'Buy failed' },
+  entry_price_missing:       { icon: '⚠️', label: 'Entry price unknown' },
+  exit_filled:               { icon: '🔴', label: 'Position closed' },
+  exit_failed_critical:      { icon: '🛑', label: 'Sell failed — stuck' },
+  exit_failed_unsizeable:    { icon: '🛑', label: 'Sell failed — unsizeable' },
+  marked_unsellable:         { icon: '⛔', label: 'Marked unsellable' },
+  unsellable_recovered:      { icon: '✅', label: 'Unsellable position recovered' },
+  balance_already_zero:      { icon: '🔎', label: 'Needs manual reconciliation' },
+  permanently_halted:        { icon: '🛑', label: 'TRADING HALTED' },
+  wallet_funded:             { icon: '💰', label: 'Wallet funded' },
+  daily_loss_limit_hit:      { icon: '⏸️', label: 'Daily loss limit hit' },
+  daily_loss_limit_cleared:  { icon: '▶️', label: 'Daily limit cleared' },
+  rent_swept:                { icon: '🧹', label: 'Rent reclaimed' },
+};
+function eventInfo(event) {
+  return EVENT_INFO[event] || { icon: 'ℹ️', label: (event || 'notification').replace(/_/g, ' ') };
+}
+function absoluteTime(iso) {
+  try { return new Date(iso).toLocaleString(undefined, { hour12: false }); } catch { return iso; }
 }
 
 function showToast(n) {
+  const info = eventInfo(n.event);
   const el = document.createElement('div');
   el.className = `toast ${n.level}`;
-  el.innerHTML = `<div style="color:var(--muted);font-size:9px;letter-spacing:1px;margin-bottom:4px">${levelLabel(n.level)}</div>${n.message}`;
+  el.innerHTML = `<div style="color:var(--muted);font-size:9px;letter-spacing:1px;margin-bottom:4px">${info.icon} ${info.label.toUpperCase()}</div>${n.message}`;
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => el.remove(), 6000);
 }
@@ -699,13 +803,21 @@ function renderNotifications(list) {
   if (!list.length) {
     document.getElementById('notifs').innerHTML = `<div class="ctitle"><div class="dot"></div>Notifications</div><div class="empty">Nothing yet — entries, exits, and any halt will show up here as they happen.</div>`;
   } else {
-    const rows = list.map(n => `
+    const rows = list.map(n => {
+      const info = eventInfo(n.event);
+      return `
       <div class="notif-row ${n.level}">
-        <div class="notif-badge"></div>
-        <div class="notif-msg">${n.message}</div>
-        <div class="notif-time">${ago(n.created_at)}</div>
+        <div class="notif-icon">${info.icon}</div>
+        <div class="notif-body">
+          <div class="notif-head">
+            <span class="notif-label">${info.label}</span>
+            <span class="notif-time" title="${absoluteTime(n.created_at)}">${ago(n.created_at)}</span>
+          </div>
+          <div class="notif-msg">${n.message}</div>
+        </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
     document.getElementById('notifs').innerHTML = `
       <div class="ctitle"><div class="dot"></div>Notifications</div>
       <div class="notif-list">${rows}</div>

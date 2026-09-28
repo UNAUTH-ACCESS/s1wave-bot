@@ -632,6 +632,16 @@ class ConfluenceLiveTrade(Base):
     reclaim_tx_signature: Mapped[str | None] = mapped_column(String(128))
     reclaim_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)
     real_pnl_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    # Itemized fee breakdown (2026-09-28, second pass) — the four fields
+    # above give the trustworthy TOTAL real cost/proceeds, but "all fees
+    # and capital paid" needed the pieces visible separately: the real
+    # Solana network fee actually charged per transaction (distinct from
+    # the non-reclaimable Pump.fun protocol-fee account cost, which is
+    # whatever's left in entry/exit_real_sol_lamports beyond the intended
+    # swap amount and this network fee — computed at read time, not
+    # stored, since it's fully derivable from fields already here).
+    entry_network_fee_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exit_network_fee_lamports: Mapped[int | None] = mapped_column(BigInteger)
 
     def __repr__(self) -> str:
         return f"<ConfluenceLiveTrade token={self.token_id} status={self.status}>"
