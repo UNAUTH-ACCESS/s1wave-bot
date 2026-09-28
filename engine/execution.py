@@ -86,34 +86,39 @@ _SELL_RETRY_DELAY_S = 2.0
 # 20-35x the intended size in one unavoidable, un-refundable cost — the
 # opposite of "protect the money first."
 #
-# RAISED 2.2M -> 5.0M, REVERTED to 2.2M, then RAISED again to 5.0M, all
-# on 2026-09-28. The first raise was backed by a shadow-position
-# counterfactual on the 16 tokens this ceiling had rejected: 14/15 would
-# have WON (93.3%, mean +48.8% raw / +39.1% capped). But shadow only
-# measures PRICE over a long hold and never executes a real sell, so it
-# never tested whether a freshly-migrated pool has enough REAL DEPTH to
-# round-trip a live position — it didn't, immediately: the first 3 real
-# entries let through (DISNEY, LOADPAD, xSOL) were all exited by the
-# liquidity guard within 0.3-2 SECONDS of entry (its first check ran with
-# zero delay), so reverted back to 2.2M on that real live-money evidence.
-# Then the user independently verified on Solscan: LOADPAD and xSOL both
-# showed REAL, volume-backed recovery within the same hour ($130 and
-# $1.35K real volume) — the guard hadn't found a genuinely dead pool, just
-# caught one at the single worst possible instant, before it had any
-# chance to develop depth. (A third apparent recovery, DISNEY's +11,433%
-# candle, was ruled out — $0.006 of volume for the whole hour, not a real,
-# tradeable move.) Raised back to 5.0M paired with
-# workers/confluence_live_worker.py's new
-# _LIQUIDITY_GUARD_GRACE_PERIOD_S (60s) — the guard's first check on a new
-# position no longer fires immediately, giving a freshly-migrated pool a
-# minute to develop the depth LOADPAD/xSOL's own real volume showed shows
-# up anyway. HARD_FLOOR/trailing-stop still protect the position on the
-# normal snapshot price during that minute regardless.
+# FULL HISTORY, all 2026-09-28 — read before changing this again:
+#   1. RAISED 2.2M -> 5.0M, backed by a shadow-position counterfactual on
+#      the 16 tokens this ceiling had rejected: 14/15 would have WON
+#      (93.3%, mean +48.8% raw). But shadow only measures PRICE over a
+#      long hold and never executes a real sell.
+#   2. REVERTED back to 2.2M the same day: the first 3 real entries the
+#      raise let through (DISNEY, LOADPAD, xSOL) were all exited by the
+#      liquidity guard within 0.3-2 SECONDS of entry (zero-delay first
+#      check) — real live-money evidence shadow couldn't have produced.
+#   3. RAISED again to 5.0M, paired with a new 60s grace period on the
+#      liquidity guard's first check (see workers/confluence_live_worker.py
+#      git history), after the user independently verified on Solscan that
+#      2 of those 3 (LOADPAD, xSOL) had REAL, volume-backed recovery
+#      within the same hour — the guard had caught a momentary thin-
+#      liquidity reading, not a dead pool.
+#   4. REVERTED to 2.2M and REMOVED the grace period entirely, same day,
+#      after the very next real entry let through by the raise (GEMINI)
+#      rugged to -99.9% during the grace window — and the normal snapshot-
+#      based stop (HARD_FLOOR) never caught it either, so the delayed
+#      liquidity-guard check was the only thing watching, a full 60s late.
+#      The user's call: go back to the original 2.2M + zero-delay check,
+#      the configuration with the actual longer track record, rather than
+#      keep iterating on a real-money strategy parameter in real time.
+#      Both the shadow counterfactual (step 1) AND the live counter-
+#      evidence (steps 2 and 4) are real; this codebase does not currently
+#      have enough live sample to tell which effect dominates. If this
+#      gets revisited, get a much bigger live sample under controlled
+#      conditions before changing either of these numbers again.
 #
 # One normal entry (a single destination token account for us) costs
 # ~1.49M lamports of real rent + the swap principal + a small fee — see
 # _check_entry_cost()'s docstring for the exact math.
-_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 5_000_000
+_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
 
 # withdraw_sol() (2026-09-28): a plain System Program transfer's real
 # network fee is ~5,000 lamports — this reserve is comfortably above that,
