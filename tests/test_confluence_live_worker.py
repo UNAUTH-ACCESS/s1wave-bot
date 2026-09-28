@@ -2420,6 +2420,63 @@ class TestInAppNotifications:
         assert token.symbol in exit_rows[0].message
 
     @pytest.mark.asyncio
+    async def test_exit_notification_shows_the_real_verified_pnl_not_the_stale_recorded_one(self, session, monkeypatch):
+        """Real bug found live, 2026-09-28: the "Claude" trade recorded
+        pnl_usd=-$0.0036 (rounds to "$-0.00") while its real, on-chain-
+        verified P&L was -$0.037 — trade history correctly showed the real
+        number (it was fixed for this back when real_pnl_usd was added),
+        but the notification bar still built its message from the stale
+        pnl_usd/pnl_pct fields, so the two disagreed about the same closed
+        trade. Real numbers from that incident, reconstructed here."""
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(seconds=1), entry_price=Decimal("0.000069877099"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("0.705336"),
+            entry_real_sol_lamports=-7_687_629, entry_network_fee_lamports=130_676,
+        )
+        session.add(trade)
+        await session.flush()
+        worker = make_worker(session)
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 117.0)
+        # Real exit: 5,862,050 lamports back + a 1,513,840-lamport rent
+        # reclaim -> real_pnl_usd ~ -$0.037, vs. the recorded pnl_usd
+        # (computed from the intended swap amount only) rounding to $-0.00.
+        worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="sellsig", actual_amount=Decimal("5862050"),
+            actual_sol_lamports=5_862_050, network_fee_lamports=130_676,
+            reclaim_tx_signature="reclaimsig", reclaim_sol_lamports=1_513_840,
+        ))
+        worker._check_liquidity_guard = AsyncMock(return_value=("LIQUIDITY_GUARD", trade.entry_price * Decimal("0.995")))
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_exit(trade_dict, trade.entry_price * Decimal("0.995"), datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.real_pnl_usd is not None
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        exit_rows = [r for r in rows if r.event == "exit_filled"]
+        assert len(exit_rows) == 1
+        message = exit_rows[0].message
+        # The message must reflect the REAL loss (~-$0.04), not the
+        # stale recorded figure that rounds away to "$-0.00", and must be
+        # marked as verified so it's visually distinguishable from a
+        # recorded-only figure, matching trade history's own convention.
+        assert "$-0.00" not in message
+        assert "✓" in message
+        assert str(round(float(row.real_pnl_usd), 2)) in message or f"{row.real_pnl_usd:+.2f}" in message
+
+    @pytest.mark.asyncio
     async def test_permanently_halted_notifies_once_across_many_checks(self, session, monkeypatch):
         """The core regression this class exists to prevent: refreshing
         halt notifications repeatedly while permanently halted must write

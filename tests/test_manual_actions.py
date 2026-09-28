@@ -132,6 +132,46 @@ async def test_manual_close_persists_real_onchain_deltas(session):
 
 
 @pytest.mark.asyncio
+async def test_notification_shows_the_real_verified_pnl_not_the_stale_recorded_one(session):
+    """Real bug found live, 2026-09-28 (found via confluence_live_worker.py's
+    own automatic-exit notification, then confirmed here too since this is
+    a separate code path): the recorded pnl_usd here computes to a small
+    LOSS (-$0.0036, from the intended swap amount only) while the real,
+    on-chain-verified P&L is actually a small GAIN (+$0.0324, once the
+    rent reclaim is included) — an outright sign flip, not just a rounding
+    difference. The notification must reflect the real number."""
+    token = make_token(symbol="SI")
+    session.add(token)
+    await session.flush()
+    trade = ConfluenceLiveTrade(
+        token_id=token.id, n_rules_cofiring=2, status="open",
+        entry_time=datetime.now(timezone.utc) - timedelta(hours=1), entry_price=Decimal("0.0001"),
+        entry_token_lamports=500_000_000, position_usd=Decimal("0.05"),
+        entry_real_sol_lamports=-1603733,
+    )
+    session.add(trade)
+    await session.flush()
+    trade_id = str(trade.id)
+
+    with patch("engine.manual_actions.get_session", return_value=session_cm(session)), \
+         patch("engine.manual_actions.ExecutionEngine") as MockEngine:
+        MockEngine.return_value.get_token_balance_raw = AsyncMock(return_value=(500_000_000, 6))
+        MockEngine.return_value.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="closesig", actual_amount=Decimal("400000"),
+            actual_sol_lamports=395000, reclaim_tx_signature="reclaimsig", reclaim_sol_lamports=1488440,
+        ))
+        result = await close_trade_manually(trade_id, sol_price_usd=Decimal("116.0"))
+
+    assert result.success is True
+    row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+    assert row.real_pnl_usd > 0  # the real number is a GAIN
+    notif = (await session.execute(select(ConfluenceNotification).where(ConfluenceNotification.trade_id == trade.id))).scalar_one()
+    assert notif.level == "info"  # must follow the real (positive) sign, not the stale recorded (negative) one
+    assert "-" not in notif.message.split("$")[1][:1]  # no leading minus on the dollar figure
+    assert "✓" in notif.message
+
+
+@pytest.mark.asyncio
 async def test_falls_back_to_documented_wrong_unit_price_when_balance_lookup_fails(session):
     """If the pre-sell balance lookup fails (rare), exit_price falls back to
     execution.py's documented sell-side actual_price rather than losing the

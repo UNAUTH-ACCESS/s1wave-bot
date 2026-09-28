@@ -186,14 +186,24 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         row.exit_network_fee_lamports = result.network_fee_lamports
         row.reclaim_tx_signature = result.reclaim_tx_signature
         row.reclaim_sol_lamports = result.reclaim_sol_lamports
+        real_pnl_usd = None
         if row.entry_real_sol_lamports is not None and result.actual_sol_lamports is not None:
             real_net_lamports = row.entry_real_sol_lamports + result.actual_sol_lamports + (result.reclaim_sol_lamports or 0)
-            row.real_pnl_usd = (Decimal(real_net_lamports) / Decimal("1e9")) * sol_price_usd
+            real_pnl_usd = (Decimal(real_net_lamports) / Decimal("1e9")) * sol_price_usd
+            row.real_pnl_usd = real_pnl_usd
+        # Prefer the real, on-chain-verified P&L over the recorded
+        # (intended-amount) figure whenever it's known (2026-09-28) —
+        # mirrors confluence_live_worker.py's own exit-notification fix;
+        # same "recorded vs real disagree" bug found in the notification
+        # bar for automatic exits applied here too, since this is a
+        # separate code path for the dashboard's manual Close button.
+        display_pnl_usd = real_pnl_usd if real_pnl_usd is not None else pnl_usd
+        verified_suffix = " ✓" if real_pnl_usd is not None else ""
         session.add(ConfluenceNotification(
-            level="info" if (pnl_usd or 0) >= 0 else "warning",
+            level="info" if (display_pnl_usd or 0) >= 0 else "warning",
             event="exit_filled",
             message=f"{symbol} closed (MANUAL_CLOSE): "
-                    f"{f'${pnl_usd:+.4f}' if pnl_usd is not None else 'pnl unknown'}",
+                    f"{f'${display_pnl_usd:+.4f}' if display_pnl_usd is not None else 'pnl unknown'}{verified_suffix}",
             trade_id=trade_uuid,
         ))
 

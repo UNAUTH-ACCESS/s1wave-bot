@@ -1291,9 +1291,12 @@ class ConfluenceLiveWorker:
             row.exit_network_fee_lamports = result.network_fee_lamports
             row.reclaim_tx_signature = result.reclaim_tx_signature
             row.reclaim_sol_lamports = result.reclaim_sol_lamports
+            real_pnl_usd = None
             if (row.entry_real_sol_lamports is not None and result.actual_sol_lamports is not None):
                 real_net_lamports = row.entry_real_sol_lamports + result.actual_sol_lamports + (result.reclaim_sol_lamports or 0)
-                row.real_pnl_usd = (Decimal(real_net_lamports) / Decimal("1e9")) * sol_price
+                real_pnl_usd = (Decimal(real_net_lamports) / Decimal("1e9")) * sol_price
+                row.real_pnl_usd = real_pnl_usd
+            entry_real_sol_lamports = row.entry_real_sol_lamports
         self._last_accepted_price.pop(trade["id"], None)
         self._pending_tick.pop(trade["id"], None)
         self._notified_stuck_trades.discard(trade["id"])
@@ -1302,16 +1305,33 @@ class ConfluenceLiveWorker:
         if was_unsellable:
             log.info("confluence_live.unsellable_recovered", trade_id=str(trade["id"]), symbol=trade.get("symbol"))
         pnl_pct = (pnl_usd / trade["position_usd"] * 100) if pnl_usd is not None and trade["position_usd"] else None
+        # Prefer the real, on-chain-verified P&L over the recorded
+        # (intended-amount) figure whenever it's known (2026-09-28) — real
+        # incident: the notification bar was still reporting the OLD
+        # pnl_usd/pnl_pct here even after trade history was fixed to show
+        # real_pnl_usd as the primary number, so the two disagreed on the
+        # same closed trade (a real case: recorded "$-0.00" vs. the real
+        # -$0.04 trade history already had correctly). Same "✓ verified"
+        # convention as the dashboard's trade-history table.
+        if real_pnl_usd is not None and entry_real_sol_lamports:
+            capital_paid_usd = (Decimal(str(abs(entry_real_sol_lamports))) / Decimal("1e9")) * sol_price
+            display_pnl_usd = real_pnl_usd
+            display_pnl_pct = (real_pnl_usd / capital_paid_usd * 100) if capital_paid_usd else None
+            verified_suffix = " ✓"
+        else:
+            display_pnl_usd = pnl_usd
+            display_pnl_pct = pnl_pct
+            verified_suffix = ""
         # LIQUIDITY_GUARD is always critical regardless of pnl sign — it
         # means the snapshot price this position was being monitored
         # against had already diverged from reality, which is worth
         # flagging distinctly from a routine, expected stop.
-        notify_level = "critical" if reason == "LIQUIDITY_GUARD" else ("info" if (pnl_usd or 0) >= 0 else "warning")
+        notify_level = "critical" if reason == "LIQUIDITY_GUARD" else ("info" if (display_pnl_usd or 0) >= 0 else "warning")
         await self._notify(
             notify_level, "exit_filled",
             f"{trade.get('symbol') or trade['mint'][:8]} closed ({reason}): "
-            f"{f'{pnl_pct:+.1f}%' if pnl_pct is not None else 'pnl unknown'}"
-            f"{f', ${pnl_usd:+.2f}' if pnl_usd is not None else ''}",
+            f"{f'{display_pnl_pct:+.1f}%' if display_pnl_pct is not None else 'pnl unknown'}"
+            f"{f', ${display_pnl_usd:+.2f}' if display_pnl_usd is not None else ''}{verified_suffix}",
             trade_id=trade["id"],
         )
         log.info("confluence_live.exit_filled", trade_id=str(trade["id"]), exit_reason=reason,
