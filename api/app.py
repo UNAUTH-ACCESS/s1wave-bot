@@ -60,6 +60,14 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, PlainTex
 from sqlalchemy import select, func, desc, and_
 
 from engine.execution import ExecutionEngine
+from engine.filter_calibration import (
+    BASELINE_CAPPED_MEAN,
+    BASELINE_ESTABLISHED_AT,
+    BASELINE_RUG_RATE,
+    BASELINE_SAMPLE_N,
+    BASELINE_WIN_RATE,
+    check_current_filter_population,
+)
 from engine.halt_override import acknowledge_halt, apply_override, get_halt_override
 from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
@@ -1299,6 +1307,36 @@ def create_app() -> FastAPI:
             "all_time": _compute_pct_stats(all_rows),
         }
 
+    @app.get("/confluence/calibration", tags=["confluence"])
+    async def confluence_calibration(window_days: int = Query(default=14, ge=1, le=90)) -> dict:
+        """
+        On-demand read of the same self-audit `_maybe_check_filter_
+        calibration()` runs weekly in the background (2026-09-28) — see
+        engine/filter_calibration.py's module docstring for the full
+        design. Lets anyone (a human via Termux, or a future Claude
+        session) check "are the entry filters still performing like they
+        did when they were validated?" without re-deriving the analysis
+        by hand or waiting for the next scheduled check. Never adjusts
+        anything — read-only, same as the background check.
+        """
+        result = await check_current_filter_population(window_days=window_days)
+        return {
+            "window_days": result.window_days,
+            "n": result.n,
+            "win_rate": result.win_rate,
+            "rug_rate": result.rug_rate,
+            "capped_mean": result.capped_mean,
+            "needs_review": result.needs_review,
+            "reasons": result.reasons,
+            "baseline": {
+                "win_rate": BASELINE_WIN_RATE,
+                "rug_rate": BASELINE_RUG_RATE,
+                "capped_mean": BASELINE_CAPPED_MEAN,
+                "established_at": BASELINE_ESTABLISHED_AT,
+                "sample_n": BASELINE_SAMPLE_N,
+            },
+        }
+
     @app.get("/confluence/summary", tags=["confluence"], response_class=PlainTextResponse)
     async def confluence_summary() -> str:
         """
@@ -1378,8 +1416,19 @@ def create_app() -> FastAPI:
                       f"win rate {_fmt_frac(shadow_stats['win_rate'])}, capped mean {_fmt_pct(shadow_stats['mean_pnl_pct_capped'])}, rug rate {_fmt_frac(shadow_stats['rug_rate'])}")
         lines.append(f"       all-time ({shadow_stats['all_time']['closed']} closed): "
                       f"win rate {_fmt_frac(shadow_stats['all_time']['win_rate'])}, capped mean {_fmt_pct(shadow_stats['all_time']['mean_pnl_pct_capped'])}")
+        calibration = await check_current_filter_population()
+        if calibration.n < 15:
+            cal_line = f"Filter calibration: not enough recent data to judge ({calibration.n} trades in {calibration.window_days}d)"
+        elif calibration.needs_review:
+            cal_line = f"Filter calibration: ⚠️  NEEDS REVIEW — {'; '.join(calibration.reasons)}"
+        else:
+            cal_line = (f"Filter calibration: ✅ OK (last {calibration.window_days}d, n={calibration.n}) — "
+                        f"win {_fmt_frac(calibration.win_rate)}, rug {_fmt_frac(calibration.rug_rate)}, "
+                        f"capped mean {_fmt_pct(calibration.capped_mean * 100 if calibration.capped_mean is not None else None)}")
         lines.append("")
-        lines.append("Full detail: GET /confluence/status, /confluence/live/trades, /confluence/live/stats, /confluence/shadow/stats")
+        lines.append(cal_line)
+        lines.append("")
+        lines.append("Full detail: GET /confluence/status, /confluence/live/trades, /confluence/live/stats, /confluence/shadow/stats, /confluence/calibration")
         return "\n".join(lines) + "\n"
 
     @app.get("/confluence/shadow/positions", tags=["confluence"])

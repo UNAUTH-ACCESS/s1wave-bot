@@ -2020,6 +2020,97 @@ class TestAuditTrailBackfill:
             await worker._maybe_backfill_audit_trail()  # must not raise
 
 
+class TestFilterCalibrationCheck:
+    """
+    Periodic self-audit (2026-09-28) — _maybe_check_filter_calibration()
+    re-runs engine.filter_calibration.check_current_filter_population()
+    on _CALIBRATION_CHECK_INTERVAL_S, and notifies (never adjusts a
+    threshold) when it comes back needing review. See
+    engine/filter_calibration.py's module docstring for why this is
+    detect-and-flag only, never auto-adjusting.
+    """
+
+    def _fake_result(self, needs_review: bool, reasons=None, n=50):
+        import workers.confluence_live_worker as mod
+        from engine.filter_calibration import CalibrationResult
+        return CalibrationResult(
+            n=n, window_days=14, win_rate=0.5 if needs_review else 0.86,
+            rug_rate=0.3 if needs_review else 0.08, capped_mean=-0.1 if needs_review else 0.30,
+            needs_review=needs_review, reasons=reasons or (["win rate too low"] if needs_review else []),
+        )
+
+    @pytest.mark.asyncio
+    async def test_checks_on_the_first_cycle_without_waiting_a_full_interval(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        mock_check = AsyncMock(return_value=self._fake_result(needs_review=False))
+        monkeypatch.setattr(mod, "check_current_filter_population", mock_check)
+        await worker._maybe_check_filter_calibration()
+        mock_check.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_does_not_check_again_before_the_interval_elapses(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        mock_check = AsyncMock(return_value=self._fake_result(needs_review=False))
+        monkeypatch.setattr(mod, "check_current_filter_population", mock_check)
+        await worker._maybe_check_filter_calibration()
+        await worker._maybe_check_filter_calibration()
+        mock_check.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_checks_again_once_the_interval_elapses(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        mock_check = AsyncMock(return_value=self._fake_result(needs_review=False))
+        monkeypatch.setattr(mod, "check_current_filter_population", mock_check)
+        await worker._maybe_check_filter_calibration()
+        worker._last_calibration_check -= mod._CALIBRATION_CHECK_INTERVAL_S + 1
+        await worker._maybe_check_filter_calibration()
+        assert mock_check.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_notifies_when_review_is_needed(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        mock_check = AsyncMock(return_value=self._fake_result(needs_review=True, reasons=["win rate 50.0% is below the 65% review floor"]))
+        monkeypatch.setattr(mod, "check_current_filter_population", mock_check)
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_check_filter_calibration()
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        review_rows = [r for r in rows if r.event == "filter_calibration_needs_review"]
+        assert len(review_rows) == 1
+        assert "win rate" in review_rows[0].message
+
+    @pytest.mark.asyncio
+    async def test_no_notification_when_everything_still_looks_fine(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        mock_check = AsyncMock(return_value=self._fake_result(needs_review=False))
+        monkeypatch.setattr(mod, "check_current_filter_population", mock_check)
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_check_filter_calibration()
+        finally:
+            ctx.stop()
+
+        rows = (await session.execute(select(ConfluenceNotification))).scalars().all()
+        assert not any(r.event == "filter_calibration_needs_review" for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_a_check_failure_never_raises(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        worker = make_worker(session)
+        monkeypatch.setattr(mod, "check_current_filter_population", AsyncMock(side_effect=RuntimeError("DB outage")))
+        await worker._maybe_check_filter_calibration()  # must not raise
+
+
 class TestExposurePercentageSizing:
     """config/settings.py's CONFLUENCE_LIVE_EXPOSURE_PCT formula
     (2026-09-23, replacing an earlier fixed-stake-plus-profit-share

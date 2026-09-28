@@ -133,6 +133,7 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.execution import ExecutionEngine
+from engine.filter_calibration import check_current_filter_population
 from engine.halt_override import apply_override, get_halt_override
 from engine.sell_coordination import finish_sell, try_start_sell
 from engine.live_equity import (
@@ -280,6 +281,16 @@ _AUDIT_BACKFILL_INTERVAL_S = 900.0     # 15 minutes between sweeps
 _AUDIT_BACKFILL_BATCH_SIZE = 200        # comfortably above the historical backlog
 _AUDIT_BACKFILL_LOOKUP_DELAY_S = 0.4    # gentle pacing between RPC calls
 
+# Filter calibration self-audit (2026-09-28) — see
+# engine/filter_calibration.py's module docstring for the full design:
+# re-runs the same bucket analysis that validated the 3 production entry
+# filters, on a trailing 14-day window, and flags (never auto-adjusts) a
+# real divergence from the 2026-09-28 baseline. Weekly is deliberately
+# slow — this dataset moves in the dozens of trades per week, not
+# thousands, so checking more often would mostly just re-measure the same
+# noise this session repeatedly had to caveat around (n=15-30 buckets).
+_CALIBRATION_CHECK_INTERVAL_S = 7 * 24 * 3600.0  # 1 week
+
 # Sell-retry backoff for a persistently-failing exit (2026-09-25) — real,
 # live incident: SEND's exit reason (TIME_EXIT, permanently true forever
 # once past max_hold_seconds) re-triggered a full real sell attempt (a
@@ -363,6 +374,9 @@ class ConfluenceLiveWorker:
         # Real-audit-trail backfill (2026-09-28) — see
         # _AUDIT_BACKFILL_INTERVAL_S's comment. None means "never run yet."
         self._last_audit_backfill: float | None = None
+        # Filter calibration self-audit (2026-09-28) — see
+        # _CALIBRATION_CHECK_INTERVAL_S's comment. None means "never run yet."
+        self._last_calibration_check: float | None = None
         self._execution = ExecutionEngine(
             paper_override=False,
             wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
@@ -404,6 +418,7 @@ class ConfluenceLiveWorker:
         await self._refresh_halt_notifications(equity, today_pnl, all_time_pnl)
         await self._maybe_sweep_rent()
         await self._maybe_backfill_audit_trail()
+        await self._maybe_check_filter_calibration()
 
         if settings.CONFLUENCE_LIVE_ENABLED:
             await self._maybe_enter()
@@ -702,6 +717,41 @@ class ConfluenceLiveWorker:
 
         if filled_count:
             log.info("confluence_live.audit_backfilled", count=filled_count, trade_ids=[str(t) for t in trade_ids])
+
+    async def _maybe_check_filter_calibration(self) -> None:
+        """
+        See _CALIBRATION_CHECK_INTERVAL_S's comment and
+        engine/filter_calibration.py's module docstring for the full
+        design. Runs regardless of CONFLUENCE_LIVE_ENABLED — same
+        reasoning as the rent sweep and halt notifications, this is a
+        standing health check, not an entry decision. Never lets a check
+        failure break the trading cycle that triggered it; a failed check
+        just gets retried next week.
+        """
+        now_mono = time.monotonic()
+        if (self._last_calibration_check is not None
+                and (now_mono - self._last_calibration_check) < _CALIBRATION_CHECK_INTERVAL_S):
+            return
+        self._last_calibration_check = now_mono
+        try:
+            result = await check_current_filter_population()
+        except Exception as exc:
+            log.warning("confluence_live.calibration_check_failed", error_type=type(exc).__name__, error=str(exc))
+            return
+        if result.needs_review:
+            log.warning("confluence_live.filter_calibration_needs_review", n=result.n,
+                        win_rate=result.win_rate, rug_rate=result.rug_rate,
+                        capped_mean=result.capped_mean, reasons=result.reasons)
+            await self._notify(
+                "warning", "filter_calibration_needs_review",
+                f"Filter calibration check (last {result.window_days}d, n={result.n}): "
+                + "; ".join(result.reasons) + ". Entry filters aren't self-adjusting — "
+                "this needs a human to re-run the full analysis, not just this flag.",
+            )
+        else:
+            log.info("confluence_live.filter_calibration_ok", n=result.n, window_days=result.window_days,
+                      win_rate=result.win_rate, rug_rate=result.rug_rate, capped_mean=result.capped_mean,
+                      reasons=result.reasons)
 
     async def _safe_to_enter(self) -> bool:
         equity = await self._get_equity_usd()
