@@ -86,12 +86,30 @@ _SELL_RETRY_DELAY_S = 2.0
 # 20-35x the intended size in one unavoidable, un-refundable cost — the
 # opposite of "protect the money first."
 #
+# RAISED 2.2M -> 5.0M lamports (2026-09-28), after checking what this
+# ceiling was actually rejecting: 16 real live entries blocked as
+# "entry_too_expensive" since this shipped, every one of them ALSO opened
+# as a shadow position (shadow has no real transaction cost, so it's an
+# exact counterfactual — same signal, same entry/exit rules, same 1s
+# monitoring). Result: 14 of 15 closed would have WON (93.3%), mean
+# +48.8% raw / +39.1% capped, the one loss a small -13.3% stop-loss, not
+# a rug. Mechanistically this makes sense: "first trade against a
+# freshly-migrated pool" is the same population workers/entry_filters.py's
+# liquidity ceiling already identified as the strategy's best-performing
+# segment — this cost gate and that filter were pointing at the same
+# tokens from opposite directions. The real overhead observed clusters
+# tightly at ~4.6-4.75M lamports every time (including the original
+# Bybit/NUUC incident, ~4.65M) — a common, predictable, usually-profitable
+# fixed cost, not the rare blowout the original 2.2M ceiling assumed. Also
+# a $0.50ish fixed cost was crushing at the ~$0.015-0.29 positions this
+# was calibrated against; it's a much smaller bite at the ~$1+ positions
+# CONFLUENCE_LIVE_EXPOSURE_PCT=0.50 now produces. 5.0M clears every
+# observed case (max ~4.73M) with real margin while still catching
+# anything genuinely more extreme than what's actually been seen.
 # One normal entry (a single destination token account for us) costs
 # ~1.49M lamports of real rent + the swap principal + a small fee — see
-# _check_entry_cost()'s docstring for how this ceiling was chosen: comfortable
-# margin above that normal case, solidly below the ~4.6M-lamport-of-extra-
-# overhead case that actually happened.
-_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
+# _check_entry_cost()'s docstring for the exact math.
+_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 5_000_000
 
 # withdraw_sol() (2026-09-28): a plain System Program transfer's real
 # network fee is ~5,000 lamports — this reserve is comfortably above that,
