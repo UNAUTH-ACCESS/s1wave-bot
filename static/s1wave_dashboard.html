@@ -61,6 +61,9 @@
   .btn.toggle.resume:hover { background:rgba(255,68,68,.08); border-color:var(--danger); }
   .btn.toggle.pause { border-color:rgba(255,184,0,.4); color:var(--warn); }
   .btn.toggle.pause:hover { background:rgba(255,184,0,.08); border-color:var(--warn); }
+  .halt-notice { margin-top:12px; padding:8px 10px; border:1px solid rgba(255,68,68,.4); border-radius:6px; background:rgba(255,68,68,.08); font-size:11.5px; line-height:1.5; color:var(--danger); }
+  .btn.toggle.resume-halted { border-color:rgba(255,68,68,.6); color:#fff; background:rgba(255,68,68,.85); }
+  .btn.toggle.resume-halted:hover { background:rgba(255,68,68,1); }
 
   .row { display:grid; gap:14px; margin-bottom:14px; }
   .r4 { grid-template-columns:repeat(4,1fr); }
@@ -372,6 +375,15 @@ function renderStatusCards(status, shadow) {
     <button class="btn toggle ${armed ? 'pause' : 'resume'}" id="toggleBtn" onclick="toggleTrading(${!armed})">
       ${armed ? '⏸ PAUSE TRADING' : '▶ RESUME TRADING'}
     </button>
+    ${status.permanently_halted ? `
+      <div class="halt-notice">
+        🛑 <b>Permanently halted</b> by the max-loss safety gate${status.halt_override_active ? ` (since resuming on ${absoluteTime(status.halt_override_acknowledged_at)})` : ''} —
+        no new entries until acknowledged. The ARMED switch above has no effect while this is active.
+      </div>
+      <button class="btn toggle resume-halted" id="resumeHaltedBtn" onclick="resumeHaltedTrading()">
+        ⚠ RESUME HALTED TRADING
+      </button>
+    ` : ''}
   `;
 
   const pnlClass = parseFloat(status.all_time_realized_pnl_usd) > 0 ? 'g' : parseFloat(status.all_time_realized_pnl_usd) < 0 ? 'r' : '';
@@ -704,7 +716,7 @@ function renderTradeHistory(closed) {
 async function loadLiveTrades() {
   const [open, closed] = await Promise.all([
     get('/confluence/live/trades?status=open&limit=20'),
-    get('/confluence/live/trades?status=closed&limit=50'),
+    get('/confluence/live/trades?status=closed&limit=200'),
   ]);
   lastClosedTrades = closed;
   renderTradeHistory(closed);
@@ -835,7 +847,7 @@ function renderNotifications(list) {
 }
 
 async function loadNotifications() {
-  const list = await get('/confluence/notifications?limit=30');
+  const list = await get('/confluence/notifications?limit=200');
   renderNotifications(list);
   // Only now is it safe to start toasting — every recent notification is
   // guaranteed to be in seenNotifIds by this point, no matter which source
@@ -864,6 +876,39 @@ async function toggleTrading(nextEnabled) {
     alert('Failed to update: ' + e.message);
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+// ── Resume-after-halt override (2026-09-28) ─────────────────────────────
+// Deliberately NOT the same one-line confirm as toggleTrading() — a
+// permanent halt means the $3 max-loss cap has already been hit for
+// real, and resuming resets that cap's zero point to right now rather
+// than disabling it. The dialog spells out what's actually happening so
+// this is never clicked on reflex.
+async function resumeHaltedTrading() {
+  const ok = confirm(
+    'Resume trading after a permanent halt?\n\n' +
+    'This does NOT disable the safety cap — it resets its zero point to ' +
+    'the wallet\'s current balance and P&L right now. The exact same ' +
+    'max-loss limit will keep protecting every dollar from this moment ' +
+    'forward, measured from here instead of the original deposit.\n\n' +
+    'Only do this if you\'ve consciously accepted the loss so far and want ' +
+    'to keep trading with what\'s left.'
+  );
+  if (!ok) return;
+  const btn = document.getElementById('resumeHaltedBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+  try {
+    const res = await fetch(BASE + '/confluence/resume-halted', { method: 'POST' });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || ('HTTP ' + res.status));
+    }
+    await loadStatusCards();
+  } catch (e) {
+    alert('Failed to resume: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⚠ RESUME HALTED TRADING'; }
   }
 }
 

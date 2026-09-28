@@ -647,6 +647,35 @@ class ConfluenceLiveTrade(Base):
         return f"<ConfluenceLiveTrade token={self.token_id} status={self.status}>"
 
 
+class ConfluenceLiveHaltOverride(Base):
+    """
+    Singleton row (id=1) — a human's explicit "resume" after a permanent
+    halt (2026-09-28). Deliberately NOT a simple on/off switch: disabling
+    the safety check outright would mean a further loss down to zero goes
+    completely unnoticed, defeating the whole point of
+    CONFLUENCE_LIVE_MAX_LOSS_USD. Instead, resuming records the wallet's
+    real equity and all-time realized P&L AT THE MOMENT of acknowledgment
+    as new baselines — engine/live_equity.py's is_permanently_halted() is
+    then checked against (equity - equity_baseline_usd) and
+    (all_time_pnl_usd - pnl_baseline_usd) instead of the original deposit
+    and lifetime P&L. The user has consciously accepted the loss so far
+    and chosen to continue with what's left; the SAME $3 cap still
+    protects every dollar from here forward, just measured from a new
+    zero point rather than the original deposit. Overwritten (not
+    versioned) on every acknowledgment — only the most recent one matters.
+    """
+
+    __tablename__ = "confluence_live_halt_override"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    acknowledged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    equity_baseline_usd: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    pnl_baseline_usd: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<ConfluenceLiveHaltOverride acknowledged_at={self.acknowledged_at}>"
+
+
 class ConfluenceLiveObservation(Base):
     """Raw 1-second price observation for an OPEN ConfluenceLiveTrade —
     same convention as ConfluenceShadowObservation/TradePriceObservation."""

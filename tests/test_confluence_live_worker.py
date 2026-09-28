@@ -91,11 +91,31 @@ def make_worker(session, enabled=True) -> ConfluenceLiveWorker:
 
 
 def patched_session(session):
+    """
+    Patches get_session everywhere the worker's real request path touches
+    it — including engine/halt_override.py (2026-09-28), which imports its
+    own get_session reference and is NOT covered by patching the worker
+    module's reference alone (confirmed the hard way: every halt/entry
+    test in this file started making real postgres connection attempts
+    the moment _safe_to_enter()/_refresh_halt_notifications() started
+    calling get_halt_override()).
+    """
     ctx = patch("workers.confluence_live_worker.get_session")
     mock_gs = ctx.start()
     mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
     mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-    return ctx
+
+    ctx2 = patch("engine.halt_override.get_session")
+    mock_gs2 = ctx2.start()
+    mock_gs2.return_value.__aenter__ = AsyncMock(return_value=session)
+    mock_gs2.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    class _CombinedCtx:
+        def stop(self):
+            ctx.stop()
+            ctx2.stop()
+
+    return _CombinedCtx()
 
 
 def mock_wallet_balance(worker, monkeypatch, equity_usd, sol_price=150.0) -> None:

@@ -59,6 +59,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select, func, desc, and_
 
+from engine.halt_override import acknowledge_halt, apply_override, get_halt_override
 from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
 from workers.entry_filters import CURRENT_FILTER_REGIME_SINCE
@@ -203,6 +204,10 @@ async def _build_confluence_status() -> dict:
         start_of_day_equity = max(Decimal("0"), equity - today_pnl)
         daily_limit = start_of_day_equity * Decimal(str(settings.CONFLUENCE_LIVE_DAILY_LOSS_LIMIT_PCT))
 
+    # Resume-after-halt override (2026-09-28) — see engine/halt_override.py.
+    override = await get_halt_override()
+    effective_deposit, effective_pnl = apply_override(override, DEPOSIT_USD, all_time_pnl)
+
     return {
         "enabled": settings.CONFLUENCE_LIVE_ENABLED,
         "wallet_address": wallet_address,
@@ -219,7 +224,9 @@ async def _build_confluence_status() -> dict:
         "closed_trades": closed_count,
         "max_concurrent": settings.CONFLUENCE_LIVE_MAX_CONCURRENT,
         "exposure_pct": settings.CONFLUENCE_LIVE_EXPOSURE_PCT,
-        "permanently_halted": is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD),
+        "permanently_halted": is_permanently_halted(equity, effective_pnl, deposit_usd=effective_deposit),
+        "halt_override_active": override is not None,
+        "halt_override_acknowledged_at": override.acknowledged_at.isoformat() if override else None,
         "daily_halted": is_daily_halted(equity, today_pnl),
         "daily_loss_limit_usd": str(daily_limit.quantize(Decimal("0.01"))) if daily_limit is not None else None,
         "min_tradeable_usd": settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,
@@ -928,6 +935,41 @@ def create_app() -> FastAPI:
             ))
         return {"enabled": settings.CONFLUENCE_LIVE_ENABLED}
 
+    @app.post("/confluence/resume-halted", tags=["confluence"])
+    async def confluence_resume_halted() -> dict:
+        """
+        Acknowledge a permanent halt and resume trading (2026-09-28) — the
+        dashboard's RESUME HALTED TRADING button. Deliberately NOT a
+        simple re-enable: see engine/halt_override.py and
+        models.orm.ConfluenceLiveHaltOverride for the full design — this
+        resets the safety check's baseline to right now rather than
+        disabling it, so the same CONFLUENCE_LIVE_MAX_LOSS_USD cap keeps
+        protecting every dollar from this point forward. Does NOT touch
+        CONFLUENCE_LIVE_ENABLED — if trading was manually paused before
+        the halt, it stays paused; this only clears
+        is_permanently_halted()'s block on new entries.
+        """
+        status = await _build_confluence_status()
+        if not status["permanently_halted"]:
+            raise HTTPException(status_code=400, detail="Trading is not currently halted — nothing to resume.")
+        if status["equity_usd"] is None:
+            raise HTTPException(status_code=503, detail="Wallet balance not available — try again in a moment.")
+        equity_usd = Decimal(status["equity_usd"])
+        all_time_pnl_usd = Decimal(status["all_time_realized_pnl_usd"])
+        await acknowledge_halt(equity_usd, all_time_pnl_usd)
+        async with get_session() as session:
+            session.add(ConfluenceNotification(
+                level="warning",
+                event="halt_resumed",
+                message=(
+                    f"Halt acknowledged and trading RESUMED from the dashboard. "
+                    f"New baseline: equity ${equity_usd:.2f}, all-time P&L ${all_time_pnl_usd:.2f} — "
+                    f"the ${Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):.2f} max-loss cap now protects "
+                    f"every dollar from this point forward."
+                ),
+            ))
+        return await _build_confluence_status()
+
     @app.post("/confluence/live/trades/{trade_id}/close", tags=["confluence"])
     async def confluence_close_trade(trade_id: str) -> dict:
         """
@@ -1206,7 +1248,7 @@ def create_app() -> FastAPI:
         # verdict rather than two separately-true facts that read as
         # contradictory ("ARMED — HALTED").
         if status["permanently_halted"]:
-            trading_line = "Trading: 🛑 HALTED by safety gate — needs a human to clear, regardless of the switch"
+            trading_line = "Trading: 🛑 HALTED by safety gate — POST /confluence/resume-halted (or the dashboard button) to clear it"
         elif status["daily_halted"]:
             trading_line = "Trading: ⏸️  PAUSED — daily loss limit hit, resumes automatically next UTC day"
         elif status["enabled"]:

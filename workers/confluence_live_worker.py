@@ -133,6 +133,7 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.execution import ExecutionEngine
+from engine.halt_override import apply_override, get_halt_override
 from engine.sell_coordination import finish_sell, try_start_sell
 from engine.live_equity import (
     DEPOSIT_USD, compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
@@ -511,7 +512,14 @@ class ConfluenceLiveWorker:
         first_check = not self._halt_state_initialized
         self._halt_state_initialized = True
 
-        perm_halted = is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD)
+        # Resume-after-halt override (2026-09-28) — see engine/halt_override.py's
+        # docstring: a human acknowledging a past halt resets these two
+        # baselines to that moment, rather than disabling the check. The
+        # exact same cap keeps protecting every dollar from here forward.
+        override = await get_halt_override()
+        effective_deposit, effective_pnl = apply_override(override, DEPOSIT_USD, all_time_pnl)
+
+        perm_halted = is_permanently_halted(equity, effective_pnl, deposit_usd=effective_deposit)
         if perm_halted != self._last_permanently_halted:
             self._last_permanently_halted = perm_halted
             if perm_halted:
@@ -522,18 +530,19 @@ class ConfluenceLiveWorker:
                 # the new deposit-gap check got reported as "wallet balance
                 # $4.35 is below the $1.00 minimum" — false on its face
                 # (4.35 > 1.00) and pointing at the wrong cause entirely.
-                max_loss_hit = all_time_pnl <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
-                real_loss = (equity - DEPOSIT_USD) if equity is not None else None
+                max_loss_hit = effective_pnl <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
+                real_loss = (equity - effective_deposit) if equity is not None else None
                 deposit_gap_hit = real_loss is not None and real_loss <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
                 dust_floor_hit = equity is not None and equity <= Decimal(str(settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD))
                 if max_loss_hit:
                     reason = (
                         f"realized losses reached the ${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} test-phase limit "
-                        f"(all-time: ${all_time_pnl:.2f})"
+                        f"(all-time: ${effective_pnl:.2f}{' since the last resume' if override else ''})"
                     )
                 elif deposit_gap_hit:
                     reason = (
-                        f"real loss against the ${DEPOSIT_USD:.2f} deposit reached the "
+                        f"real loss against the ${effective_deposit:.2f} "
+                        f"{'balance at your last resume' if override else 'deposit'} reached the "
                         f"${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} limit (wallet: ${equity:.2f}, "
                         f"real loss: ${real_loss:.2f})"
                     )
@@ -670,7 +679,9 @@ class ConfluenceLiveWorker:
             return False
 
         all_time_pnl = await self._load_all_time_realized_pnl()
-        if is_permanently_halted(equity, all_time_pnl, deposit_usd=DEPOSIT_USD):
+        override = await get_halt_override()
+        effective_deposit, effective_pnl = apply_override(override, DEPOSIT_USD, all_time_pnl)
+        if is_permanently_halted(equity, effective_pnl, deposit_usd=effective_deposit):
             return False
 
         today_pnl = await self._load_today_realized_pnl()
