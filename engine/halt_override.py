@@ -11,7 +11,7 @@ In short: a permanent halt is not something a button should just switch
 off — that would mean a further loss down to zero goes completely
 unnoticed. Instead, acknowledging a halt records the wallet's current
 equity and all-time realized P&L as new baselines; the exact same
-CONFLUENCE_LIVE_MAX_LOSS_USD cap keeps protecting every dollar from that
+CONFLUENCE_LIVE_MAX_LOSS_PCT cap keeps protecting every dollar from that
 point forward, just measured from a new zero rather than the original
 deposit.
 """

@@ -2,7 +2,7 @@
 Tests for engine/halt_override.py (2026-09-28) — the resume-after-halt
 baseline reset. See models.orm.ConfluenceLiveHaltOverride's docstring for
 the design: acknowledging a halt must NOT disable the safety check, it
-resets its zero point, so the same CONFLUENCE_LIVE_MAX_LOSS_USD cap keeps
+resets its zero point, so the same CONFLUENCE_LIVE_MAX_LOSS_PCT cap keeps
 protecting every dollar from the acknowledgment moment forward.
 """
 from __future__ import annotations

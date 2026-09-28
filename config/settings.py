@@ -100,14 +100,22 @@ class Settings(BaseSettings):
     # attempt an ever-shrinking sequence of sub-dollar trades.
     CONFLUENCE_LIVE_MIN_TRADEABLE_USD: Annotated[float, Field(gt=0)] = 1.0
     # 2026-09-24, user's explicit instruction for the first real test run:
-    # "set max loss to $3". Absolute-dollar lifetime cap, independent of the
-    # dust floor above — once ALL-TIME REALIZED LOSS across every closed
-    # confluence_live_trades row reaches this amount, halt PERMANENTLY, same
-    # severity as the dust-floor halt, regardless of how much equity is
-    # still technically in the wallet. This is a real risk decision for a
-    # live test phase, not a tuning knob — do not raise it without a fresh,
-    # explicit instruction.
-    CONFLUENCE_LIVE_MAX_LOSS_USD: Annotated[float, Field(gt=0)] = 3.0
+    # "set max loss to $3" (an absolute-dollar lifetime cap). 2026-09-28,
+    # converted to a PERCENTAGE per the user's explicit instruction ("so
+    # it'll correspond with different cc balance") — a fixed $3 stopped
+    # making sense the moment the wallet could be topped up or drawn down:
+    # the same $3 is a crushing 30% of a $10 balance but a trivial 0.5% of
+    # a $600 one. is_permanently_halted() now computes the real dollar
+    # threshold as `deposit_usd * CONFLUENCE_LIVE_MAX_LOSS_PCT`, where
+    # deposit_usd is the caller's current baseline (the original DEPOSIT_USD,
+    # or — after a resume-after-halt acknowledgment or a withdrawal — the
+    # freshly reset baseline from engine/halt_override.py). Halts
+    # PERMANENTLY, independent of the dust floor above, once real equity
+    # has drawn down this fraction from that baseline, regardless of how
+    # much equity is still technically in the wallet. Real risk decision
+    # for a live test phase, not a tuning knob — do not raise it without a
+    # fresh, explicit instruction.
+    CONFLUENCE_LIVE_MAX_LOSS_PCT: Annotated[float, Field(gt=0, le=1)] = 0.30
     # Outer sanity ceiling on a single position, independent of how much
     # the account has compounded or how much is deposited — NOT the
     # everyday position size (see CONFLUENCE_LIVE_EXPOSURE_PCT below for

@@ -653,7 +653,7 @@ class ConfluenceLiveHaltOverride(Base):
     halt (2026-09-28). Deliberately NOT a simple on/off switch: disabling
     the safety check outright would mean a further loss down to zero goes
     completely unnoticed, defeating the whole point of
-    CONFLUENCE_LIVE_MAX_LOSS_USD. Instead, resuming records the wallet's
+    CONFLUENCE_LIVE_MAX_LOSS_PCT. Instead, resuming records the wallet's
     real equity and all-time realized P&L AT THE MOMENT of acknowledgment
     as new baselines — engine/live_equity.py's is_permanently_halted() is
     then checked against (equity - equity_baseline_usd) and

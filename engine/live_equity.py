@@ -37,12 +37,14 @@ Safety gates, redefined against live equity instead of a fixed stake:
   - permanently halted: EITHER (a) live equity has fallen to (near) zero —
     CONFLUENCE_LIVE_MIN_TRADEABLE_USD is a dust floor (default $1), not a
     loss-limit percentage: below it, swap fees and slippage would dominate
-    any trade anyway — OR (b) all-time REALIZED loss across every closed
-    confluence_live_trades row has reached CONFLUENCE_LIVE_MAX_LOSS_USD (an
-    absolute dollar cap, 2026-09-24, per the user's explicit instruction for
-    the first live test run: "set max loss to $3"). (b) is independent of
-    (a): a wallet can still hold plenty of equity (e.g. topped up again)
-    while having realized $3 of losses lifetime, and that must still halt.
+    any trade anyway — OR (b) real equity has drawn down
+    CONFLUENCE_LIVE_MAX_LOSS_PCT (2026-09-28: a PERCENTAGE, 30% default —
+    converted from a fixed $3 the same day the user added more capital,
+    specifically so the threshold scales with whatever the current balance
+    actually is instead of staying pinned to the original $10 test size)
+    from `deposit_usd`, the caller's current baseline. (b) is independent
+    of (a): a wallet can still hold plenty of equity (e.g. topped up again)
+    while having drawn down 30% from its baseline, and that must still halt.
   - daily halted: today's realized P&L has erased CONFLUENCE_LIVE_
     DAILY_LOSS_LIMIT_PCT of *today's starting* equity. Today's starting
     equity is back-derived as (current equity - today's realized pnl)
@@ -107,32 +109,45 @@ def is_permanently_halted(
     was confirmed, via a full on-chain audit, to understate real losses by
     6.36x in aggregate — built from INTENDED swap amounts, missing a
     mandatory, non-reclaimable Pump.fun protocol-fee cost on some sells.
-    Real consequence found live: CONFLUENCE_LIVE_MAX_LOSS_USD (set to
-    $3.00) had ALREADY been breached in reality (real loss ~$6.71 against
-    a $10.65 deposit) while this function kept reporting "not halted",
-    because it only ever saw the understated -$1.21 figure. Trading kept
-    running past its own stated stop-loss the whole time.
+    Real consequence found live: the max-loss cap had ALREADY been
+    breached in reality (real loss ~$6.71 against a $10.65 deposit) while
+    this function kept reporting "not halted", because it only ever saw
+    the understated -$1.21 figure. Trading kept running past its own
+    stated stop-loss the whole time.
 
     deposit_usd (optional) lets a caller ALSO check the ground-truth gap
-    (current equity vs. the wallet's one real deposit) — this doesn't
-    depend on any per-trade attribution at all, so it can't be fooled the
-    same way. Deliberately a parameter, not DEPOSIT_USD baked in directly:
-    that constant is real, production-specific data, and hardcoding it
-    here would make this shared function's behavior depend on unrelated
+    (current equity vs. the caller's current baseline — the wallet's one
+    real deposit, or a later reset baseline) — this doesn't depend on any
+    per-trade attribution at all, so it can't be fooled the same way.
+    Deliberately a parameter, not DEPOSIT_USD baked in directly: that
+    constant is real, production-specific data, and hardcoding it here
+    would make this shared function's behavior depend on unrelated
     real-world state inside tests that pass their own arbitrary equity
-    numbers. The real call site (confluence_live_worker.py) passes
-    deposit_usd=DEPOSIT_USD explicitly. Halts on EITHER signal crossing
-    the limit, whichever is worse; omitting deposit_usd just skips this
-    check, same as omitting all_time_pnl_usd skips that one.
+    numbers. The real call sites (confluence_live_worker.py, api/app.py)
+    pass deposit_usd=<the override-adjusted baseline> explicitly.
+
+    2026-09-28: the loss threshold itself is now `deposit_usd *
+    CONFLUENCE_LIVE_MAX_LOSS_PCT` — a PERCENTAGE of the baseline, not a
+    fixed dollar figure — so it scales automatically whenever the baseline
+    does (a top-up, a withdrawal, or a resume-after-halt acknowledgment),
+    instead of staying pinned to whatever dollar amount made sense for the
+    original test size. Both the recorded-pnl signal and the real-
+    deposit-gap signal are checked against this same scaled threshold;
+    since the threshold itself now depends on deposit_usd, BOTH checks are
+    skipped (not just the deposit-gap one) when deposit_usd is omitted —
+    there is no baseline to compute a percentage of. Halts on EITHER
+    signal crossing the limit, whichever is worse.
     """
     if equity_usd is not None and equity_usd <= Decimal(str(settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD)):
         return True
-    if all_time_pnl_usd is not None and all_time_pnl_usd <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):
-        return True
-    if equity_usd is not None and deposit_usd is not None:
-        real_loss = equity_usd - deposit_usd
-        if real_loss <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):
+    if deposit_usd is not None and deposit_usd > 0:
+        max_loss_usd = deposit_usd * Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_PCT))
+        if all_time_pnl_usd is not None and all_time_pnl_usd <= -max_loss_usd:
             return True
+        if equity_usd is not None:
+            real_loss = equity_usd - deposit_usd
+            if real_loss <= -max_loss_usd:
+                return True
     return False
 
 

@@ -432,8 +432,9 @@ class ConfluenceLiveWorker:
     # ── safety gates ─────────────────────────────────────────────────────
 
     async def _load_all_time_realized_pnl(self) -> Decimal:
-        """Re-added 2026-09-24 for the absolute-dollar lifetime max-loss cap
-        (CONFLUENCE_LIVE_MAX_LOSS_USD) — independent of equity, which no
+        """Re-added 2026-09-24 for the lifetime max-loss cap
+        (CONFLUENCE_LIVE_MAX_LOSS_PCT, a percentage of the current
+        baseline since 2026-09-28) — independent of equity, which no
         longer tracks this on its own now that equity is the live wallet
         balance rather than (stake + all-time pnl)."""
         async with get_session() as session:
@@ -523,28 +524,38 @@ class ConfluenceLiveWorker:
         if perm_halted != self._last_permanently_halted:
             self._last_permanently_halted = perm_halted
             if perm_halted:
-                # Three independent halt conditions (2026-09-28: added the
-                # real-deposit-gap one) — report whichever ACTUALLY
-                # matched, not just guess "dust floor" as the fallback.
-                # Real bug found deploying that exact fix: a real halt from
-                # the new deposit-gap check got reported as "wallet balance
-                # $4.35 is below the $1.00 minimum" — false on its face
-                # (4.35 > 1.00) and pointing at the wrong cause entirely.
-                max_loss_hit = effective_pnl <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
+                # Three independent halt conditions — report whichever
+                # ACTUALLY matched, not just guess "dust floor" as the
+                # fallback. Real bug found deploying an earlier version of
+                # this: a real halt from the deposit-gap check got
+                # reported as "wallet balance $4.35 is below the $1.00
+                # minimum" — false on its face (4.35 > 1.00) and pointing
+                # at the wrong cause entirely.
+                #
+                # 2026-09-28: the threshold itself is now a PERCENTAGE of
+                # the baseline (CONFLUENCE_LIVE_MAX_LOSS_PCT, 30% default)
+                # rather than a fixed dollar figure — see
+                # engine/live_equity.py's is_permanently_halted() docstring
+                # for why. Recomputed here (not read back from that
+                # function) purely to know which of its two internal
+                # checks actually fired, for the message.
+                max_loss_usd = effective_deposit * Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_PCT))
+                max_loss_hit = effective_pnl <= -max_loss_usd
                 real_loss = (equity - effective_deposit) if equity is not None else None
-                deposit_gap_hit = real_loss is not None and real_loss <= -Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD))
+                deposit_gap_hit = real_loss is not None and real_loss <= -max_loss_usd
                 dust_floor_hit = equity is not None and equity <= Decimal(str(settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD))
                 if max_loss_hit:
                     reason = (
-                        f"realized losses reached the ${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} test-phase limit "
-                        f"(all-time: ${effective_pnl:.2f}{' since the last resume' if override else ''})"
+                        f"realized losses reached the {settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} "
+                        f"drawdown limit (${max_loss_usd:.2f} of ${effective_deposit:.2f}) — "
+                        f"all-time: ${effective_pnl:.2f}{' since the last resume' if override else ''}"
                     )
                 elif deposit_gap_hit:
                     reason = (
                         f"real loss against the ${effective_deposit:.2f} "
                         f"{'balance at your last resume' if override else 'deposit'} reached the "
-                        f"${settings.CONFLUENCE_LIVE_MAX_LOSS_USD:.2f} limit (wallet: ${equity:.2f}, "
-                        f"real loss: ${real_loss:.2f})"
+                        f"{settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} drawdown limit (${max_loss_usd:.2f}) — "
+                        f"wallet: ${equity:.2f}, real loss: ${real_loss:.2f}"
                     )
                 elif dust_floor_hit:
                     reason = f"wallet balance ${equity:.2f} is below the ${settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD:.2f} minimum"

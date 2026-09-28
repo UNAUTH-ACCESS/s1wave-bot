@@ -93,6 +93,12 @@ _SELL_RETRY_DELAY_S = 2.0
 # overhead case that actually happened.
 _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
 
+# withdraw_sol() (2026-09-28): a plain System Program transfer's real
+# network fee is ~5,000 lamports — this reserve is comfortably above that,
+# left untouched by the withdrawal amount itself so the transaction can
+# never fail from paying its own fee out of the last lamport being sent.
+_WITHDRAWAL_FEE_RESERVE_LAMPORTS = 10_000
+
 
 @dataclass
 class ExecutionResult:
@@ -374,6 +380,82 @@ class ExecutionEngine:
             log.warning("execution.close_account_failed", mint=mint,
                         error_type=type(exc).__name__, error=str(exc))
             return None
+
+    async def withdraw_sol(self, destination_address: str, amount_lamports: int) -> str:
+        """
+        Send `amount_lamports` of this wallet's own native SOL to an
+        arbitrary external address (2026-09-28) — a real System Program
+        transfer, completely separate from every swap/close path above (no
+        token account involved, no Jupiter route). Added so real capital
+        can actually be taken OUT of the trading wallet on request,
+        instead of the only way out being a manual transfer done entirely
+        outside the bot's own tracking.
+
+        Deliberately the ONLY method in this class that can move money to
+        an address this engine doesn't already control — callers
+        (api/app.py) must treat the destination address as untrusted
+        input; a malformed one simply fails to parse below and raises,
+        rather than silently doing nothing. `_WITHDRAWAL_FEE_RESERVE_LAMPORTS`
+        is checked against the REAL current on-chain balance (not a cached
+        figure) so the transfer amount plus its own network fee can never
+        exceed what's actually there.
+
+        Unlike close_token_account()/sweep_dead_token_accounts() (best-
+        effort background housekeeping that swallows failures), this
+        raises RuntimeError with a human-readable reason on any failure —
+        a withdrawal is a direct, on-purpose request to move real money
+        out, and a silent no-op here would be far worse than a loud error.
+        Returns the real, confirmed tx signature on success.
+        """
+        if self._paper or self._rpc is None or self._keypair is None:
+            raise RuntimeError("Live wallet not configured — cannot withdraw in paper mode.")
+        if amount_lamports <= 0:
+            raise RuntimeError("Withdrawal amount must be a positive number of lamports.")
+        from solders.pubkey import Pubkey
+        from solders.system_program import TransferParams, transfer
+        from solders.message import MessageV0
+
+        try:
+            destination = Pubkey.from_string(destination_address)
+        except Exception as exc:
+            raise RuntimeError(f"'{destination_address}' is not a valid Solana address: {exc}") from exc
+
+        try:
+            balance_resp = await self._rpc.get_balance(self._keypair.pubkey())
+        except Exception as exc:
+            raise RuntimeError(f"Could not read the current wallet balance: {exc}") from exc
+        balance_lamports = balance_resp.value
+        if amount_lamports + _WITHDRAWAL_FEE_RESERVE_LAMPORTS > balance_lamports:
+            raise RuntimeError(
+                f"Insufficient balance: wallet has {balance_lamports} lamports, this withdrawal "
+                f"needs {amount_lamports} plus a {_WITHDRAWAL_FEE_RESERVE_LAMPORTS}-lamport network-fee reserve."
+            )
+
+        ix = transfer(TransferParams(
+            from_pubkey=self._keypair.pubkey(), to_pubkey=destination, lamports=amount_lamports,
+        ))
+        try:
+            blockhash_resp = await self._rpc.get_latest_blockhash()
+            msg = MessageV0.try_compile(
+                self._keypair.pubkey(), [ix], [], blockhash_resp.value.blockhash,
+            )
+            tx = VersionedTransaction(msg, [self._keypair])
+            opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
+            result = await self._rpc.send_transaction(tx, opts=opts)
+            tx_sig = str(result.value)
+        except Exception as exc:
+            raise RuntimeError(f"Withdrawal transaction failed to submit: {exc}") from exc
+
+        confirmed = await self._confirm_tx(tx_sig)
+        if not confirmed:
+            raise RuntimeError(
+                f"Withdrawal transaction {tx_sig} was not confirmed within the timeout — "
+                f"check https://solscan.io/tx/{tx_sig} before retrying, it may still land."
+            )
+
+        log.warning("execution.withdrawal_sent", destination=destination_address,
+                    amount_lamports=amount_lamports, tx_signature=tx_sig)
+        return tx_sig
 
     async def sweep_dead_token_accounts(self) -> list[str]:
         """

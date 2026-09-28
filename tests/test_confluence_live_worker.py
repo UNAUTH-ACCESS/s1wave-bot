@@ -2349,12 +2349,16 @@ class TestInAppNotifications:
         assert halt_rows[0].level == "critical"
 
     @pytest.mark.asyncio
-    async def test_max_loss_usd_halts_permanently_even_with_equity_remaining(self, session, monkeypatch):
+    async def test_max_loss_pct_halts_permanently_even_with_equity_remaining(self, session, monkeypatch):
         """2026-09-24, user's explicit instruction for the first live test:
-        'set max loss to $3'. This must trip even when the wallet still
+        'set max loss to $3' (2026-09-28: converted to a 30%-of-baseline
+        percentage — pinned here to a $10 baseline so the threshold is
+        still exactly $3.00). This must trip even when the wallet still
         holds plenty of equity (e.g. topped up again) — it's independent of
         the dust-floor check, tracking cumulative REALIZED loss instead."""
-        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_PCT", 0.30)
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(mod, "DEPOSIT_USD", Decimal("10.0"))
         worker = make_worker(session)
         ctx = patched_session(session)
         try:
@@ -2376,7 +2380,7 @@ class TestInAppNotifications:
         $1.00 minimum' — false on its face (4.35 > 1.00) since the message
         logic only knew about two of what are now three halt conditions.
         Real numbers from that incident."""
-        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_PCT", 0.30)
         import workers.confluence_live_worker as mod
         monkeypatch.setattr(mod, "DEPOSIT_USD", Decimal("10.65"))
         worker = make_worker(session)
@@ -2398,8 +2402,10 @@ class TestInAppNotifications:
         assert "10.65" in message  # names the real deposit, not just the limit
 
     @pytest.mark.asyncio
-    async def test_max_loss_usd_does_not_halt_below_the_limit(self, session, monkeypatch):
-        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
+    async def test_max_loss_pct_does_not_halt_below_the_limit(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_PCT", 0.30)
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(mod, "DEPOSIT_USD", Decimal("10.0"))
         worker = make_worker(session)
         ctx = patched_session(session)
         try:
@@ -2412,8 +2418,8 @@ class TestInAppNotifications:
         assert not [r for r in rows if r.event == "permanently_halted"]
 
     @pytest.mark.asyncio
-    async def test_safe_to_enter_blocked_by_max_loss_usd(self, session, monkeypatch):
-        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 3.0)
+    async def test_safe_to_enter_blocked_by_max_loss_pct(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_PCT", 0.30)
         token = make_token()
         session.add(token)
         await session.flush()
@@ -2550,8 +2556,10 @@ class TestInAppNotifications:
         # the real DEPOSIT_USD constant — this test's equity=$4 dummy value
         # would otherwise collide with that real-world number and trip a
         # permanent halt before daily-halt logic (what this test actually
-        # covers) ever runs. A large ceiling here isolates the two checks.
-        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_USD", 1000.0)
+        # covers) ever runs. The max allowed pct (100%, the field's own
+        # `le=1` ceiling) isolates the two checks the same way the old
+        # $1000 ceiling did.
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_MAX_LOSS_PCT", 1.0)
         worker = make_worker(session)
         ctx = patched_session(session)
         try:

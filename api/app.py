@@ -59,12 +59,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select, func, desc, and_
 
+from engine.execution import ExecutionEngine
 from engine.halt_override import acknowledge_halt, apply_override, get_halt_override
 from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
 from workers.entry_filters import CURRENT_FILTER_REGIME_SINCE
 
-from config.logging import log_file_path
+from config.logging import get_logger, log_file_path
 from config.settings import settings
 from database.engine import get_session
 from models.orm import (
@@ -84,6 +85,8 @@ from models.orm import (
     Trade,
     TradeStatus,
 )
+
+log = get_logger(__name__)
 
 _START_TIME = datetime.now(timezone.utc)
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
@@ -230,7 +233,8 @@ async def _build_confluence_status() -> dict:
         "daily_halted": is_daily_halted(equity, today_pnl),
         "daily_loss_limit_usd": str(daily_limit.quantize(Decimal("0.01"))) if daily_limit is not None else None,
         "min_tradeable_usd": settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,
-        "max_loss_usd": settings.CONFLUENCE_LIVE_MAX_LOSS_USD,
+        "max_loss_pct": settings.CONFLUENCE_LIVE_MAX_LOSS_PCT,
+        "max_loss_usd": str((effective_deposit * Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_PCT))).quantize(Decimal("0.01"))),
         # Real account-level reconciliation (2026-09-28) — see
         # engine/live_equity.py's DEPOSIT_USD docstring for the audit this
         # closes. deposit_vs_balance_gap_usd is the ground-truth number:
@@ -943,7 +947,7 @@ def create_app() -> FastAPI:
         simple re-enable: see engine/halt_override.py and
         models.orm.ConfluenceLiveHaltOverride for the full design — this
         resets the safety check's baseline to right now rather than
-        disabling it, so the same CONFLUENCE_LIVE_MAX_LOSS_USD cap keeps
+        disabling it, so the same CONFLUENCE_LIVE_MAX_LOSS_PCT cap keeps
         protecting every dollar from this point forward. Does NOT touch
         CONFLUENCE_LIVE_ENABLED — if trading was manually paused before
         the halt, it stays paused; this only clears
@@ -957,6 +961,7 @@ def create_app() -> FastAPI:
         equity_usd = Decimal(status["equity_usd"])
         all_time_pnl_usd = Decimal(status["all_time_realized_pnl_usd"])
         await acknowledge_halt(equity_usd, all_time_pnl_usd)
+        new_max_loss_usd = equity_usd * Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_PCT))
         async with get_session() as session:
             session.add(ConfluenceNotification(
                 level="warning",
@@ -964,11 +969,80 @@ def create_app() -> FastAPI:
                 message=(
                     f"Halt acknowledged and trading RESUMED from the dashboard. "
                     f"New baseline: equity ${equity_usd:.2f}, all-time P&L ${all_time_pnl_usd:.2f} — "
-                    f"the ${Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_USD)):.2f} max-loss cap now protects "
-                    f"every dollar from this point forward."
+                    f"the {settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} drawdown cap (${new_max_loss_usd:.2f}) now "
+                    f"protects every dollar from this point forward."
                 ),
             ))
         return await _build_confluence_status()
+
+    @app.post("/confluence/withdraw", tags=["confluence"])
+    async def confluence_withdraw(
+        amount_usd: Decimal = Query(..., gt=0),
+        destination_address: str = Query(...),
+    ) -> dict:
+        """
+        Withdraw real SOL from the live trading wallet to an external
+        address (2026-09-28) — the dashboard's withdrawal form. A real,
+        on-chain, IRREVERSIBLE native System Program transfer
+        (engine.execution.ExecutionEngine.withdraw_sol()), completely
+        separate from every swap/close path — no token account, no
+        Jupiter route. Amount is entered in USD (matching the rest of the
+        dashboard) and converted to lamports at the current
+        SOL_PRICE_USD; the frontend shows the exact resulting SOL amount
+        in its confirmation dialog before ever calling this, since a USD
+        estimate and the real lamports sent are two different numbers.
+
+        Automatically re-baselines the halt-override (see
+        engine/halt_override.py) to the POST-withdrawal equity — a
+        withdrawal is a deliberate capital decision, not a trading loss,
+        and must not itself count against CONFLUENCE_LIVE_MAX_LOSS_PCT's
+        drawdown cap the way an unexplained balance drop should.
+        """
+        sol_price = Decimal(str(settings.SOL_PRICE_USD))
+        if sol_price <= 0:
+            raise HTTPException(status_code=503, detail="SOL price not yet available — try again in a moment")
+        destination_address = destination_address.strip()
+        if not destination_address:
+            raise HTTPException(status_code=400, detail="Destination address is required.")
+        amount_lamports = int((amount_usd / sol_price) * Decimal("1e9"))
+        if amount_lamports <= 0:
+            raise HTTPException(status_code=400, detail="Withdrawal amount is too small to send any lamports.")
+
+        engine = ExecutionEngine(
+            paper_override=False,
+            wallet_private_key_override=settings.CONFLUENCE_LIVE_WALLET_PRIVATE_KEY,
+            rpc_url_override=settings.HELIUS_RPC_URL,
+        )
+        try:
+            tx_signature = await engine.withdraw_sol(destination_address, amount_lamports)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        async with get_session() as session:
+            session.add(ConfluenceNotification(
+                level="warning",
+                event="withdrawal_sent",
+                message=(
+                    f"Withdrew ${amount_usd:.2f} ({amount_lamports / 1e9:.6f} SOL) to "
+                    f"{destination_address[:4]}...{destination_address[-4:]} — tx {tx_signature}."
+                ),
+            ))
+
+        # Re-baseline (see this endpoint's docstring) — best-effort: the
+        # withdrawal already succeeded and is irreversible either way, so a
+        # failure to re-baseline must not read as the withdrawal itself
+        # having failed.
+        try:
+            status = await _build_confluence_status()
+            if status["equity_usd"] is not None:
+                await acknowledge_halt(
+                    Decimal(status["equity_usd"]), Decimal(status["all_time_realized_pnl_usd"]),
+                )
+        except Exception as exc:
+            log.warning("api.withdraw_rebaseline_failed", error_type=type(exc).__name__, error=str(exc))
+
+        return {"success": True, "tx_signature": tx_signature, "amount_lamports": amount_lamports,
+                "solscan_url": f"https://solscan.io/tx/{tx_signature}"}
 
     @app.post("/confluence/live/trades/{trade_id}/close", tags=["confluence"])
     async def confluence_close_trade(trade_id: str) -> dict:
