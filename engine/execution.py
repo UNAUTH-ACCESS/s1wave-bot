@@ -103,11 +103,34 @@ class ExecutionResult:
     actual_price is the real fill price computed from amounts.
     actual_amount is the exact token amount bought (for sell sizing).
     tx_signature is the on-chain transaction ID.
+
+    actual_sol_lamports (2026-09-28) — real incident: entry_sol_lamports
+    (the INTENDED swap amount) understated real spend by 6.36x in
+    aggregate across 71 real trades, because it never counted network
+    fees, this wallet's own token-account rent, or — the big one — a
+    mandatory Pump.fun protocol-fee token account (owned by Pump.fun's fee
+    collector, not this wallet) that some sells must create, at ~0.00149
+    SOL, non-reclaimable. On one confirmed real trade this fee alone
+    exceeded the entire gross gain, turning a "+126% winner" by the old
+    accounting into a real net loss. This is the wallet's ACTUAL SOL
+    balance delta for this one transaction — signed, negative for a buy,
+    the real net (proceeds minus every fee paid in the same transaction)
+    for a sell — read directly from the confirmed transaction's own
+    pre/post balances, never estimated from a quote. None if it couldn't
+    be determined (confirmation succeeded but the balance read failed) —
+    callers must not treat that as zero.
     """
     success:        bool
     tx_signature:   str | None = None
     actual_price:   Decimal | None = None
     actual_amount:  Decimal | None = None   # token lamports bought
+    actual_sol_lamports: int | None = None
+    # Reclaim tracking (2026-09-28) — the rent-reclaim CloseAccount runs as
+    # its OWN, separate transaction right after a sell, and its signature
+    # and amount were never captured against the trade before. Only ever
+    # set on a sell's ExecutionResult; always None for a buy.
+    reclaim_tx_signature: str | None = None
+    reclaim_sol_lamports: int | None = None
     error_type:     str | None = None
     error_detail:   str | None = None
 
@@ -275,6 +298,22 @@ class ExecutionEngine:
         there was nothing to close, the balance wasn't zero, or the close
         itself failed.
         """
+        result = await self._close_token_account_impl(mint)
+        return result[0] if result else None
+
+    async def close_token_account_with_amount(self, mint: str) -> tuple[str, int] | None:
+        """
+        Same as close_token_account(), but also returns the real lamports
+        reclaimed — added 2026-09-28 so a per-trade real net P&L can
+        include the reclaim, not just the swap itself. See
+        ExecutionResult.actual_sol_lamports's docstring for why this
+        matters: the swap transaction and the reclaim are two separate
+        on-chain transactions, and Toni's audit found the reclaim amount
+        was never being captured anywhere against the trade it belonged to.
+        """
+        return await self._close_token_account_impl(mint)
+
+    async def _close_token_account_impl(self, mint: str) -> tuple[str, int] | None:
         if self._paper or self._rpc is None or self._keypair is None:
             return None
         from solana.rpc.models import TokenAccountOpts
@@ -297,6 +336,7 @@ class ExecutionEngine:
 
             account_pubkey = entry.pubkey
             program_id = entry.account.owner
+            reclaim_lamports = entry.account.lamports
 
             ix = Instruction(
                 program_id,
@@ -323,8 +363,8 @@ class ExecutionEngine:
                 return None
 
             log.info("execution.rent_reclaimed", mint=mint,
-                      account=str(account_pubkey), tx_signature=tx_sig)
-            return tx_sig
+                      account=str(account_pubkey), tx_signature=tx_sig, reclaim_lamports=reclaim_lamports)
+            return tx_sig, reclaim_lamports
         except Exception as exc:
             log.warning("execution.close_account_failed", mint=mint,
                         error_type=type(exc).__name__, error=str(exc))
@@ -590,8 +630,10 @@ class ExecutionEngine:
                 token_out_estimated=out_amount,
             )
 
-            # Step 4: Confirm
-            confirmed = await self._confirm_tx(tx_sig)
+            # Step 4: Confirm — also captures this wallet's REAL SOL delta
+            # for this transaction (see ExecutionResult.actual_sol_lamports),
+            # at no extra RPC cost since it's read from the same confirm response.
+            confirmed, real_sol_delta = await self._confirm_tx_with_delta(tx_sig)
             if not confirmed:
                 return ExecutionResult(
                     success=False,
@@ -638,6 +680,7 @@ class ExecutionEngine:
                 tx_signature=tx_sig,
                 actual_price=actual_price,
                 actual_amount=actual_amount,
+                actual_sol_lamports=real_sol_delta,
             )
 
     async def _execute_sell(
@@ -686,7 +729,16 @@ class ExecutionEngine:
                 sol_out_estimated=sol_out,
             )
 
-            confirmed = await self._confirm_tx(tx_sig)
+            # Also captures this wallet's REAL SOL delta for the sell
+            # itself (2026-09-28) — see ExecutionResult.actual_sol_lamports.
+            # Real incident this fixes: the old accounting used sol_out
+            # (Jupiter's pre-trade QUOTE) as if it were the real proceeds,
+            # which cannot see fees paid in the SAME transaction — on one
+            # confirmed real trade, a mandatory Pump.fun protocol-fee
+            # account (never owned by this wallet, never reclaimable) cost
+            # more than the entire quoted proceeds, turning a trade the old
+            # accounting called profitable into a real net loss.
+            confirmed, real_sol_delta = await self._confirm_tx_with_delta(tx_sig)
             if not confirmed:
                 return ExecutionResult(
                     success=False,
@@ -697,13 +749,9 @@ class ExecutionEngine:
 
             # NOTE (2026-09-24): same dimensional issue as the old buy-side
             # actual_price (SOL-lamports per raw-token-unit, not a USD-per-
-            # token price) — NOT fixed here because, unlike the buy side,
-            # nothing currently reads this field: _maybe_exit() computes
-            # pnl_usd directly from actual_amount (real SOL received) *
-            # SOL_PRICE_USD, and uses the DexScreener-sourced current_price
-            # for exit_price, never this value. Left as informational only;
-            # fix the same way (real post-trade balance) before anything
-            # ever starts relying on it for a real decision.
+            # token price) — informational only, kept for logging; never
+            # relied on for a real decision. actual_sol_lamports above is
+            # the trustworthy real number now.
             actual_price = Decimal(str(sol_out)) / Decimal(str(token_lamports))
 
             log.info(
@@ -713,6 +761,7 @@ class ExecutionEngine:
                 token_in_lamports=token_lamports,
                 sol_out_lamports=sol_out,
                 actual_price=str(actual_price),
+                real_sol_delta=real_sol_delta,
             )
 
             # Reclaim the token account's rent now that the position is
@@ -720,11 +769,15 @@ class ExecutionEngine:
             # docstring). A full-exit sell always empties the account, so
             # this is safe to attempt unconditionally; best-effort and
             # never allowed to affect the sell's own success/failure —
-            # close_token_account() already swallows its own errors, but
-            # this belt-and-suspenders try/except keeps that guarantee
-            # true even if that ever changes.
+            # close_token_account_with_amount() already swallows its own
+            # errors, but this belt-and-suspenders try/except keeps that
+            # guarantee true even if that ever changes.
+            reclaim_tx_signature = None
+            reclaim_sol_lamports = None
             try:
-                await self.close_token_account(mint)
+                reclaim_result = await self.close_token_account_with_amount(mint)
+                if reclaim_result:
+                    reclaim_tx_signature, reclaim_sol_lamports = reclaim_result
             except Exception as exc:
                 log.warning("execution.close_account_call_site_error", mint=mint,
                             error_type=type(exc).__name__, error=str(exc))
@@ -734,6 +787,9 @@ class ExecutionEngine:
                 tx_signature=tx_sig,
                 actual_price=actual_price,
                 actual_amount=Decimal(str(sol_out)),
+                actual_sol_lamports=real_sol_delta,
+                reclaim_tx_signature=reclaim_tx_signature,
+                reclaim_sol_lamports=reclaim_sol_lamports,
             )
 
     # ── Jupiter helpers ────────────────────────────────────────────────────
@@ -916,3 +972,50 @@ class ExecutionEngine:
                             error_type=type(exc).__name__, error=str(exc))
             await asyncio.sleep(_CONFIRM_POLL_S)
         return False
+
+    async def _confirm_tx_with_delta(self, tx_sig: str) -> tuple[bool, int | None]:
+        """
+        Same polling loop as _confirm_tx(), plus this wallet's REAL SOL
+        balance delta for the transaction — read from the same response
+        already being fetched to confirm it, so this costs no extra RPC
+        call. Added 2026-09-28 after finding entry_sol_lamports (the
+        intended swap amount) understated real spend by 6.36x in
+        aggregate: network fees, this wallet's own rent, and — the
+        dominant one — a mandatory Pump.fun protocol-fee token account
+        (owned by Pump.fun's fee collector, never this wallet, never
+        reclaimable) were all invisible to the old accounting. See
+        ExecutionResult.actual_sol_lamports's docstring for the full
+        incident. Returns (confirmed, real_delta_lamports) — delta is None
+        if confirmed but this wallet's own balance couldn't be found in
+        the transaction's account list (should be unreachable — this
+        wallet is always the fee payer — but never treated as zero).
+        """
+        sig = Signature.from_string(tx_sig)
+        deadline = time.monotonic() + _CONFIRM_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                resp = await self._rpc.get_transaction(
+                    sig,
+                    commitment=Confirmed,
+                    max_supported_transaction_version=0,
+                )
+                if resp.value is not None:
+                    meta = resp.value.transaction.meta
+                    if meta.err is not None:
+                        log.error("execution.tx_error_on_chain", tx_sig=tx_sig, err=str(meta.err))
+                        return False, None
+                    keys = resp.value.transaction.transaction.message.account_keys
+                    wallet_str = str(self._keypair.pubkey())
+                    delta = None
+                    for i, k in enumerate(keys):
+                        if str(k) == wallet_str:
+                            delta = meta.post_balances[i] - meta.pre_balances[i]
+                            break
+                    if delta is None:
+                        log.warning("execution.confirm_delta_wallet_not_found", tx_sig=tx_sig)
+                    return True, delta
+            except Exception as exc:
+                log.warning("execution.confirm_poll_error", tx_sig=tx_sig,
+                            error_type=type(exc).__name__, error=str(exc))
+            await asyncio.sleep(_CONFIRM_POLL_S)
+        return False, None

@@ -729,6 +729,11 @@ class ConfluenceLiveWorker:
                 entry_sol_lamports=int(float(position_usd / sol_price) * 1e9),
                 entry_token_lamports=int(result.actual_amount) if result.actual_amount else None,
                 entry_tx_signature=result.tx_signature, position_usd=position_usd,
+                # Real, on-chain-verified spend (2026-09-28) — see this
+                # column's docstring in models/orm.py for the full audit
+                # that found entry_sol_lamports above (the intended amount)
+                # understated real spend by 6.36x in aggregate.
+                entry_real_sol_lamports=result.actual_sol_lamports,
             )
             session.add(row)
             await session.flush()  # populate row.id for the notification below
@@ -1063,6 +1068,20 @@ class ConfluenceLiveWorker:
             row.pnl_usd = pnl_usd
             row.trailing_stop_floor = new_floor
             row.high_watermark_price = new_hwm
+            # Real, on-chain-verified net P&L (2026-09-28) — see this
+            # column's docstring in models/orm.py for the full audit that
+            # found pnl_usd above can call a trade profitable when the real
+            # wallet cash flow was a loss (a mandatory, non-reclaimable
+            # Pump.fun protocol-fee account exceeded the entire gain on one
+            # confirmed trade). Only computable when every real component
+            # is known — a missing one (e.g. reclaim never fired) leaves
+            # real_pnl_usd NULL rather than a partial, misleading number.
+            row.exit_real_sol_lamports = result.actual_sol_lamports
+            row.reclaim_tx_signature = result.reclaim_tx_signature
+            row.reclaim_sol_lamports = result.reclaim_sol_lamports
+            if (row.entry_real_sol_lamports is not None and result.actual_sol_lamports is not None):
+                real_net_lamports = row.entry_real_sol_lamports + result.actual_sol_lamports + (result.reclaim_sol_lamports or 0)
+                row.real_pnl_usd = (Decimal(real_net_lamports) / Decimal("1e9")) * sol_price
         self._last_accepted_price.pop(trade["id"], None)
         self._pending_tick.pop(trade["id"], None)
         self._notified_stuck_trades.discard(trade["id"])

@@ -56,7 +56,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, StreamingResponse
 from sqlalchemy import select, func, desc, and_
 
-from engine.live_equity import compute_equity_usd, is_daily_halted, is_permanently_halted
+from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
 from workers.entry_filters import CURRENT_FILTER_REGIME_SINCE
 
@@ -147,6 +147,22 @@ async def _build_confluence_status() -> dict:
             select(func.count()).select_from(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "unsellable")
         )).scalar_one()
 
+        # Real, on-chain-verified account reconciliation (2026-09-28) — see
+        # engine/live_equity.py's DEPOSIT_USD docstring for the full audit:
+        # all_time_realized_pnl_usd above (a sum of per-trade pnl_usd,
+        # itself built from INTENDED swap amounts) understated the real
+        # loss by ~6x. real_pnl_known_trades / closed_count tells the
+        # dashboard how much of the picture is backed by verified on-chain
+        # data vs. trades closed before this fix shipped.
+        real_pnl_sum = (await session.execute(
+            select(func.coalesce(func.sum(ConfluenceLiveTrade.real_pnl_usd), 0))
+            .where(ConfluenceLiveTrade.status == "closed")
+        )).scalar_one()
+        real_pnl_known_trades = (await session.execute(
+            select(func.count()).select_from(ConfluenceLiveTrade)
+            .where(ConfluenceLiveTrade.status == "closed", ConfluenceLiveTrade.real_pnl_usd.is_not(None))
+        )).scalar_one()
+
     wallet_sol: float | None = None
     wallet_error: str | None = None
     wallet_address: str | None = None
@@ -194,6 +210,19 @@ async def _build_confluence_status() -> dict:
         "daily_loss_limit_usd": str(daily_limit.quantize(Decimal("0.01"))) if daily_limit is not None else None,
         "min_tradeable_usd": settings.CONFLUENCE_LIVE_MIN_TRADEABLE_USD,
         "max_loss_usd": settings.CONFLUENCE_LIVE_MAX_LOSS_USD,
+        # Real account-level reconciliation (2026-09-28) — see
+        # engine/live_equity.py's DEPOSIT_USD docstring for the audit this
+        # closes. deposit_vs_balance_gap_usd is the ground-truth number:
+        # current wallet value minus the one real deposit ever made,
+        # unaffected by any per-trade accounting gap. real_all_time_pnl_usd
+        # sums the verified-on-chain per-trade figure (only available for
+        # trades closed after this fix shipped — see real_pnl_known_trades).
+        "deposit_usd": str(DEPOSIT_USD.quantize(Decimal("0.01"))),
+        "deposit_vs_balance_gap_usd": (
+            str((equity - DEPOSIT_USD).quantize(Decimal("0.01"))) if equity is not None else None
+        ),
+        "real_all_time_pnl_usd": str(Decimal(str(real_pnl_sum)).quantize(Decimal("0.01"))),
+        "real_pnl_known_trades": real_pnl_known_trades,
     }
 
 
@@ -1019,6 +1048,22 @@ def create_app() -> FastAPI:
                 "real_price": str(t.real_price) if t.real_price is not None else None,
                 "real_pnl_pct": float(t.real_pnl_pct) if t.real_pnl_pct is not None else None,
                 "real_price_checked_at": t.real_price_checked_at.isoformat() if t.real_price_checked_at else None,
+                # Real, on-chain-verified audit trail (2026-09-28) — see
+                # ConfluenceLiveTrade.entry_real_sol_lamports's docstring
+                # in models/orm.py for the full incident this closes: the
+                # fields above (pnl_usd, entry/exit_sol_lamports) are
+                # INTENDED amounts and understated real spend by 6.36x in
+                # aggregate. These four are read directly from each real
+                # transaction's own balances — real_pnl_usd is the number
+                # to trust; the others are NULL for trades closed before
+                # 2026-09-28 (this session cannot retroactively know them
+                # without a manual forensic lookup per trade).
+                "entry_real_sol_lamports": t.entry_real_sol_lamports,
+                "exit_real_sol_lamports": t.exit_real_sol_lamports,
+                "reclaim_tx_signature": t.reclaim_tx_signature,
+                "reclaim_sol_lamports": t.reclaim_sol_lamports,
+                "real_pnl_usd": str(t.real_pnl_usd) if t.real_pnl_usd is not None else None,
+                "solscan_url": f"https://solscan.io/token/{mint}",
             }
             for t, symbol, mint in rows
         ]

@@ -1582,6 +1582,176 @@ class TestBalanceAlreadyZeroReconciliation:
         self.worker._execution.sell.assert_awaited_once()
 
 
+class TestRealOnChainAuditTrail:
+    """
+    Real audit, 2026-09-28 (triggered by a 3-day dry-spell investigation,
+    then a full wallet reconciliation): entry_sol_lamports/exit_sol_lamports
+    (both INTENDED/quoted amounts) understated real spend by 6.36x in
+    aggregate across 71 real trades. Root cause, confirmed via a direct
+    on-chain instruction trace: a mandatory Pump.fun protocol-fee token
+    account (owned by Pump.fun's fee collector, never this wallet, never
+    reclaimable) that some sells must create — on one confirmed trade this
+    fee alone exceeded the entire quoted gain, turning a trade pnl_usd
+    called profitable into a real net loss. These tests cover persisting
+    the REAL numbers (from ExecutionResult.actual_sol_lamports/
+    reclaim_tx_signature/reclaim_sol_lamports) onto the trade row.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_persists_the_real_wallet_delta(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        worker = make_worker(session)
+        mock_wallet_balance(worker, monkeypatch, equity_usd=10.0)
+        worker._execution.buy = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="sig1", actual_price=Decimal("0.001"),
+            actual_amount=Decimal("10000000"), actual_sol_lamports=-1603733,
+        ))
+        session.add(make_signal(token, n_rules_cofiring=2))
+        await session.flush()
+
+        ctx = patched_session(session)
+        try:
+            await worker._maybe_enter()
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.token_id == token.id))).scalar_one()
+        assert row.entry_real_sol_lamports == -1603733
+
+    @pytest.mark.asyncio
+    async def test_exit_persists_real_deltas_and_computes_real_pnl_usd(self, session, monkeypatch):
+        """Real MetaMask-incident numbers: entry real cost 1,603,733,
+        exit real delta -1,429,987 (the sell itself net-LOST money after
+        the non-reclaimable Pump.fun fee account), reclaim +0 (none this
+        time) — real_pnl_usd must reflect the true, worse-than-pnl_usd
+        outcome, not the quoted-amount-based one."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 119.41)
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("0.0001"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("0.02"),
+            entry_real_sol_lamports=-1603733,
+        )
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="exitsig", actual_amount=Decimal("249417"),
+            actual_sol_lamports=-1429987, reclaim_tx_signature=None, reclaim_sol_lamports=None,
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.exit_real_sol_lamports == -1429987
+        assert row.reclaim_tx_signature is None
+        # real net = -1603733 (entry) + -1429987 (exit) + 0 (no reclaim) = -3033720 lamports
+        expected_real_pnl = (Decimal(-3033720) / Decimal("1e9")) * Decimal("119.41")
+        assert row.real_pnl_usd == expected_real_pnl
+        assert row.real_pnl_usd < 0  # a real loss, even if pnl_usd (quoted-amount-based) looked positive
+
+    @pytest.mark.asyncio
+    async def test_exit_persists_a_real_reclaim(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 120.0)
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("0.0001"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("0.02"),
+            entry_real_sol_lamports=-1600000,
+        )
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="exitsig", actual_amount=Decimal("135000"),
+            actual_sol_lamports=130000, reclaim_tx_signature="reclaimsig", reclaim_sol_lamports=1488440,
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.reclaim_tx_signature == "reclaimsig"
+        assert row.reclaim_sol_lamports == 1488440
+        expected_real_pnl = (Decimal(-1600000 + 130000 + 1488440) / Decimal("1e9")) * Decimal("120.0")
+        assert row.real_pnl_usd == expected_real_pnl
+
+    @pytest.mark.asyncio
+    async def test_real_pnl_usd_stays_null_when_entry_real_delta_unknown(self, session, monkeypatch):
+        """A historical trade from before this fix has no
+        entry_real_sol_lamports — real_pnl_usd must stay NULL rather than
+        compute a partial, misleading number from just the exit side."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 120.0)
+        worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        trade = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(minutes=1), entry_price=Decimal("0.0001"),
+            entry_token_lamports=10_000_000, position_usd=Decimal("0.02"),
+            entry_real_sol_lamports=None,
+        )
+        session.add(trade)
+        await session.flush()
+
+        worker._execution.sell = AsyncMock(return_value=ExecutionResult(
+            success=True, tx_signature="exitsig", actual_amount=Decimal("135000"), actual_sol_lamports=130000,
+        ))
+
+        trade_dict = dict(
+            id=trade.id, mint=token.mint_address, symbol=token.symbol,
+            entry_price=trade.entry_price, entry_time=trade.entry_time,
+            entry_token_lamports=trade.entry_token_lamports, position_usd=trade.position_usd,
+        )
+
+        ctx = patched_session(session)
+        try:
+            floor = Decimal(str(settings.HARD_FLOOR_PCT))
+            exit_price = trade.entry_price * (1 + floor)
+            await worker._maybe_exit(trade_dict, exit_price, datetime.now(timezone.utc))
+        finally:
+            ctx.stop()
+
+        row = (await session.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.id == trade.id))).scalar_one()
+        assert row.exit_real_sol_lamports == 130000  # exit side still recorded
+        assert row.real_pnl_usd is None  # but the combined real pnl is honestly unknown
+
+
 class TestPeriodicRentSweep:
     """
     Real incident, 2026-09-25 (SEND): the only existing rent-reclaim path

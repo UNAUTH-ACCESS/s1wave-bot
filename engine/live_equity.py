@@ -61,6 +61,18 @@ from decimal import Decimal
 
 from config.settings import settings
 
+# The wallet's one and only real deposit (2026-09-24, confirmed via direct
+# RPC trace of every transaction ever made by this wallet: preBalance=0 on
+# this one, the only inbound transfer in its entire history). Ground truth
+# for the account-level reconciliation added 2026-09-28 after a full audit
+# found the displayed all_time_realized_pnl_usd (-$1.21 at the time)
+# massively understated the real loss — the honest number is
+# current_wallet_usd - DEPOSIT_USD, not a sum of per-trade pnl_usd fields.
+# Update this if the wallet is ever topped up again.
+DEPOSIT_LAMPORTS = 92_774_730
+DEPOSIT_SOL_PRICE_USD_AT_DEPOSIT = Decimal("114.75")  # nearest real heartbeat.ok reading to the deposit's block time
+DEPOSIT_USD = (Decimal(DEPOSIT_LAMPORTS) / Decimal("1e9")) * DEPOSIT_SOL_PRICE_USD_AT_DEPOSIT
+
 
 def compute_equity_usd(sol_balance: Decimal | None, sol_price_usd: Decimal) -> Decimal | None:
     """None if the balance is unknown (RPC error, paper mode) or price isn't

@@ -612,6 +612,26 @@ class ConfluenceLiveTrade(Base):
     real_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     real_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     real_price_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Real, on-chain-verified cash flow (2026-09-28) — a full audit found
+    # entry_sol_lamports/exit_sol_lamports (both INTENDED/quoted amounts)
+    # understated real spend by 6.36x in aggregate across 71 real trades.
+    # Root cause, confirmed via a direct on-chain instruction trace: a
+    # mandatory Pump.fun protocol-fee token account (owned by Pump.fun's
+    # fee collector, never this wallet, never reclaimable) that some sells
+    # must create — on one confirmed trade this fee alone exceeded the
+    # entire quoted gain, turning a trade pnl_usd called profitable into a
+    # real net loss. These four fields are read directly from each real
+    # transaction's own pre/post balances (ExecutionEngine's
+    # actual_sol_lamports/reclaim_tx_signature/reclaim_sol_lamports),
+    # never estimated from a quote. real_pnl_usd = (entry_real_sol_lamports
+    # + exit_real_sol_lamports + reclaim_sol_lamports) converted to USD —
+    # the trustworthy number; pnl_usd above is kept for continuity with
+    # historical trades but should not be trusted alone going forward.
+    entry_real_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exit_real_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    reclaim_tx_signature: Mapped[str | None] = mapped_column(String(128))
+    reclaim_sol_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    real_pnl_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
 
     def __repr__(self) -> str:
         return f"<ConfluenceLiveTrade token={self.token_id} status={self.status}>"

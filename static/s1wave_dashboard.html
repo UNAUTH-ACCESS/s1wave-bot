@@ -328,12 +328,15 @@ function renderStatusCards(status, shadow) {
   `;
 
   const pnlClass = parseFloat(status.all_time_realized_pnl_usd) > 0 ? 'g' : parseFloat(status.all_time_realized_pnl_usd) < 0 ? 'r' : '';
+  const gap = status.deposit_vs_balance_gap_usd !== null && status.deposit_vs_balance_gap_usd !== undefined ? parseFloat(status.deposit_vs_balance_gap_usd) : null;
+  const gapClass = gap > 0 ? 'g' : gap < 0 ? 'r' : '';
   const c2 = `
     <div class="clabel">Equity</div>
     <div class="bn ${pnlClass}">${usd(status.equity_usd)}</div>
     <div class="bu">LIVE WALLET BALANCE — SIZES EVERY TRADE</div>
-    <div class="sr"><span class="sl">ALL-TIME P&amp;L</span><span class="sv ${pnlClass}">${usd(status.all_time_realized_pnl_usd)}</span></div>
+    <div class="sr"><span class="sl">ALL-TIME P&amp;L (recorded)</span><span class="sv ${pnlClass}" title="Sum of pnl_usd across all closed trades — built from INTENDED swap amounts, confirmed to understate real losses by ~6x. See REAL vs. DEPOSIT below for the trustworthy number.">${usd(status.all_time_realized_pnl_usd)}ⓘ</span></div>
     <div class="sr"><span class="sl">TODAY P&amp;L</span><span class="sv">${usd(status.today_realized_pnl_usd)}</span></div>
+    <div class="sr"><span class="sl">REAL vs. DEPOSIT</span><span class="sv ${gapClass}" title="Current wallet value minus the one real deposit ever made (${usd(status.deposit_usd)}) — ground truth, unaffected by any per-trade accounting gap.">${gap !== null ? usd(gap) : '—'}</span></div>
   `;
 
   const c3 = `
@@ -579,20 +582,41 @@ function renderTradeHistory(closed) {
     document.getElementById('livetrades').innerHTML = `<div class="ctitle"><div class="dot"></div>Trade history (closed)</div><div class="empty">Nothing closed yet.</div>`;
     return;
   }
-  const closedTrs = closed.map(t => `
+  const closedTrs = closed.map(t => {
+    // Real, on-chain-verified P&L (2026-09-28) — see
+    // ConfluenceLiveTrade.entry_real_sol_lamports's docstring in
+    // models/orm.py for the audit that found the recorded pnl_usd (built
+    // from INTENDED swap amounts) can call a trade profitable when the
+    // real wallet cash flow was a loss. Shown as the primary number when
+    // known; the recorded figure is kept alongside, muted, for trades
+    // where it disagrees, so the gap is visible at a glance instead of
+    // requiring a manual audit.
+    const hasReal = t.real_pnl_usd !== null && t.real_pnl_usd !== undefined;
+    const primaryPnl = hasReal ? t.real_pnl_usd : t.pnl_usd;
+    const primaryClass = parseFloat(primaryPnl) > 0 ? 'tp' : parseFloat(primaryPnl) < 0 ? 'tn' : '';
+    const disagrees = hasReal && t.pnl_usd !== null && Math.abs(parseFloat(t.real_pnl_usd) - parseFloat(t.pnl_usd)) > 0.001;
+    const pnlHtml = `${primaryPnl !== null ? usd(primaryPnl) : '—'}${hasReal ? ' <span style="color:var(--muted)" title="Real, on-chain-verified net P&L — entry + exit + rent reclaim, from actual wallet balance deltas, not the intended swap amount.">✓</span>' : ''}${disagrees ? ` <span style="color:var(--warn);font-size:9px" title="Recorded (intended-amount) figure: ${usd(t.pnl_usd)} — differs from the real on-chain result.">≠rec</span>` : ''}`;
+    const tokenLink = t.mint ? `<a href="${t.solscan_url || ('https://solscan.io/token/' + t.mint)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted">${t.symbol || short(t.mint, 6)}</a>` : (t.symbol || '—');
+    const txLinks = [
+      t.entry_tx ? `<a href="https://solscan.io/tx/${t.entry_tx}" target="_blank" rel="noopener" style="color:var(--muted)">entry</a>` : null,
+      t.exit_tx ? `<a href="https://solscan.io/tx/${t.exit_tx}" target="_blank" rel="noopener" style="color:var(--muted)">exit</a>` : null,
+    ].filter(Boolean).join(' · ');
+    return `
     <tr>
-      <td>${t.symbol || '—'}</td>
+      <td>${tokenLink}</td>
       <td><span class="etag">${t.status}</span></td>
       <td>${ago(t.entry_time)}</td>
       <td>$${Number(t.position_usd).toFixed(2)}</td>
       <td>${t.exit_reason || '—'}</td>
-      <td class="${parseFloat(t.pnl_usd)>0?'tp':parseFloat(t.pnl_usd)<0?'tn':''}">${t.pnl_usd !== null ? usd(t.pnl_usd) : '—'}</td>
+      <td class="${primaryClass}">${pnlHtml}</td>
+      <td style="font-size:9px">${txLinks || '—'}</td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
   document.getElementById('livetrades').innerHTML = `
-    <div class="ctitle"><div class="dot"></div>Trade history (closed) <span style="color:var(--muted);font-weight:400">— real, on-chain trades</span></div>
+    <div class="ctitle"><div class="dot"></div>Trade history (closed) <span style="color:var(--muted);font-weight:400">— real, on-chain trades. P&amp;L marked ✓ is verified against actual wallet balance deltas.</span></div>
     <div class="tablewrap"><table class="tbl">
-      <thead><tr><th>Token</th><th>Status</th><th>Entry</th><th>Size</th><th>Exit reason</th><th>P&amp;L</th></tr></thead>
+      <thead><tr><th>Token</th><th>Status</th><th>Entry</th><th>Size</th><th>Exit reason</th><th>P&amp;L</th><th>Tx</th></tr></thead>
       <tbody>${closedTrs}</tbody>
     </table></div>
   `;

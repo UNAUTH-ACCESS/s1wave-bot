@@ -176,6 +176,86 @@ async def test_confirm_tx_returns_false_on_real_onchain_error():
     assert result is False
 
 
+# ── _confirm_tx_with_delta() — real SOL delta capture (2026-09-28) ──────────
+#
+# Real incident: entry_sol_lamports (the intended swap amount) understated
+# real spend by 6.36x in aggregate across 71 real trades. Root cause,
+# confirmed via a direct on-chain instruction trace: a mandatory Pump.fun
+# protocol-fee token account (owned by Pump.fun's fee collector, never
+# this wallet, never reclaimable) that some sells must create — on one
+# confirmed trade this fee alone exceeded the entire quoted gain. This
+# reads the wallet's own real pre/post balance from the same confirm
+# response, at no extra RPC cost.
+
+class FakeMetaWithBalances:
+    def __init__(self, err, pre_balances, post_balances):
+        self.err = err
+        self.pre_balances = pre_balances
+        self.post_balances = post_balances
+
+
+class FakeTxWithBalances:
+    def __init__(self, meta, account_keys):
+        self.transaction = type("Inner", (), {"message": type("Msg", (), {"account_keys": account_keys})()})()
+        self.meta = meta
+
+
+class FakeTxRespWithBalances:
+    def __init__(self, meta, account_keys):
+        self.transaction = FakeTxWithBalances(meta, account_keys)
+
+
+@pytest.mark.asyncio
+async def test_confirm_tx_with_delta_reads_the_real_wallet_balance_change():
+    engine = make_engine()
+    wallet = engine._keypair.pubkey()
+    other = Keypair().pubkey()
+    sig_str = str(Keypair().sign_message(b"x"))
+
+    async def fake_get_transaction(sig_arg, commitment=None, max_supported_transaction_version=None):
+        meta = FakeMetaWithBalances(err=None, pre_balances=[10_000_000, 500_000], post_balances=[8_500_000, 1_500_000])
+        return FakeGetTxResult(FakeTxRespWithBalances(meta, [wallet, other]))
+
+    engine._rpc.get_transaction = fake_get_transaction
+    confirmed, delta = await engine._confirm_tx_with_delta(sig_str)
+
+    assert confirmed is True
+    assert delta == -1_500_000  # 8_500_000 - 10_000_000, this wallet's own real delta
+
+
+@pytest.mark.asyncio
+async def test_confirm_tx_with_delta_returns_none_delta_on_real_onchain_error():
+    engine = make_engine()
+    sig_str = str(Keypair().sign_message(b"x"))
+
+    async def fake_get_transaction(sig_arg, commitment=None, max_supported_transaction_version=None):
+        meta = FakeMetaWithBalances(err={"InstructionError": [0, "Custom"]}, pre_balances=[1], post_balances=[1])
+        return FakeGetTxResult(FakeTxRespWithBalances(meta, [engine._keypair.pubkey()]))
+
+    engine._rpc.get_transaction = fake_get_transaction
+    confirmed, delta = await engine._confirm_tx_with_delta(sig_str)
+    assert confirmed is False
+    assert delta is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_tx_with_delta_returns_none_when_wallet_not_found():
+    """Should be unreachable (this wallet is always the fee payer), but
+    must fail safe rather than mistake someone else's balance for ours."""
+    engine = make_engine()
+    other = Keypair().pubkey()
+    sig_str = str(Keypair().sign_message(b"x"))
+
+    async def fake_get_transaction(sig_arg, commitment=None, max_supported_transaction_version=None):
+        meta = FakeMetaWithBalances(err=None, pre_balances=[500_000], post_balances=[600_000])
+        return FakeGetTxResult(FakeTxRespWithBalances(meta, [other]))
+
+    engine._rpc.get_transaction = fake_get_transaction
+    confirmed, delta = await engine._confirm_tx_with_delta(sig_str)
+    assert confirmed is True
+    assert delta is None
+
+
 class FakeTokenAmount:
     def __init__(self, amount: str, decimals: int):
         self.amount = amount
@@ -233,7 +313,7 @@ async def test_execute_buy_computes_dimensionally_correct_price_from_real_balanc
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
     engine._check_entry_cost = AsyncMock(return_value=None)  # safe to proceed — not what this test covers
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
-    engine._confirm_tx = AsyncMock(return_value=True)
+    engine._confirm_tx_with_delta = AsyncMock(return_value=(True, -9282473))
     engine.get_token_balance_raw = AsyncMock(return_value=(2167016274, 6))  # the real LUCKYCATT numbers
 
     result = await engine._execute_buy(
@@ -262,7 +342,7 @@ async def test_execute_buy_falls_back_when_real_balance_unavailable(monkeypatch)
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
     engine._check_entry_cost = AsyncMock(return_value=None)  # safe to proceed — not what this test covers
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
-    engine._confirm_tx = AsyncMock(return_value=True)
+    engine._confirm_tx_with_delta = AsyncMock(return_value=(True, -9282473))
     engine.get_token_balance_raw = AsyncMock(return_value=None)
 
     result = await engine._execute_buy(
@@ -424,12 +504,13 @@ TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 
 class FakeCloseableAccountEntry:
-    def __init__(self, pubkey, amount: str, owner_program: str):
+    def __init__(self, pubkey, amount: str, owner_program: str, lamports: int = 1488440):
         from solders.pubkey import Pubkey
         self.pubkey = pubkey
         self.account = type("Acc", (), {
             "data": type("Data", (), {"parsed": {"info": {"tokenAmount": {"amount": amount, "decimals": 6}}}})(),
             "owner": Pubkey.from_string(owner_program),
+            "lamports": lamports,
         })()
 
 
@@ -512,18 +593,22 @@ async def test_close_token_account_swallows_failures_and_returns_none():
 @pytest.mark.asyncio
 async def test_execute_sell_reclaims_rent_after_a_confirmed_sell(monkeypatch):
     """Wiring check: a successful _execute_sell() must call
-    close_token_account() with the sold mint exactly once."""
+    close_token_account_with_amount() with the sold mint exactly once, and
+    surface the real reclaim signature/amount on the result (2026-09-28)."""
     engine = make_engine()
     engine._get_quote = AsyncMock(return_value={"outAmount": "142280"})
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
-    engine._confirm_tx = AsyncMock(return_value=True)
-    engine.close_token_account = AsyncMock(return_value="CLOSESIG")
+    engine._confirm_tx_with_delta = AsyncMock(return_value=(True, 142280))
+    engine.close_token_account_with_amount = AsyncMock(return_value=("CLOSESIG", 1488440))
 
     result = await engine._execute_sell(mint="SoldOutMint", token_lamports=1746290)
 
     assert result.success is True
-    engine.close_token_account.assert_awaited_once_with("SoldOutMint")
+    engine.close_token_account_with_amount.assert_awaited_once_with("SoldOutMint")
+    assert result.reclaim_tx_signature == "CLOSESIG"
+    assert result.reclaim_sol_lamports == 1488440
+    assert result.actual_sol_lamports == 142280
 
 
 # ── sweep_dead_token_accounts() — periodic rent sweep (2026-09-25) ──────────
@@ -655,15 +740,16 @@ async def test_get_sell_quote_swallows_errors():
 @pytest.mark.asyncio
 async def test_execute_sell_succeeds_even_if_reclaim_raises(monkeypatch):
     """A rent-reclaim failure must never turn a real, confirmed sell into a
-    reported failure — close_token_account() already swallows its own
-    errors, but the call site in _execute_sell() guards it too in case
-    that ever changes."""
+    reported failure — close_token_account_with_amount() already swallows
+    its own errors, but the call site in _execute_sell() guards it too in
+    case that ever changes."""
     engine = make_engine()
     engine._get_quote = AsyncMock(return_value={"outAmount": "142280"})
     engine._build_swap_tx = AsyncMock(return_value=b"fake-tx-bytes")
     engine._sign_and_submit = AsyncMock(return_value="FAKESIG")
-    engine._confirm_tx = AsyncMock(return_value=True)
-    engine.close_token_account = AsyncMock(side_effect=RuntimeError("should not happen, but must not break the sell"))
+    engine._confirm_tx_with_delta = AsyncMock(return_value=(True, 142280))
+    engine.close_token_account_with_amount = AsyncMock(side_effect=RuntimeError("should not happen, but must not break the sell"))
 
     result = await engine._execute_sell(mint="SoldOutMint", token_lamports=1746290)
     assert result.success is True
+    assert result.reclaim_tx_signature is None  # reclaim failed, but that must never fail the sell itself
