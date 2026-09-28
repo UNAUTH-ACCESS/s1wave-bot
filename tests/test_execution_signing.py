@@ -467,21 +467,19 @@ async def test_entry_cost_check_allows_a_normal_single_account_entry():
 
 
 @pytest.mark.asyncio
-async def test_entry_cost_check_rejects_a_freshly_migrated_pool():
+async def test_entry_cost_check_allows_the_bybit_incident_magnitude():
     """Real numbers from the actual Bybit incident: ~4.75M lamports real
-    cost against a ~135K intended swap — must be rejected, not submitted.
-
-    2026-09-28: briefly raised this ceiling to 5.0M (which would have
-    ALLOWED this exact case) after a shadow-position counterfactual
-    showed 14/15 similarly-rejected tokens would have won big. Reverted
-    back to 2.2M the same day on stronger, if smaller, evidence: the
-    first 3 real live entries the raise actually let through were all
-    exited by the liquidity guard within 0.3-2 seconds — a real sell
-    quote for the full position showed the freshly-migrated pool
-    couldn't be round-tripped yet, something the shadow counterfactual
-    (price-only, never executes a real sell) could never have caught.
-    See _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS's comment for the full story
-    before changing this again."""
+    cost against a ~135K intended swap. Originally rejected (ceiling
+    2.2M); briefly raised to 5.0M, reverted back to 2.2M same-day on real
+    live evidence (3 newly-allowed entries all exited by the liquidity
+    guard within 0.3-2s), then raised again to 5.0M once the user
+    independently verified on Solscan that 2 of those 3 (LOADPAD, xSOL)
+    had real, volume-backed recovery shortly after — the guard caught a
+    momentary thin-liquidity reading, not a dead pool. Paired this time
+    with confluence_live_worker.py's _LIQUIDITY_GUARD_GRACE_PERIOD_S so
+    the guard's first check no longer judges a position at the single
+    worst possible instant. See _MAX_ENTRY_RENT_OVERHEAD_LAMPORTS's
+    comment for the full story before changing this again."""
     engine = make_engine()
     tx_bytes = make_jupiter_shaped_tx_bytes(engine._keypair)
     sol_lamports = 134_730
@@ -494,9 +492,7 @@ async def test_entry_cost_check_rejects_a_freshly_migrated_pool():
     )
 
     result = await engine._check_entry_cost(tx_bytes, sol_lamports)
-    assert result is not None
-    assert result.success is False
-    assert result.error_type == "entry_too_expensive"
+    assert result is None  # safe to proceed
 
 
 @pytest.mark.asyncio

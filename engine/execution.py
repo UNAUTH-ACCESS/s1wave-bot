@@ -86,31 +86,34 @@ _SELL_RETRY_DELAY_S = 2.0
 # 20-35x the intended size in one unavoidable, un-refundable cost — the
 # opposite of "protect the money first."
 #
-# RAISED 2.2M -> 5.0M lamports, then REVERTED back to 2.2M, both on
-# 2026-09-28. The raise was backed by real evidence: a shadow-position
-# counterfactual on the 16 tokens this ceiling had rejected showed 14/15
-# would have WON (93.3%, mean +48.8% raw / +39.1% capped) — see this
-# session's git history for the full analysis. But shadow only measures
-# PRICE over a long hold; it never has to execute a real sell, so it
+# RAISED 2.2M -> 5.0M, REVERTED to 2.2M, then RAISED again to 5.0M, all
+# on 2026-09-28. The first raise was backed by a shadow-position
+# counterfactual on the 16 tokens this ceiling had rejected: 14/15 would
+# have WON (93.3%, mean +48.8% raw / +39.1% capped). But shadow only
+# measures PRICE over a long hold and never executes a real sell, so it
 # never tested whether a freshly-migrated pool has enough REAL DEPTH to
-# round-trip a live position. It doesn't, at least not immediately: of
-# the first 3 real live entries let through by the raise (DISNEY, LOADPAD,
-# xSOL), all 3 were exited by the liquidity guard within 0.3-2 SECONDS of
-# entry — its very first check runs immediately with no grace period, and
-# a real sell quote for the full position showed >=35% price impact on
-# all three (price itself barely moved; the loss was almost entirely the
-# fixed vault-creation cost, ~$0.2-0.4 each). Reverted back to 2.2M on
-# that real, if small (n=3), live-money evidence rather than the larger
-# but execution-blind shadow sample. If this gets revisited, the more
-# targeted fix is probably a short grace period before the liquidity
-# guard's FIRST check on a freshly-entered position (giving a newly
-# migrated pool a moment to deepen) rather than only moving this ceiling
-# again — untried as of this writing.
+# round-trip a live position — it didn't, immediately: the first 3 real
+# entries let through (DISNEY, LOADPAD, xSOL) were all exited by the
+# liquidity guard within 0.3-2 SECONDS of entry (its first check ran with
+# zero delay), so reverted back to 2.2M on that real live-money evidence.
+# Then the user independently verified on Solscan: LOADPAD and xSOL both
+# showed REAL, volume-backed recovery within the same hour ($130 and
+# $1.35K real volume) — the guard hadn't found a genuinely dead pool, just
+# caught one at the single worst possible instant, before it had any
+# chance to develop depth. (A third apparent recovery, DISNEY's +11,433%
+# candle, was ruled out — $0.006 of volume for the whole hour, not a real,
+# tradeable move.) Raised back to 5.0M paired with
+# workers/confluence_live_worker.py's new
+# _LIQUIDITY_GUARD_GRACE_PERIOD_S (60s) — the guard's first check on a new
+# position no longer fires immediately, giving a freshly-migrated pool a
+# minute to develop the depth LOADPAD/xSOL's own real volume showed shows
+# up anyway. HARD_FLOOR/trailing-stop still protect the position on the
+# normal snapshot price during that minute regardless.
 #
 # One normal entry (a single destination token account for us) costs
 # ~1.49M lamports of real rent + the swap principal + a small fee — see
 # _check_entry_cost()'s docstring for the exact math.
-_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 2_200_000
+_MAX_ENTRY_RENT_OVERHEAD_LAMPORTS = 5_000_000
 
 # withdraw_sol() (2026-09-28): a plain System Program transfer's real
 # network fee is ~5,000 lamports — this reserve is comfortably above that,

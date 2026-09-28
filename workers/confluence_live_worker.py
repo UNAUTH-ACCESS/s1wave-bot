@@ -192,6 +192,29 @@ _LIQUIDITY_CHECK_INTERVAL_S = 60.0
 _LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
 _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
 
+# Grace period before the FIRST liquidity-guard check on a brand-new
+# position (2026-09-28) — real incident: raising the entry-cost ceiling to
+# 5.0M lamports (since reverted) let 3 real live entries through
+# (DISNEY, LOADPAD, xSOL) that were ALL exited by this guard's very first
+# check, 0.3-2 SECONDS after entry (this check normally has no delay at
+# all on a fresh position — see the throttle logic below). The user
+# independently verified on Solscan afterward: LOADPAD and xSOL both
+# showed REAL, volume-backed recovery within the same hour ($130 and
+# $1.35K real volume — not artifacts) — meaning the guard's real sell
+# quote caught a momentary thin-liquidity reading in the first instant
+# after our own buy transaction landed, before the freshly-migrated pool
+# had any chance to develop real depth, not a lasting inability to trade
+# the token. (A third apparent "recovery," DISNEY's +11,433% candle, was
+# ruled out as a real signal — $0.006 of volume for the whole hour, the
+# same implausible-tick pattern this codebase already guards against on
+# the shadow side, not a tradeable move.) This does NOT reduce protection
+# during the grace window — HARD_FLOOR and the trailing-stop staircase
+# still run every cycle against the normal price snapshot the whole time;
+# this only delays the EXTRA real-quote cross-check by one normal check
+# interval, giving a newly-migrated pool a chance to not be judged at the
+# single worst possible moment of its life.
+_LIQUIDITY_GUARD_GRACE_PERIOD_S = 60.0
+
 # Adaptive faster check for a position in real profit (2026-09-25) — see
 # _check_liquidity_guard()'s docstring for the Gavel incident this closes:
 # a snapshot showing +40% while the real price had already collapsed to
@@ -944,6 +967,11 @@ class ConfluenceLiveWorker:
         DexScreener snapshot price the position is being monitored
         against, so it structurally cannot see this failure mode.
 
+        Returns (None, None) unconditionally for a position younger than
+        _LIQUIDITY_GUARD_GRACE_PERIOD_S — see that constant's comment for
+        the real incident this closes (a freshly-migrated pool judged at
+        the single worst possible moment, 0.3-2s after our own buy).
+
         Returns ("LIQUIDITY_GUARD", real_price) if a real Jupiter quote
         for the full position size shows either >=35% price impact or an
         already-worse-than-any-normal-stop real P&L. Returns (None, None)
@@ -976,6 +1004,12 @@ class ConfluenceLiveWorker:
         """
         trade_id = trade["id"]
         now_mono = time.monotonic()
+
+        entry_time = trade.get("entry_time")
+        if entry_time is not None:
+            age_s = (datetime.now(timezone.utc) - entry_time).total_seconds()
+            if age_s < _LIQUIDITY_GUARD_GRACE_PERIOD_S:
+                return None, None
 
         interval = _LIQUIDITY_CHECK_INTERVAL_S
         if current_price is not None and trade.get("entry_price"):

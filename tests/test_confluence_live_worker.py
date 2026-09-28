@@ -774,6 +774,68 @@ class TestLiquidityGuard:
         )
         return row
 
+    async def _setup_with_age(self, session, age_s: float):
+        """Same as _setup(), but with a controllable position age — added
+        2026-09-28 for the grace-period tests below."""
+        self.worker = make_worker(session)
+        token = make_token()
+        session.add(token)
+        await session.flush()
+        row = ConfluenceLiveTrade(
+            token_id=token.id, n_rules_cofiring=2, status="open",
+            entry_time=datetime.now(timezone.utc) - timedelta(seconds=age_s), entry_price=Decimal("0.0001"),
+            entry_token_lamports=500_000_000, position_usd=Decimal("0.04"),
+        )
+        session.add(row)
+        await session.flush()
+        self.trade = dict(
+            id=row.id, mint="SomeMint", symbol="TEST",
+            entry_price=row.entry_price, entry_time=row.entry_time,
+            entry_token_lamports=row.entry_token_lamports, position_usd=row.position_usd,
+        )
+        return row
+
+    @pytest.mark.asyncio
+    async def test_grace_period_skips_the_first_check_on_a_brand_new_position(self, session, monkeypatch):
+        """Real incident, 2026-09-28: raising the entry-cost ceiling let 3
+        real live entries through (DISNEY, LOADPAD, xSOL), and all 3 were
+        exited by this guard's very first check, 0.3-2 SECONDS after
+        entry — this check used to run with zero delay. The user
+        independently verified 2 of the 3 had real, volume-backed
+        recovery shortly after — the guard caught a momentary thin-
+        liquidity reading, not a dead pool. A brand-new position must not
+        even ATTEMPT a real quote (which costs a real RPC call) during
+        the grace window, regardless of how catastrophic it would read."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup_with_age(session, age_s=1.0)  # 1 second old
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": 1, "price_impact_pct": Decimal("1"),  # would be a clear crisis if checked
+        })
+        ctx = patched_session(session)
+        try:
+            reason, price = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
+        assert reason is None
+        assert price is None
+        self.worker._execution.get_sell_quote.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_checks_normally_once_the_grace_period_has_elapsed(self, session, monkeypatch):
+        import workers.confluence_live_worker as mod
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup_with_age(session, age_s=mod._LIQUIDITY_GUARD_GRACE_PERIOD_S + 1)
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": 1, "price_impact_pct": Decimal("1"),
+        })
+        ctx = patched_session(session)
+        try:
+            reason, price = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
+        assert reason == "LIQUIDITY_GUARD"
+        self.worker._execution.get_sell_quote.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_fires_on_high_price_impact(self, session, monkeypatch):
         monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
