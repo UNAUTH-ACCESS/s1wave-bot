@@ -27,6 +27,10 @@ dependencies = [
     "tenacity>=8.3",
     "structlog>=24.1",
     "orjson>=3.10",
+    # Control panel auth (2026-09-29)
+    "bcrypt>=4.1",
+    "itsdangerous>=2.2",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

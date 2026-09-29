@@ -1,0 +1,270 @@
+"""
+control_panel/app.py
+======================
+The S1Wave control panel (2026-09-29) — a private homepage: log in, see
+every trading account at a glance, create a new one. Explicitly scoped
+to ONE owner (see /signup below) after the user ruled out a public,
+multi-tenant version — real custody/compliance questions that don't
+apply to a private admin tool for someone's own accounts.
+
+Runs as its OWN process (control_panel_main.py), its own database
+(s1wave_control, via .env.control's DATABASE_URL), separate from every
+trading account it lists. Never touches a trading account's wallet key
+or database directly — only ever talks to a trading account's own API
+over HTTP (the exact same way a browser hitting that account's own
+dashboard would), using the Basic Auth credentials captured in the
+registry at account-creation time.
+"""
+
+from __future__ import annotations
+
+import bcrypt
+import httpx
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import func, select
+from starlette.middleware.sessions import SessionMiddleware
+
+from config.logging import get_logger
+from config.settings import settings
+from control_panel.models import Base, ControlAccount, ControlUser
+from database.engine import get_engine, get_session
+from engine.provisioning import ProvisioningError, create_account
+
+log = get_logger(__name__)
+
+app = FastAPI(title="S1Wave Control Panel")
+
+if not settings.CONTROL_SESSION_SECRET:
+    raise RuntimeError(
+        "CONTROL_SESSION_SECRET is not set in .env.control — refusing to start with an "
+        "insecure default session signing key. Generate one (e.g. `python -c "
+        "\"import secrets; print(secrets.token_hex(32))\"`) and set it before starting this service."
+    )
+app.add_middleware(SessionMiddleware, secret_key=settings.CONTROL_SESSION_SECRET, https_only=True)
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    log.info("control_panel.started", port=settings.API_PORT)
+
+
+def _layout(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{title} — S1Wave</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {{ --bg:#080C0B; --surface:#0E1512; --border:#1A2620; --accent:#00FF87;
+           --danger:#FF4444; --warn:#FFB800; --text:#C8DDD5; --bright:#E8F5EE; --muted:#5C7A6D; }}
+  * {{ box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif;
+          margin:0; min-height:100vh; }}
+  .wrap {{ max-width:720px; margin:0 auto; padding:32px 16px; }}
+  h1 {{ color:var(--bright); font-size:22px; margin:0 0 4px; }}
+  .sub {{ color:var(--muted); font-size:13px; margin-bottom:28px; }}
+  .card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px;
+           padding:20px; margin-bottom:16px; }}
+  label {{ display:block; font-size:11px; letter-spacing:0.5px; text-transform:uppercase;
+           color:var(--muted); margin-bottom:6px; margin-top:14px; }}
+  input {{ width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px;
+           color:var(--bright); padding:10px 12px; font-size:14px; }}
+  input:focus {{ outline:none; border-color:var(--accent); }}
+  button, .btn {{ background:var(--accent); color:#052014; border:none; border-radius:6px;
+           padding:11px 18px; font-weight:700; font-size:14px; cursor:pointer; margin-top:18px;
+           display:inline-block; text-decoration:none; }}
+  button:hover, .btn:hover {{ filter:brightness(1.1); }}
+  .btn-secondary {{ background:transparent; border:1px solid var(--border); color:var(--text); }}
+  a {{ color:var(--accent); }}
+  .error {{ color:var(--danger); font-size:13px; margin-top:10px; }}
+  .account-row {{ display:flex; justify-content:space-between; align-items:center;
+           padding:14px 0; border-bottom:1px solid var(--border); gap:12px; flex-wrap:wrap; }}
+  .account-row:last-child {{ border-bottom:none; }}
+  .account-name {{ font-weight:700; color:var(--bright); }}
+  .account-meta {{ font-size:12px; color:var(--muted); }}
+  .pill {{ font-size:11px; padding:3px 9px; border-radius:999px; font-weight:700; }}
+  .pill.armed {{ background:rgba(0,255,135,.15); color:var(--accent); }}
+  .pill.paused {{ background:rgba(255,184,0,.15); color:var(--warn); }}
+  .pill.halted {{ background:rgba(255,68,68,.15); color:var(--danger); }}
+  .pill.unknown {{ background:rgba(92,122,109,.2); color:var(--muted); }}
+  .topbar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }}
+  .topbar a {{ color:var(--muted); font-size:13px; text-decoration:none; }}
+</style></head>
+<body><div class="wrap">{body}</div></body></html>"""
+
+
+def _require_login(request: Request) -> str | None:
+    return request.session.get("user")
+
+
+@app.get("/signup", response_class=HTMLResponse)
+async def signup_form(request: Request):
+    async with get_session() as session:
+        count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
+    if count > 0:
+        return RedirectResponse("/login", status_code=303)
+    return HTMLResponse(_layout("Sign up", """
+        <h1>Create your S1Wave login</h1>
+        <div class="sub">One-time setup — this becomes the only login for this control panel.</div>
+        <div class="card">
+        <form method="post" action="/signup">
+            <label>Username</label><input name="username" required autofocus>
+            <label>Password</label><input name="password" type="password" required minlength="8">
+            <button type="submit">Create account</button>
+        </form>
+        </div>
+    """))
+
+
+@app.post("/signup")
+async def signup_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    async with get_session() as session:
+        count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
+        if count > 0:
+            return RedirectResponse("/login", status_code=303)
+        password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        session.add(ControlUser(username=username, password_hash=password_hash))
+    request.session["user"] = username
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request, error: str | None = None):
+    async with get_session() as session:
+        count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
+    if count == 0:
+        return RedirectResponse("/signup", status_code=303)
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    return HTMLResponse(_layout("Log in", f"""
+        <h1>S1Wave Control Panel</h1>
+        <div class="sub">Log in to manage your trading accounts.</div>
+        <div class="card">
+        <form method="post" action="/login">
+            <label>Username</label><input name="username" required autofocus>
+            <label>Password</label><input name="password" type="password" required>
+            <button type="submit">Log in</button>
+            {error_html}
+        </form>
+        </div>
+    """))
+
+
+@app.post("/login")
+async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    async with get_session() as session:
+        user = (await session.execute(
+            select(ControlUser).where(ControlUser.username == username)
+        )).scalar_one_or_none()
+    if user is None or not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
+        return RedirectResponse("/login?error=Invalid+username+or+password", status_code=303)
+    request.session["user"] = username
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
+
+
+async def _fetch_status(account: ControlAccount) -> dict | None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{account.port}/confluence/status",
+                auth=(account.dashboard_auth_user, account.dashboard_auth_password),
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as exc:
+        log.warning("control_panel.status_fetch_failed", account=account.name, error=str(exc))
+        return None
+
+
+@app.get("/", response_class=HTMLResponse)
+async def homepage(request: Request):
+    user = _require_login(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+
+    async with get_session() as session:
+        accounts = (await session.execute(
+            select(ControlAccount).order_by(ControlAccount.created_at)
+        )).scalars().all()
+
+    statuses = {}
+    for acct in accounts:
+        statuses[acct.name] = await _fetch_status(acct)
+
+    rows = ""
+    for acct in accounts:
+        st = statuses[acct.name]
+        if st is None:
+            pill = '<span class="pill unknown">UNREACHABLE</span>'
+            meta = f"port {acct.port} — {acct.wallet_pubkey[:4]}...{acct.wallet_pubkey[-4:]}"
+        else:
+            if st.get("permanently_halted"):
+                pill = '<span class="pill halted">HALTED</span>'
+            elif st.get("enabled"):
+                pill = '<span class="pill armed">ARMED</span>'
+            else:
+                pill = '<span class="pill paused">PAUSED</span>'
+            wallet_usd = st.get("wallet_usd")
+            meta = (f"${wallet_usd:.2f}" if wallet_usd is not None else "—") + \
+                   f" · {st.get('open_trades', 0)} open · port {acct.port}"
+        rows += f"""
+        <div class="account-row">
+            <div>
+                <div class="account-name">{acct.name}</div>
+                <div class="account-meta">{meta}</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+                {pill}
+                <a class="btn btn-secondary" href="http://127.0.0.1:{acct.port}/" target="_blank">Open</a>
+            </div>
+        </div>"""
+    if not rows:
+        rows = '<div class="account-meta">No accounts yet.</div>'
+
+    return HTMLResponse(_layout("Accounts", f"""
+        <div class="topbar">
+            <h1 style="margin:0">S1Wave Accounts</h1>
+            <a href="/logout">Log out ({user})</a>
+        </div>
+        <div class="card">{rows}</div>
+        <a class="btn" href="/accounts/new">+ New Account</a>
+    """))
+
+
+@app.get("/accounts/new", response_class=HTMLResponse)
+async def new_account_form(request: Request, error: str | None = None):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    return HTMLResponse(_layout("New account", f"""
+        <h1>New S1Wave account</h1>
+        <div class="sub">Creates an isolated database, a fresh wallet, its own port and service.
+        Comes up paused and unfunded — you fund the wallet and flip it on when ready.</div>
+        <div class="card">
+        <form method="post" action="/accounts/new">
+            <label>Account name (lowercase, digits, hyphens)</label>
+            <input name="name" required pattern="[a-z0-9-]+" autofocus placeholder="e.g. trading2">
+            <button type="submit">Create</button>
+            {error_html}
+        </form>
+        </div>
+        <a href="/">&larr; Back</a>
+    """))
+
+
+@app.post("/accounts/new")
+async def new_account_submit(request: Request, name: str = Form(...)):
+    if not _require_login(request):
+        return RedirectResponse("/login", status_code=303)
+    try:
+        await create_account(name)
+    except ProvisioningError as exc:
+        return RedirectResponse(f"/accounts/new?error={exc}", status_code=303)
+    return RedirectResponse("/", status_code=303)

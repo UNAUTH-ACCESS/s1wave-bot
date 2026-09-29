@@ -318,6 +318,13 @@ class Settings(BaseSettings):
     # scripts/create-account.sh sets this per new account it provisions.
     S1WAVE_ACCOUNT_NAME: str = "S1Wave"
 
+    # ── Control panel (2026-09-29) — only used by control_panel_main.py,
+    # a separate process from any trading account. Signs the login session
+    # cookie; a blank default is deliberate (control_panel/app.py refuses
+    # to start with the default in a non-debug context, rather than
+    # silently accepting an insecure, guessable secret).
+    CONTROL_SESSION_SECRET: str = ""
+
     # ── Cross-field validation ───────────────────────────────────────────────
 
     @model_validator(mode="after")
