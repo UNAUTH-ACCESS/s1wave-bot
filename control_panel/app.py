@@ -14,13 +14,23 @@ or database directly — only ever talks to a trading account's own API
 over HTTP (the exact same way a browser hitting that account's own
 dashboard would), using the Basic Auth credentials captured in the
 registry at account-creation time.
+
+Mounted at /panel (2026-09-29) — served through the SAME domain as the
+base account's own dashboard (https://s1wave-solana.duckdns.org/), not a
+new subdomain, per the user's explicit request. Every route below is
+under PREFIX and every internal redirect/form-action string is written
+with that prefix explicitly (NOT relying on nginx to strip/rewrite paths)
+— the base dashboard's own "/" route already occupies the domain root, so
+this app has to know its own mount point itself rather than assume it
+owns "/". See nginx's active.conf for the matching `location /panel/`
+block (passes the full path through unchanged, no prefix-stripping).
 """
 
 from __future__ import annotations
 
 import bcrypt
 import httpx
-from fastapi import FastAPI, Form, Request
+from fastapi import APIRouter, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, select
 from starlette.middleware.sessions import SessionMiddleware
@@ -33,6 +43,15 @@ from engine.provisioning import ProvisioningError, create_account
 
 log = get_logger(__name__)
 
+PREFIX = "/panel"
+
+# The one account with a real, working public URL today — every other
+# account is reachable only on its own localhost port until it gets its
+# own subdomain (a separate, lower-urgency step). Hardcoded rather than
+# derived, since there's no general way to know an account's public URL
+# (or whether it has one) from the registry alone.
+_PUBLIC_URLS = {"base": "https://s1wave-solana.duckdns.org/"}
+
 app = FastAPI(title="S1Wave Control Panel")
 
 if not settings.CONTROL_SESSION_SECRET:
@@ -42,6 +61,8 @@ if not settings.CONTROL_SESSION_SECRET:
         "\"import secrets; print(secrets.token_hex(32))\"`) and set it before starting this service."
     )
 app.add_middleware(SessionMiddleware, secret_key=settings.CONTROL_SESSION_SECRET, https_only=True)
+
+router = APIRouter(prefix=PREFIX)
 
 
 @app.on_event("startup")
@@ -99,17 +120,17 @@ def _require_login(request: Request) -> str | None:
     return request.session.get("user")
 
 
-@app.get("/signup", response_class=HTMLResponse)
+@router.get("/signup", response_class=HTMLResponse)
 async def signup_form(request: Request):
     async with get_session() as session:
         count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
     if count > 0:
-        return RedirectResponse("/login", status_code=303)
-    return HTMLResponse(_layout("Sign up", """
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+    return HTMLResponse(_layout("Sign up", f"""
         <h1>Create your S1Wave login</h1>
         <div class="sub">One-time setup — this becomes the only login for this control panel.</div>
         <div class="card">
-        <form method="post" action="/signup">
+        <form method="post" action="{PREFIX}/signup">
             <label>Username</label><input name="username" required autofocus>
             <label>Password</label><input name="password" type="password" required minlength="8">
             <button type="submit">Create account</button>
@@ -118,30 +139,30 @@ async def signup_form(request: Request):
     """))
 
 
-@app.post("/signup")
+@router.post("/signup")
 async def signup_submit(request: Request, username: str = Form(...), password: str = Form(...)):
     async with get_session() as session:
         count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
         if count > 0:
-            return RedirectResponse("/login", status_code=303)
+            return RedirectResponse(f"{PREFIX}/login", status_code=303)
         password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         session.add(ControlUser(username=username, password_hash=password_hash))
     request.session["user"] = username
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(PREFIX + "/", status_code=303)
 
 
-@app.get("/login", response_class=HTMLResponse)
+@router.get("/login", response_class=HTMLResponse)
 async def login_form(request: Request, error: str | None = None):
     async with get_session() as session:
         count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
     if count == 0:
-        return RedirectResponse("/signup", status_code=303)
+        return RedirectResponse(f"{PREFIX}/signup", status_code=303)
     error_html = f'<div class="error">{error}</div>' if error else ""
     return HTMLResponse(_layout("Log in", f"""
         <h1>S1Wave Control Panel</h1>
         <div class="sub">Log in to manage your trading accounts.</div>
         <div class="card">
-        <form method="post" action="/login">
+        <form method="post" action="{PREFIX}/login">
             <label>Username</label><input name="username" required autofocus>
             <label>Password</label><input name="password" type="password" required>
             <button type="submit">Log in</button>
@@ -151,22 +172,22 @@ async def login_form(request: Request, error: str | None = None):
     """))
 
 
-@app.post("/login")
+@router.post("/login")
 async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
     async with get_session() as session:
         user = (await session.execute(
             select(ControlUser).where(ControlUser.username == username)
         )).scalar_one_or_none()
     if user is None or not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
-        return RedirectResponse("/login?error=Invalid+username+or+password", status_code=303)
+        return RedirectResponse(f"{PREFIX}/login?error=Invalid+username+or+password", status_code=303)
     request.session["user"] = username
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse(PREFIX + "/", status_code=303)
 
 
-@app.get("/logout")
+@router.get("/logout")
 async def logout(request: Request):
     request.session.clear()
-    return RedirectResponse("/login", status_code=303)
+    return RedirectResponse(f"{PREFIX}/login", status_code=303)
 
 
 async def _fetch_status(account: ControlAccount) -> dict | None:
@@ -183,11 +204,11 @@ async def _fetch_status(account: ControlAccount) -> dict | None:
         return None
 
 
-@app.get("/", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 async def homepage(request: Request):
     user = _require_login(request)
     if not user:
-        return RedirectResponse("/login", status_code=303)
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
 
     async with get_session() as session:
         accounts = (await session.execute(
@@ -201,6 +222,9 @@ async def homepage(request: Request):
     rows = ""
     for acct in accounts:
         st = statuses[acct.name]
+        public_url = _PUBLIC_URLS.get(acct.name)
+        open_link = (f'<a class="btn btn-secondary" href="{public_url}" target="_blank">Open</a>'
+                     if public_url else '<span class="account-meta">no public URL yet</span>')
         if st is None:
             pill = '<span class="pill unknown">UNREACHABLE</span>'
             meta = f"port {acct.port} — {acct.wallet_pubkey[:4]}...{acct.wallet_pubkey[-4:]}"
@@ -222,7 +246,7 @@ async def homepage(request: Request):
             </div>
             <div style="display:flex;align-items:center;gap:10px">
                 {pill}
-                <a class="btn btn-secondary" href="http://127.0.0.1:{acct.port}/" target="_blank">Open</a>
+                {open_link}
             </div>
         </div>"""
     if not rows:
@@ -231,40 +255,49 @@ async def homepage(request: Request):
     return HTMLResponse(_layout("Accounts", f"""
         <div class="topbar">
             <h1 style="margin:0">S1Wave Accounts</h1>
-            <a href="/logout">Log out ({user})</a>
+            <a href="{PREFIX}/logout">Log out ({user})</a>
         </div>
         <div class="card">{rows}</div>
-        <a class="btn" href="/accounts/new">+ New Account</a>
+        <a class="btn" href="{PREFIX}/accounts/new">+ New Account</a>
     """))
 
 
-@app.get("/accounts/new", response_class=HTMLResponse)
+@router.get("/accounts/new", response_class=HTMLResponse)
 async def new_account_form(request: Request, error: str | None = None):
     if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
     error_html = f'<div class="error">{error}</div>' if error else ""
     return HTMLResponse(_layout("New account", f"""
         <h1>New S1Wave account</h1>
         <div class="sub">Creates an isolated database, a fresh wallet, its own port and service.
         Comes up paused and unfunded — you fund the wallet and flip it on when ready.</div>
         <div class="card">
-        <form method="post" action="/accounts/new">
+        <form method="post" action="{PREFIX}/accounts/new">
             <label>Account name (lowercase, digits, hyphens)</label>
             <input name="name" required pattern="[a-z0-9-]+" autofocus placeholder="e.g. trading2">
             <button type="submit">Create</button>
             {error_html}
         </form>
         </div>
-        <a href="/">&larr; Back</a>
+        <a href="{PREFIX}/">&larr; Back</a>
     """))
 
 
-@app.post("/accounts/new")
+@router.post("/accounts/new")
 async def new_account_submit(request: Request, name: str = Form(...)):
     if not _require_login(request):
-        return RedirectResponse("/login", status_code=303)
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
     try:
         await create_account(name)
     except ProvisioningError as exc:
-        return RedirectResponse(f"/accounts/new?error={exc}", status_code=303)
-    return RedirectResponse("/", status_code=303)
+        return RedirectResponse(f"{PREFIX}/accounts/new?error={exc}", status_code=303)
+    return RedirectResponse(PREFIX + "/", status_code=303)
+
+
+app.include_router(router)
+
+
+@app.get("/panel")
+async def panel_root_redirect():
+    """Bare /panel (no trailing slash) -> the real homepage route."""
+    return RedirectResponse(PREFIX + "/", status_code=307)
