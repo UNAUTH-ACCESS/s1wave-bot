@@ -20,10 +20,12 @@ import pytest
 from engine.provisioning import (
     REPO_DIR,
     ProvisioningError,
+    add_nginx_route,
     create_account,
     env_path_for,
     generate_dashboard_credentials,
     get_solana_tracker_keys,
+    public_url_for,
     service_name_for,
     update_dashboard_credentials,
     update_solana_tracker_keys,
@@ -214,3 +216,112 @@ async def test_update_dashboard_credentials_rewrites_env_and_restarts_only_that_
     run_mock.assert_awaited_once_with(
         "systemctl", "--user", "restart", "s1wave-bot-second.service"
     )
+
+
+def test_public_url_for_uses_the_same_domain_for_every_account():
+    assert public_url_for("base") == "https://s1wave-solana.duckdns.org/base/"
+    assert public_url_for("third") == "https://s1wave-solana.duckdns.org/third/"
+
+
+@pytest.fixture
+def fake_nginx_conf(tmp_path, monkeypatch):
+    conf = tmp_path / "active.conf"
+    conf.write_text(
+        "server {\n"
+        "    location /base/ {\n"
+        "        proxy_pass http://host.docker.internal:8000/;\n"
+        "    }\n"
+        "    # S1WAVE-ACCOUNTS-END\n"
+        "    location / {\n"
+        "        proxy_pass http://host.docker.internal:8000;\n"
+        "    }\n"
+        "}\n"
+    )
+    monkeypatch.setattr("engine.provisioning._QUANTEDGE_NGINX_CONF", conf)
+    return conf
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_missing_conf_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr("engine.provisioning._QUANTEDGE_NGINX_CONF", tmp_path / "nope.conf")
+    with pytest.raises(ProvisioningError, match="not found"):
+        await add_nginx_route("third", 8003)
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_missing_marker_raises(monkeypatch, tmp_path):
+    conf = tmp_path / "active.conf"
+    conf.write_text("server {\n    location / { proxy_pass http://x; }\n}\n")
+    monkeypatch.setattr("engine.provisioning._QUANTEDGE_NGINX_CONF", conf)
+    with pytest.raises(ProvisioningError, match="0 occurrences"):
+        await add_nginx_route("third", 8003)
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_refuses_to_guess_with_duplicate_marker(monkeypatch, tmp_path):
+    """Real incident (2026-09-29): a comment mentioning the marker by name
+    created a second literal match, and str.replace's count=1 silently
+    took the FIRST one — landing the new block in the wrong place while
+    nginx -t still validated fine, since it was still a syntactically
+    valid location block, just not where intended. This must now fail
+    loudly instead of guessing."""
+    conf = tmp_path / "active.conf"
+    conf.write_text(
+        "server {\n"
+        "    # S1WAVE-ACCOUNTS-END, mentioned here by name in a comment, exactly\n"
+        "    # like the real bug that motivated this check\n"
+        "    location /base/ { proxy_pass http://host.docker.internal:8000/; }\n"
+        "    # S1WAVE-ACCOUNTS-END\n"
+        "    location / { proxy_pass http://host.docker.internal:8000; }\n"
+        "}\n"
+    )
+    monkeypatch.setattr("engine.provisioning._QUANTEDGE_NGINX_CONF", conf)
+    original = conf.read_text()
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    with pytest.raises(ProvisioningError, match="2 occurrences"):
+        await add_nginx_route("third", 8003)
+
+    assert conf.read_text() == original
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_is_idempotent_if_already_present(fake_nginx_conf, monkeypatch):
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    await add_nginx_route("base", 8000)  # "base" block already in the fixture conf
+
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_inserts_validates_and_deploys(fake_nginx_conf, monkeypatch):
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    await add_nginx_route("third", 8003)
+
+    rewritten = fake_nginx_conf.read_text()
+    assert "location /third/ {" in rewritten
+    assert "http://host.docker.internal:8003/" in rewritten
+    # inserted BEFORE the end marker, not after it
+    assert rewritten.index("location /third/") < rewritten.index("S1WAVE-ACCOUNTS-END")
+    assert run_mock.await_count == 2  # nginx -t, then docker compose up
+    deploy_call = run_mock.await_args_list[-1]
+    assert deploy_call.args == ("docker", "compose", "up", "-d", "--force-recreate", "nginx")
+
+
+@pytest.mark.asyncio
+async def test_add_nginx_route_validation_failure_leaves_live_file_untouched(fake_nginx_conf, monkeypatch):
+    original = fake_nginx_conf.read_text()
+    run_mock = AsyncMock(side_effect=ProvisioningError("nginx -t failed: bad config"))
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    with pytest.raises(ProvisioningError, match="NOT deployed"):
+        await add_nginx_route("third", 8003)
+
+    assert fake_nginx_conf.read_text() == original
+    run_mock.assert_awaited_once()  # never reached the deploy step

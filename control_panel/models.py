@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid as _uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -73,6 +73,15 @@ class ControlAccount(Base):
     wallet_pubkey: Mapped[str] = mapped_column(String(64), nullable=False)
     dashboard_auth_user: Mapped[str] = mapped_column(String(64), nullable=False)
     dashboard_auth_password: Mapped[str] = mapped_column(String(128), nullable=False)
+    # True once engine/provisioning.py's add_nginx_route() has actually
+    # deployed a working /name/ location for this account (2026-09-29) —
+    # NOT just "this account exists." A new account always gets this set
+    # automatically on creation; it can still land False if the nginx
+    # step failed (e.g. docker unavailable at that moment) without that
+    # failure undoing the account itself. The control panel only shows an
+    # "Open dashboard" link when this is True, so it never points at a
+    # route that doesn't actually exist yet.
+    nginx_configured: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     def __repr__(self) -> str:

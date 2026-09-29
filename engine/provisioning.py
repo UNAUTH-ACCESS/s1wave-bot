@@ -31,18 +31,32 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from solders.keypair import Keypair
 from sqlalchemy import select
 
+from config.logging import get_logger
 from config.settings import settings
 from control_panel.models import ControlAccount
 from database.engine import get_session
 
+log = get_logger(__name__)
+
 REPO_DIR = Path(__file__).resolve().parent.parent
 _NAME_RE = re.compile(r"^[a-z0-9-]+$")
+
+# The shared nginx container fronts SEVERAL unrelated projects (s1wave,
+# contentpipe, anchorledger) and lives in a DIFFERENT repo/checkout on this
+# same host — see that repo's own CLAUDE.md. Cross-repo on purpose: there is
+# exactly one nginx config for this whole box, and S1Wave account creation
+# needs to extend it, not fork a second one.
+_QUANTEDGE_DIR = Path("/home/solana/quantedge")
+_QUANTEDGE_NGINX_CONF = _QUANTEDGE_DIR / "nginx" / "active.conf"
+_NGINX_MARKER_END = "    # S1WAVE-ACCOUNTS-END"
+PUBLIC_DOMAIN = "s1wave-solana.duckdns.org"
 
 
 class ProvisioningError(RuntimeError):
@@ -89,6 +103,100 @@ def env_path_for(name: str) -> Path:
 
 def service_name_for(name: str) -> str:
     return "s1wave-bot.service" if name == "base" else f"s1wave-bot-{name}.service"
+
+
+def public_url_for(name: str) -> str:
+    """Every account's public URL follows the exact same pattern now
+    (2026-09-29) — no more per-account hardcoding in the control panel.
+    Only meaningful once ControlAccount.nginx_configured is True for that
+    account; callers are responsible for checking that, this function
+    just knows the URL SHAPE, not whether the route actually exists yet."""
+    return f"https://{PUBLIC_DOMAIN}/{name}/"
+
+
+def _nginx_block_for(name: str, port: int) -> str:
+    return f"""    location = /{name} {{
+        return 301 /{name}/;
+    }}
+
+    location /{name}/ {{
+        proxy_pass         http://host.docker.internal:{port}/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        '';
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+    }}
+"""
+
+
+async def add_nginx_route(name: str, port: int) -> None:
+    """
+    Gives a newly created account its own public URL under the shared
+    S1Wave domain (2026-09-29 — "let every be one app," fully automated:
+    no more manual nginx edits per account). Inserts a new location block
+    into the quantedge repo's nginx/active.conf between the
+    S1WAVE-ACCOUNTS-START/END markers, VALIDATES the resulting config in
+    an isolated container before touching the live file, and only then
+    deploys it (docker compose up -d --force-recreate — the same
+    container fronts other unrelated projects, so this briefly touches
+    their traffic too, same as every manual nginx change this session).
+
+    Idempotent: if a route for this name already exists, this is a no-op.
+
+    Best-effort by design — create_account() must not roll back a real,
+    already-provisioned account just because this last step failed (a
+    bad config, docker being briefly unavailable). Callers should catch
+    ProvisioningError here and record that the account still has no
+    public route yet, rather than letting the whole creation fail.
+    """
+    if not _QUANTEDGE_NGINX_CONF.exists():
+        raise ProvisioningError(
+            f"{_QUANTEDGE_NGINX_CONF} not found — is the quantedge repo checked out at the expected path?"
+        )
+
+    original = _QUANTEDGE_NGINX_CONF.read_text()
+    if f"location /{name}/ {{" in original:
+        return  # already has a route
+
+    marker_count = original.count(_NGINX_MARKER_END)
+    if marker_count != 1:
+        # Fail loud, not silent (2026-09-29, real incident): str.replace's
+        # count=1 takes the FIRST match, no questions asked — a stray
+        # second occurrence of this exact text (e.g. a comment mentioning
+        # the marker by name) makes the block land in the wrong place
+        # while nginx -t still happily validates it, since it's still
+        # syntactically a fine location block, just not where anyone
+        # meant it. Caught exactly this way once already; never again
+        # guess which occurrence was the real one.
+        raise ProvisioningError(
+            f"nginx config has {marker_count} occurrences of the S1WAVE-ACCOUNTS-END "
+            "marker, expected exactly 1 — refusing to guess which one to insert before."
+        )
+
+    updated = original.replace(_NGINX_MARKER_END, _nginx_block_for(name, port) + _NGINX_MARKER_END, 1)
+
+    tmp_path = Path(tempfile.mkstemp(suffix=".conf")[1])
+    try:
+        tmp_path.write_text(updated)
+        await _run(
+            "docker", "run", "--rm", "--add-host=host.docker.internal:host-gateway",
+            "-v", f"{tmp_path}:/etc/nginx/conf.d/default.conf:ro",
+            "-v", f"{_QUANTEDGE_DIR}/nginx/certbot/conf:/etc/letsencrypt:ro",
+            "-v", f"{_QUANTEDGE_DIR}/nginx/certbot/www:/var/www/certbot:ro",
+            "nginx:alpine", "nginx", "-t",
+        )
+    except ProvisioningError as exc:
+        raise ProvisioningError(f"Generated nginx config failed validation — NOT deployed. {exc}") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    _QUANTEDGE_NGINX_CONF.write_text(updated)
+    await _run("docker", "compose", "up", "-d", "--force-recreate", "nginx", cwd=_QUANTEDGE_DIR)
 
 
 def get_solana_tracker_keys(name: str) -> dict[str, str]:
@@ -259,10 +367,25 @@ WantedBy=default.target
         unit_path.unlink(missing_ok=True)
         raise
 
+    # Best-effort (2026-09-29): the account itself is real and running at
+    # this point regardless of what happens next. A failure here (docker
+    # briefly unavailable, an nginx config surprise) must not undo it —
+    # it just stays reachable only on its own port until this is retried
+    # (re-running create_account with the same name would fail on "already
+    # exists" before reaching here, so retrying THIS step specifically is
+    # a job for whatever calls this, not for create_account itself yet).
+    nginx_configured = False
+    try:
+        await add_nginx_route(name, port)
+        nginx_configured = True
+    except ProvisioningError as exc:
+        log.warning("provisioning.nginx_route_failed", account=name, error=str(exc))
+
     async with get_session() as session:
         session.add(ControlAccount(
             name=name, port=port, wallet_pubkey=wallet_pubkey,
             dashboard_auth_user=dashboard_user, dashboard_auth_password=dashboard_password,
+            nginx_configured=nginx_configured,
         ))
 
     return ProvisionedAccount(name=name, port=port, wallet_pubkey=wallet_pubkey, env_file=str(env_path))

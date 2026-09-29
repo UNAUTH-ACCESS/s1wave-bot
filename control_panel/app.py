@@ -43,6 +43,7 @@ from engine.provisioning import (
     create_account,
     generate_dashboard_credentials,
     get_solana_tracker_keys,
+    public_url_for,
     update_dashboard_credentials,
     update_solana_tracker_keys,
 )
@@ -51,16 +52,14 @@ log = get_logger(__name__)
 
 PREFIX = "/panel"
 
-# The one account with a real, working public URL today — every other
-# account is reachable only on its own localhost port until it gets its
-# own subdomain (a separate, lower-urgency step). Hardcoded rather than
-# derived, since there's no general way to know an account's public URL
-# (or whether it has one) from the registry alone.
-_PUBLIC_URLS = {
-    "base": "https://s1wave-solana.duckdns.org/base/",
-    "second": "https://s1wave-solana.duckdns.org/second/",
-    "efetobo": "https://s1wave-solana.duckdns.org/efetobo/",
-}
+
+def _dashboard_link_for(acct: ControlAccount) -> str | None:
+    """An account's public URL, but ONLY once nginx actually has a working
+    route for it (2026-09-29) — every account gets the same URL shape
+    (public_url_for), but add_nginx_route() runs as a best-effort last
+    step of account creation and can land False. Showing the link anyway
+    would just be a dead link with an extra, more confusing 502/504 step."""
+    return public_url_for(acct.name) if acct.nginx_configured else None
 
 app = FastAPI(title="S1Wave Control Panel")
 
@@ -232,7 +231,7 @@ async def homepage(request: Request):
 
     rows = ""
     for acct in accounts:
-        public_url = _PUBLIC_URLS.get(acct.name)
+        public_url = _dashboard_link_for(acct)
         open_link = (f'<a class="btn btn-secondary" href="{public_url}" target="_blank">Open dashboard</a>'
                      if public_url else '<span class="account-meta">no public dashboard yet</span>')
         rows += f"""
@@ -318,7 +317,7 @@ async def manage_account(request: Request, name: str, saved: str | None = None, 
     creds_saved_html = ('<div class="sub" style="color:var(--accent)">Password regenerated — the account restarted. '
                          'Copy it now, it won\'t be shown differently again.</div>') if saved == "creds" else ""
     error_html = f'<div class="error">{error}</div>' if error else ""
-    public_url = _PUBLIC_URLS.get(name)
+    public_url = _dashboard_link_for(acct)
     dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
                        else "no public dashboard yet — reachable on its own port on this server")
 
