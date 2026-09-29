@@ -41,14 +41,24 @@ async def test_pushes_to_telegram_for_an_allowlisted_event(session, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_does_not_push_for_a_non_allowlisted_event(session, monkeypatch):
-    """exit_filled is deliberately excluded — see the module docstring:
-    it's now the routine exit path (LIQUIDITY_GUARD fires on most trades)
-    and would be spam at this frequency, even though it's marked
-    'critical' in-app for dashboard visual prominence."""
+    """wallet_funded and the user's own dashboard actions (manual_toggle,
+    halt_resumed) are deliberately excluded — see the module docstring."""
     mock_send = AsyncMock()
     monkeypatch.setattr("engine.notify.send_alert", mock_send)
-    await notify(session, "critical", "exit_filled", "TEST closed (LIQUIDITY_GUARD): -50.0%, $-1.00")
+    await notify(session, "info", "wallet_funded", "Wallet funded — $10.00 available.")
     mock_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pushes_for_every_real_trade_entry_and_exit(session, monkeypatch):
+    """2026-09-29, per the user's explicit instruction: every trade open
+    and close pushes too, not just the crisis-level events — including a
+    routine LIQUIDITY_GUARD exit, which is now the normal exit path."""
+    mock_send = AsyncMock()
+    monkeypatch.setattr("engine.notify.send_alert", mock_send)
+    await notify(session, "info", "entry_filled", "Bought TEST — $1.00 at $0.0001")
+    await notify(session, "critical", "exit_filled", "TEST closed (LIQUIDITY_GUARD): -0.5%, $-0.01")
+    assert mock_send.await_count == 2
 
 
 @pytest.mark.asyncio

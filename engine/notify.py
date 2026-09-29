@@ -18,9 +18,8 @@ doesn't need for a handful of low-frequency alerts) — it reuses
 workers/telegram_alerts.py's simpler at-most-once direct sender instead,
 same as the existing critical-sell-failure alert already does.
 
-Curated push list, deliberately narrow — "Telegram is NOT a log mirror.
-Only events that require human attention or decision-making are sent"
-(notification_worker.py's own stated design, kept here too):
+Push list (2026-09-29, per the user's explicit instruction to also push
+every trade entry/exit, knowing that means real per-trade volume):
   - permanently_halted / marked_unsellable / exit_failed_critical:
     system-discovered problems a human might not be watching for.
   - filter_calibration_needs_review: the self-audit found something,
@@ -28,12 +27,14 @@ Only events that require human attention or decision-making are sent"
   - daily_loss_limit_hit: a real, if lesser, halt.
   - withdrawal_sent: real money left the wallet — always worth a receipt,
     regardless of who/what triggered it.
-Deliberately EXCLUDED: exit_filled (even LIQUIDITY_GUARD, marked
-"critical" in-app purely for dashboard visual prominence — it's now the
-routine exit path and would be spam at this frequency), entry_filled,
-wallet_funded, rent_swept, daily_loss_limit_cleared,
-unsellable_recovered, manual_toggle, halt_resumed (both of the last two
-are the user's OWN just-taken action — they already know).
+  - entry_filled / exit_filled: every real trade opening and closing,
+    including routine LIQUIDITY_GUARD exits — deliberately NOT filtered
+    down to "only the losses" or "only the big ones," the user wants to
+    see every one.
+Still deliberately EXCLUDED: wallet_funded, rent_swept,
+daily_loss_limit_cleared, unsellable_recovered, manual_toggle,
+halt_resumed (the last two are the user's OWN just-taken action on the
+dashboard — they already know it happened).
 """
 
 from __future__ import annotations
@@ -55,6 +56,8 @@ TELEGRAM_PUSH_EVENTS = frozenset({
     "filter_calibration_needs_review",
     "daily_loss_limit_hit",
     "withdrawal_sent",
+    "entry_filled",
+    "exit_filled",
 })
 
 _LEVEL_EMOJI = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}
