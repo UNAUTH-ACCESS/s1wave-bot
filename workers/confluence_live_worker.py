@@ -135,6 +135,7 @@ from database.engine import get_session
 from engine.execution import ExecutionEngine
 from engine.filter_calibration import check_current_filter_population
 from engine.halt_override import apply_override, get_halt_override
+from engine.notify import notify as notify_shared
 from engine.sell_coordination import finish_sell, try_start_sell
 from engine.live_equity import (
     DEPOSIT_USD, compute_equity_usd, compute_position_usd, is_daily_halted, is_permanently_halted,
@@ -455,12 +456,14 @@ class ConfluenceLiveWorker:
 
     async def _notify(self, level: str, event: str, message: str, trade_id=None) -> None:
         """Persist an in-app notification — see models.orm.ConfluenceNotification
-        for the retention/severity contract. Never raises: a notification
-        failure must not be allowed to break the trading cycle that
-        triggered it."""
+        for the retention/severity contract. Also pushes to Telegram for a
+        curated set of events (see engine/notify.py's TELEGRAM_PUSH_EVENTS)
+        — everything else stays in-app only, same as before. Never raises:
+        a notification failure must not be allowed to break the trading
+        cycle that triggered it."""
         try:
             async with get_session() as session:
-                session.add(ConfluenceNotification(level=level, event=event, message=message, trade_id=trade_id))
+                await notify_shared(session, level, event, message, trade_id=trade_id)
         except Exception as exc:
             log.error("confluence_live.notify_failed", event=event, error=str(exc))
 

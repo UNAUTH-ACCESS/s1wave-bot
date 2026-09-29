@@ -71,6 +71,7 @@ from engine.filter_calibration import (
 from engine.halt_override import acknowledge_halt, apply_override, get_halt_override
 from engine.live_equity import DEPOSIT_USD, compute_equity_usd, is_daily_halted, is_permanently_halted
 from engine.manual_actions import close_trade_manually
+from engine.notify import notify as notify_shared
 from workers.entry_filters import CURRENT_FILTER_REGIME_SINCE
 
 from config.logging import get_logger, log_file_path
@@ -940,11 +941,10 @@ def create_app() -> FastAPI:
         settings.CONFLUENCE_LIVE_ENABLED = enabled
         _persist_env_var("CONFLUENCE_LIVE_ENABLED", str(enabled))
         async with get_session() as session:
-            session.add(ConfluenceNotification(
-                level="warning" if enabled else "info",
-                event="manual_toggle",
-                message=f"Trading manually {'RESUMED' if enabled else 'PAUSED'} from the dashboard.",
-            ))
+            await notify_shared(
+                session, "warning" if enabled else "info", "manual_toggle",
+                f"Trading manually {'RESUMED' if enabled else 'PAUSED'} from the dashboard.",
+            )
         return {"enabled": settings.CONFLUENCE_LIVE_ENABLED}
 
     @app.post("/confluence/resume-halted", tags=["confluence"])
@@ -975,17 +975,14 @@ def create_app() -> FastAPI:
         await acknowledge_halt(equity_usd, all_time_pnl_usd)
         new_max_loss_usd = equity_usd * Decimal(str(settings.CONFLUENCE_LIVE_MAX_LOSS_PCT))
         async with get_session() as session:
-            session.add(ConfluenceNotification(
-                level="warning",
-                event="halt_resumed",
-                message=(
-                    (f"Halt acknowledged and trading RESUMED from the dashboard. " if was_halted
-                     else "Drawdown-cap baseline recalibrated to the current balance. ") +
-                    f"New baseline: equity ${equity_usd:.2f}, all-time P&L ${all_time_pnl_usd:.2f} — "
-                    f"the {settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} drawdown cap (${new_max_loss_usd:.2f}) now "
-                    f"protects every dollar from this point forward."
-                ),
-            ))
+            await notify_shared(
+                session, "warning", "halt_resumed",
+                (f"Halt acknowledged and trading RESUMED from the dashboard. " if was_halted
+                 else "Drawdown-cap baseline recalibrated to the current balance. ") +
+                f"New baseline: equity ${equity_usd:.2f}, all-time P&L ${all_time_pnl_usd:.2f} — "
+                f"the {settings.CONFLUENCE_LIVE_MAX_LOSS_PCT:.0%} drawdown cap (${new_max_loss_usd:.2f}) now "
+                f"protects every dollar from this point forward.",
+            )
         return await _build_confluence_status()
 
     @app.post("/confluence/withdraw", tags=["confluence"])
@@ -1032,14 +1029,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
 
         async with get_session() as session:
-            session.add(ConfluenceNotification(
-                level="warning",
-                event="withdrawal_sent",
-                message=(
-                    f"Withdrew ${amount_usd:.2f} ({amount_lamports / 1e9:.6f} SOL) to "
-                    f"{destination_address[:4]}...{destination_address[-4:]} — tx {tx_signature}."
-                ),
-            ))
+            await notify_shared(
+                session, "warning", "withdrawal_sent",
+                f"Withdrew ${amount_usd:.2f} ({amount_lamports / 1e9:.6f} SOL) to "
+                f"{destination_address[:4]}...{destination_address[-4:]} — tx {tx_signature}.",
+            )
 
         # Re-baseline (see this endpoint's docstring) — best-effort: the
         # withdrawal already succeeded and is irreversible either way, so a

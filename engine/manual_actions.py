@@ -44,8 +44,9 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.execution import ExecutionEngine
+from engine.notify import notify as notify_shared
 from engine.sell_coordination import finish_sell, try_start_sell
-from models.orm import ConfluenceLiveTrade, ConfluenceNotification, Token
+from models.orm import ConfluenceLiveTrade, Token
 
 log = get_logger(__name__)
 
@@ -199,13 +200,14 @@ async def close_trade_manually(trade_id: str, sol_price_usd: Decimal) -> ManualC
         # separate code path for the dashboard's manual Close button.
         display_pnl_usd = real_pnl_usd if real_pnl_usd is not None else pnl_usd
         verified_suffix = " ✓" if real_pnl_usd is not None else ""
-        session.add(ConfluenceNotification(
-            level="info" if (display_pnl_usd or 0) >= 0 else "warning",
-            event="exit_filled",
-            message=f"{symbol} closed (MANUAL_CLOSE): "
-                    f"{f'${display_pnl_usd:+.4f}' if display_pnl_usd is not None else 'pnl unknown'}{verified_suffix}",
+        await notify_shared(
+            session,
+            "info" if (display_pnl_usd or 0) >= 0 else "warning",
+            "exit_filled",
+            f"{symbol} closed (MANUAL_CLOSE): "
+            f"{f'${display_pnl_usd:+.4f}' if display_pnl_usd is not None else 'pnl unknown'}{verified_suffix}",
             trade_id=trade_uuid,
-        ))
+        )
 
     log.info("manual_actions.close_succeeded", trade_id=trade_id, symbol=symbol,
               tx_signature=result.tx_signature, pnl_usd=str(pnl_usd) if pnl_usd is not None else None)
