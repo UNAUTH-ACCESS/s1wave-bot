@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,6 +108,40 @@ def get_solana_tracker_keys(name: str) -> dict[str, str]:
     return keys
 
 
+def generate_dashboard_credentials(name: str) -> tuple[str, str]:
+    """A fresh, distinct Basic Auth username/password for one account's own
+    dashboard (2026-09-29) — every account used to inherit base's exact
+    creds verbatim (copied straight from its .env template), so one leaked
+    password opened every account's dashboard, not just one. Username is
+    just the account's own name (easy to recognize in the control panel;
+    it's shown right next to it, not a secret); the password is random."""
+    return name, secrets.token_urlsafe(16)
+
+
+async def update_dashboard_credentials(name: str, user: str, password: str) -> None:
+    """Rewrites an account's own DASHBOARD_AUTH_USER/PASSWORD in its .env
+    and restarts its service — the same per-account, never-touches-another-
+    account pattern as update_solana_tracker_keys(). The control panel is
+    responsible for also updating its own ControlAccount row so what it
+    displays matches what the account's .env actually enforces."""
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+
+    lines = []
+    for line in env_path.read_text().splitlines():
+        if line.startswith("DASHBOARD_AUTH_USER="):
+            lines.append(f"DASHBOARD_AUTH_USER={user}")
+        elif line.startswith("DASHBOARD_AUTH_PASSWORD="):
+            lines.append(f"DASHBOARD_AUTH_PASSWORD={password}")
+        else:
+            lines.append(line)
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+    await _run("systemctl", "--user", "restart", service_name_for(name))
+
+
 async def update_solana_tracker_keys(name: str, sampling_key: str, discovery_key: str) -> None:
     """
     Rewrites an account's SOLANA_TRACKER_API_KEY / _DISCOVERY in its own
@@ -162,6 +197,7 @@ async def create_account(name: str) -> ProvisionedAccount:
     keypair = Keypair()
     wallet_secret = str(keypair)
     wallet_pubkey = str(keypair.pubkey())
+    dashboard_user, dashboard_password = generate_dashboard_credentials(name)
 
     base_env = (REPO_DIR / ".env").read_text()
     lines = []
@@ -179,6 +215,13 @@ async def create_account(name: str) -> ProvisionedAccount:
             lines.append("SOLANA_TRACKER_API_KEY=")
         elif line.startswith("SOLANA_TRACKER_API_KEY_DISCOVERY="):
             lines.append("SOLANA_TRACKER_API_KEY_DISCOVERY=")
+        elif line.startswith("DASHBOARD_AUTH_USER="):
+            # Distinct per account (2026-09-29) — NOT copied from base, so
+            # one account's password leaking doesn't open every account's
+            # dashboard. See generate_dashboard_credentials().
+            lines.append(f"DASHBOARD_AUTH_USER={dashboard_user}")
+        elif line.startswith("DASHBOARD_AUTH_PASSWORD="):
+            lines.append(f"DASHBOARD_AUTH_PASSWORD={dashboard_password}")
         else:
             lines.append(line)
     lines.append("")
@@ -187,9 +230,6 @@ async def create_account(name: str) -> ProvisionedAccount:
     lines.append(f"# Public wallet address: {wallet_pubkey} — fund this address to activate.")
     env_path.write_text("\n".join(lines) + "\n")
     env_path.chmod(0o600)
-
-    dashboard_user = next((l.split("=", 1)[1] for l in lines if l.startswith("DASHBOARD_AUTH_USER=")), "")
-    dashboard_password = next((l.split("=", 1)[1] for l in lines if l.startswith("DASHBOARD_AUTH_PASSWORD=")), "")
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     unit_path.write_text(f"""[Unit]

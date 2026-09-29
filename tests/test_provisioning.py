@@ -22,8 +22,10 @@ from engine.provisioning import (
     ProvisioningError,
     create_account,
     env_path_for,
+    generate_dashboard_credentials,
     get_solana_tracker_keys,
     service_name_for,
+    update_dashboard_credentials,
     update_solana_tracker_keys,
 )
 
@@ -166,3 +168,49 @@ async def test_update_solana_tracker_keys_can_clear_a_key(monkeypatch, tmp_path)
 
     rewritten = env_file.read_text()
     assert "SOLANA_TRACKER_API_KEY=\n" in rewritten
+
+
+def test_generate_dashboard_credentials_uses_name_as_username():
+    user, password = generate_dashboard_credentials("second")
+    assert user == "second"
+    assert len(password) >= 16
+
+
+def test_generate_dashboard_credentials_are_distinct_each_call():
+    _, password_one = generate_dashboard_credentials("second")
+    _, password_two = generate_dashboard_credentials("second")
+    assert password_one != password_two
+
+
+@pytest.mark.asyncio
+async def test_update_dashboard_credentials_missing_env_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "engine.provisioning.env_path_for", lambda name: tmp_path / ".env.nope"
+    )
+    with pytest.raises(ProvisioningError, match="No .env file"):
+        await update_dashboard_credentials("nope", "nope", "new-password")
+
+
+@pytest.mark.asyncio
+async def test_update_dashboard_credentials_rewrites_env_and_restarts_only_that_account(
+    monkeypatch, tmp_path
+):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text(
+        "OTHER_VAR=unrelated\n"
+        "DASHBOARD_AUTH_USER=old-user\n"
+        "DASHBOARD_AUTH_PASSWORD=old-password\n"
+    )
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    await update_dashboard_credentials("second", "second", "new-password")
+
+    rewritten = env_file.read_text()
+    assert "DASHBOARD_AUTH_USER=second" in rewritten
+    assert "DASHBOARD_AUTH_PASSWORD=new-password" in rewritten
+    assert "OTHER_VAR=unrelated" in rewritten
+    run_mock.assert_awaited_once_with(
+        "systemctl", "--user", "restart", "s1wave-bot-second.service"
+    )

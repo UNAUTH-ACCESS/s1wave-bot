@@ -41,7 +41,9 @@ from database.engine import get_engine, get_session
 from engine.provisioning import (
     ProvisioningError,
     create_account,
+    generate_dashboard_credentials,
     get_solana_tracker_keys,
+    update_dashboard_credentials,
     update_solana_tracker_keys,
 )
 
@@ -54,7 +56,11 @@ PREFIX = "/panel"
 # own subdomain (a separate, lower-urgency step). Hardcoded rather than
 # derived, since there's no general way to know an account's public URL
 # (or whether it has one) from the registry alone.
-_PUBLIC_URLS = {"base": "https://s1wave-solana.duckdns.org/base/"}
+_PUBLIC_URLS = {
+    "base": "https://s1wave-solana.duckdns.org/base/",
+    "second": "https://s1wave-solana.duckdns.org/second/",
+    "efetobo": "https://s1wave-solana.duckdns.org/efetobo/",
+}
 
 app = FastAPI(title="S1Wave Control Panel")
 
@@ -283,7 +289,7 @@ async def new_account_submit(request: Request, name: str = Form(...)):
 
 
 @router.get("/accounts/{name}", response_class=HTMLResponse)
-async def manage_account(request: Request, name: str, saved: bool = False, error: str | None = None):
+async def manage_account(request: Request, name: str, saved: str | None = None, error: str | None = None):
     """
     Per-account management page (2026-09-29) — identity + config, no
     balance/financial data (that stays on the account's OWN dashboard,
@@ -308,7 +314,9 @@ async def manage_account(request: Request, name: str, saved: bool = False, error
     except ProvisioningError:
         keys = {"sampling": "", "discovery": ""}
 
-    saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new keys.</div>' if saved else ""
+    saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new keys.</div>' if saved == "keys" else ""
+    creds_saved_html = ('<div class="sub" style="color:var(--accent)">Password regenerated — the account restarted. '
+                         'Copy it now, it won\'t be shown differently again.</div>') if saved == "creds" else ""
     error_html = f'<div class="error">{error}</div>' if error else ""
     public_url = _PUBLIC_URLS.get(name)
     dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
@@ -324,6 +332,20 @@ async def manage_account(request: Request, name: str, saved: bool = False, error
             <div class="account-meta" style="word-break:break-all">{acct.wallet_pubkey}</div>
             <label>Dashboard</label>
             <div class="account-meta">{dashboard_link}</div>
+        </div>
+        <div class="card">
+            <div class="sub" style="margin-bottom:0">Dashboard login (Basic Auth)</div>
+            <div class="account-meta">This is what a browser asks for when opening this account's own
+            dashboard above — distinct per account, so one account's login can't open another's.</div>
+            <label>Username</label>
+            <input value="{acct.dashboard_auth_user}" readonly>
+            <label>Password</label>
+            <input value="{acct.dashboard_auth_password}" readonly>
+            <form method="post" action="{PREFIX}/accounts/{name}/dashboard-credentials/regenerate"
+                  onsubmit="return confirm('This immediately changes the dashboard password and restarts the account. Continue?')">
+                <button type="submit" class="btn-secondary" style="color:var(--warn);border-color:var(--warn)">Regenerate password</button>
+            </form>
+            {creds_saved_html}
         </div>
         <div class="card">
             <div class="sub" style="margin-bottom:0">SolanaTracker keys</div>
@@ -353,7 +375,29 @@ async def update_account_keys(
         await update_solana_tracker_keys(name, sampling_key, discovery_key)
     except ProvisioningError as exc:
         return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
-    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=1", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=keys", status_code=303)
+
+
+@router.post("/accounts/{name}/dashboard-credentials/regenerate")
+async def regenerate_dashboard_credentials(request: Request, name: str):
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    async with get_session() as session:
+        acct = (await session.execute(
+            select(ControlAccount).where(ControlAccount.name == name)
+        )).scalar_one_or_none()
+        if acct is None:
+            return RedirectResponse(PREFIX + "/", status_code=303)
+        user, password = generate_dashboard_credentials(name)
+        try:
+            await update_dashboard_credentials(name, user, password)
+        except ProvisioningError as exc:
+            return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
+        acct.dashboard_auth_user = user
+        acct.dashboard_auth_password = password
+
+    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=creds", status_code=303)
 
 
 app.include_router(router)

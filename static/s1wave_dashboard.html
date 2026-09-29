@@ -350,7 +350,13 @@
 
 </div>
 <script>
-const BASE = '';
+// Derived from the page's own URL (2026-09-29), not hardcoded — this ONE
+// static file is shared verbatim by every account's process (base, second,
+// efetobo, ...), each reachable under its own domain prefix (/base/,
+// /second/, ...). A hardcoded '' only worked by coincidence for whichever
+// account happened to own the unprefixed domain root; every other account
+// would have silently called that one account's API instead of its own.
+const BASE = location.pathname.replace(/\/$/, '');
 const get = path => fetch(BASE + path).then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
 
 const pct = x => x === null || x === undefined ? '—' : (x*100).toFixed(1) + '%';
