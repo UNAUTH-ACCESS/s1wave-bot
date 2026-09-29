@@ -29,7 +29,6 @@ block (passes the full path through unchanged, no prefix-stripping).
 from __future__ import annotations
 
 import bcrypt
-import httpx
 from fastapi import APIRouter, FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, select
@@ -39,7 +38,12 @@ from config.logging import get_logger
 from config.settings import settings
 from control_panel.models import Base, ControlAccount, ControlUser
 from database.engine import get_engine, get_session
-from engine.provisioning import ProvisioningError, create_account
+from engine.provisioning import (
+    ProvisioningError,
+    create_account,
+    get_solana_tracker_keys,
+    update_solana_tracker_keys,
+)
 
 log = get_logger(__name__)
 
@@ -141,6 +145,10 @@ async def signup_form(request: Request):
 
 @router.post("/signup")
 async def signup_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    # Strip whitespace (2026-09-29, real bug: a browser autofill/paste left
+    # a trailing space in the stored username that made login impossible
+    # since no one would ever type that same trailing space back).
+    username = username.strip()
     async with get_session() as session:
         count = (await session.execute(select(func.count()).select_from(ControlUser))).scalar_one()
         if count > 0:
@@ -174,13 +182,19 @@ async def login_form(request: Request, error: str | None = None):
 
 @router.post("/login")
 async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+    # Case-insensitive, whitespace-tolerant username match (2026-09-29,
+    # real bug: a real login attempt failed because of both a case
+    # mismatch AND a trailing space stored from signup — "Username" fields
+    # being silently case/whitespace-sensitive is a classic, avoidable
+    # source of "I can't log in").
+    username = username.strip()
     async with get_session() as session:
         user = (await session.execute(
-            select(ControlUser).where(ControlUser.username == username)
+            select(ControlUser).where(func.lower(func.trim(ControlUser.username)) == username.lower())
         )).scalar_one_or_none()
     if user is None or not bcrypt.checkpw(password.encode(), user.password_hash.encode()):
         return RedirectResponse(f"{PREFIX}/login?error=Invalid+username+or+password", status_code=303)
-    request.session["user"] = username
+    request.session["user"] = user.username
     return RedirectResponse(PREFIX + "/", status_code=303)
 
 
@@ -190,22 +204,17 @@ async def logout(request: Request):
     return RedirectResponse(f"{PREFIX}/login", status_code=303)
 
 
-async def _fetch_status(account: ControlAccount) -> dict | None:
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"http://127.0.0.1:{account.port}/confluence/status",
-                auth=(account.dashboard_auth_user, account.dashboard_auth_password),
-            )
-            resp.raise_for_status()
-            return resp.json()
-    except Exception as exc:
-        log.warning("control_panel.status_fetch_failed", account=account.name, error=str(exc))
-        return None
-
-
 @router.get("/", response_class=HTMLResponse)
 async def homepage(request: Request):
+    """
+    Account list (2026-09-29: deliberately NO balance/status/financial
+    info here anymore — see the user's explicit instruction). This is
+    the login-gated ACCOUNT SWITCHER, not a financial summary; each
+    account's own dashboard (linked from its manage page) is where real
+    numbers belong, behind that account's own Basic Auth. Identity only:
+    name, a link to manage it (SolanaTracker keys, etc.), and a link to
+    its live dashboard where one is public.
+    """
     user = _require_login(request)
     if not user:
         return RedirectResponse(f"{PREFIX}/login", status_code=303)
@@ -215,38 +224,17 @@ async def homepage(request: Request):
             select(ControlAccount).order_by(ControlAccount.created_at)
         )).scalars().all()
 
-    statuses = {}
-    for acct in accounts:
-        statuses[acct.name] = await _fetch_status(acct)
-
     rows = ""
     for acct in accounts:
-        st = statuses[acct.name]
         public_url = _PUBLIC_URLS.get(acct.name)
-        open_link = (f'<a class="btn btn-secondary" href="{public_url}" target="_blank">Open</a>'
-                     if public_url else '<span class="account-meta">no public URL yet</span>')
-        if st is None:
-            pill = '<span class="pill unknown">UNREACHABLE</span>'
-            meta = f"port {acct.port} — {acct.wallet_pubkey[:4]}...{acct.wallet_pubkey[-4:]}"
-        else:
-            if st.get("permanently_halted"):
-                pill = '<span class="pill halted">HALTED</span>'
-            elif st.get("enabled"):
-                pill = '<span class="pill armed">ARMED</span>'
-            else:
-                pill = '<span class="pill paused">PAUSED</span>'
-            wallet_usd = st.get("wallet_usd")
-            meta = (f"${wallet_usd:.2f}" if wallet_usd is not None else "—") + \
-                   f" · {st.get('open_trades', 0)} open · port {acct.port}"
+        open_link = (f'<a class="btn btn-secondary" href="{public_url}" target="_blank">Open dashboard</a>'
+                     if public_url else '<span class="account-meta">no public dashboard yet</span>')
         rows += f"""
         <div class="account-row">
-            <div>
-                <div class="account-name">{acct.name}</div>
-                <div class="account-meta">{meta}</div>
-            </div>
+            <div class="account-name">{acct.name}</div>
             <div style="display:flex;align-items:center;gap:10px">
-                {pill}
                 {open_link}
+                <a class="btn btn-secondary" href="{PREFIX}/accounts/{acct.name}">Manage</a>
             </div>
         </div>"""
     if not rows:
@@ -292,6 +280,80 @@ async def new_account_submit(request: Request, name: str = Form(...)):
     except ProvisioningError as exc:
         return RedirectResponse(f"{PREFIX}/accounts/new?error={exc}", status_code=303)
     return RedirectResponse(PREFIX + "/", status_code=303)
+
+
+@router.get("/accounts/{name}", response_class=HTMLResponse)
+async def manage_account(request: Request, name: str, saved: bool = False, error: str | None = None):
+    """
+    Per-account management page (2026-09-29) — identity + config, no
+    balance/financial data (that stays on the account's OWN dashboard,
+    behind its own Basic Auth; see the homepage's docstring for why).
+    Currently just the SolanaTracker keys, since that's the one thing
+    that needed editing through the panel instead of the server directly
+    — more account-level settings can live here later without the
+    homepage ever needing to grow past a plain list.
+    """
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    async with get_session() as session:
+        acct = (await session.execute(
+            select(ControlAccount).where(ControlAccount.name == name)
+        )).scalar_one_or_none()
+    if acct is None:
+        return RedirectResponse(PREFIX + "/", status_code=303)
+
+    try:
+        keys = get_solana_tracker_keys(name)
+    except ProvisioningError:
+        keys = {"sampling": "", "discovery": ""}
+
+    saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new keys.</div>' if saved else ""
+    error_html = f'<div class="error">{error}</div>' if error else ""
+    public_url = _PUBLIC_URLS.get(name)
+    dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
+                       else "no public dashboard yet — reachable on its own port on this server")
+
+    return HTMLResponse(_layout(name, f"""
+        <div class="topbar">
+            <h1 style="margin:0">{name}</h1>
+            <a href="{PREFIX}/">&larr; All accounts</a>
+        </div>
+        <div class="card">
+            <label>Wallet address</label>
+            <div class="account-meta" style="word-break:break-all">{acct.wallet_pubkey}</div>
+            <label>Dashboard</label>
+            <div class="account-meta">{dashboard_link}</div>
+        </div>
+        <div class="card">
+            <div class="sub" style="margin-bottom:0">SolanaTracker keys</div>
+            <div class="account-meta">Add or replace this account's own discovery/sampling keys.
+            Saving restarts this account's service to apply them — doesn't touch any other account.</div>
+            <form method="post" action="{PREFIX}/accounts/{name}/keys">
+                <label>Sampling key (SOLANA_TRACKER_API_KEY)</label>
+                <input name="sampling_key" value="{keys['sampling']}" placeholder="leave blank to clear">
+                <label>Discovery key (SOLANA_TRACKER_API_KEY_DISCOVERY)</label>
+                <input name="discovery_key" value="{keys['discovery']}" placeholder="leave blank to clear">
+                <button type="submit">Save &amp; restart account</button>
+                {saved_html}
+                {error_html}
+            </form>
+        </div>
+    """))
+
+
+@router.post("/accounts/{name}/keys")
+async def update_account_keys(
+    request: Request, name: str,
+    sampling_key: str = Form(default=""), discovery_key: str = Form(default=""),
+):
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+    try:
+        await update_solana_tracker_keys(name, sampling_key, discovery_key)
+    except ProvisioningError as exc:
+        return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=1", status_code=303)
 
 
 app.include_router(router)

@@ -80,6 +80,62 @@ async def _next_port(session) -> int:
     return port
 
 
+def env_path_for(name: str) -> Path:
+    """"base" is the original, pre-multi-account deployment — plain .env,
+    no suffix. Every other account is .env.<name> (see create_account())."""
+    return REPO_DIR / (".env" if name == "base" else f".env.{name}")
+
+
+def service_name_for(name: str) -> str:
+    return "s1wave-bot.service" if name == "base" else f"s1wave-bot-{name}.service"
+
+
+def get_solana_tracker_keys(name: str) -> dict[str, str]:
+    """Current SOLANA_TRACKER_API_KEY / _DISCOVERY values for an account,
+    straight from its .env — shown prefilled in the control panel's edit
+    form so "add or replace" always starts from what's actually set, not
+    a guess. Returns empty strings for a key that isn't set."""
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+    keys = {"sampling": "", "discovery": ""}
+    for line in env_path.read_text().splitlines():
+        if line.startswith("SOLANA_TRACKER_API_KEY="):
+            keys["sampling"] = line.split("=", 1)[1]
+        elif line.startswith("SOLANA_TRACKER_API_KEY_DISCOVERY="):
+            keys["discovery"] = line.split("=", 1)[1]
+    return keys
+
+
+async def update_solana_tracker_keys(name: str, sampling_key: str, discovery_key: str) -> None:
+    """
+    Rewrites an account's SOLANA_TRACKER_API_KEY / _DISCOVERY in its own
+    .env and restarts its service so the new keys take effect immediately
+    — added 2026-09-29 so a new (or credit-exhausted) account's keys can
+    be set/replaced through the control panel instead of editing a file
+    on the server by hand. Deliberately per-account, never touches any
+    OTHER account's keys or .env — the whole point of these being split
+    per account in the first place (see CLAUDE.md's SolanaTracker-outage
+    history) is that one account's credit exhaustion can't starve another's.
+    """
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+
+    lines = []
+    for line in env_path.read_text().splitlines():
+        if line.startswith("SOLANA_TRACKER_API_KEY="):
+            lines.append(f"SOLANA_TRACKER_API_KEY={sampling_key}")
+        elif line.startswith("SOLANA_TRACKER_API_KEY_DISCOVERY="):
+            lines.append(f"SOLANA_TRACKER_API_KEY_DISCOVERY={discovery_key}")
+        else:
+            lines.append(line)
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+    await _run("systemctl", "--user", "restart", service_name_for(name))
+
+
 async def create_account(name: str) -> ProvisionedAccount:
     if not _NAME_RE.match(name):
         raise ProvisioningError("Account name must be lowercase letters, digits, hyphens only.")

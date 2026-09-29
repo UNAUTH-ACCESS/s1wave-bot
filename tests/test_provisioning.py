@@ -12,9 +12,20 @@ here — see CLAUDE.md's "Multi-account support" section.
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import AsyncMock
+
 import pytest
 
-from engine.provisioning import ProvisioningError, create_account
+from engine.provisioning import (
+    REPO_DIR,
+    ProvisioningError,
+    create_account,
+    env_path_for,
+    get_solana_tracker_keys,
+    service_name_for,
+    update_solana_tracker_keys,
+)
 
 
 @pytest.mark.asyncio
@@ -60,3 +71,98 @@ async def test_accepts_valid_name_pattern_but_fails_fast_without_real_infra():
     # confirms we got PAST validation, which is what this test checks.
     with pytest.raises(Exception):
         await create_account("zzz-test-name-that-should-not-exist")
+
+
+def test_env_path_for_base_is_plain_dotenv():
+    assert env_path_for("base") == REPO_DIR / ".env"
+
+
+def test_env_path_for_named_account_uses_suffix():
+    assert env_path_for("second") == REPO_DIR / ".env.second"
+
+
+def test_service_name_for_base_has_no_suffix():
+    assert service_name_for("base") == "s1wave-bot.service"
+
+
+def test_service_name_for_named_account_uses_suffix():
+    assert service_name_for("second") == "s1wave-bot-second.service"
+
+
+def test_get_solana_tracker_keys_missing_env_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "engine.provisioning.env_path_for", lambda name: tmp_path / ".env.nope"
+    )
+    with pytest.raises(ProvisioningError, match="No .env file"):
+        get_solana_tracker_keys("nope")
+
+
+def test_get_solana_tracker_keys_reads_existing_values(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text(
+        "OTHER_VAR=unrelated\n"
+        "SOLANA_TRACKER_API_KEY=sampling-abc\n"
+        "SOLANA_TRACKER_API_KEY_DISCOVERY=discovery-xyz\n"
+    )
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+
+    keys = get_solana_tracker_keys("second")
+
+    assert keys == {"sampling": "sampling-abc", "discovery": "discovery-xyz"}
+
+
+def test_get_solana_tracker_keys_defaults_to_blank_when_unset(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("OTHER_VAR=unrelated\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+
+    keys = get_solana_tracker_keys("second")
+
+    assert keys == {"sampling": "", "discovery": ""}
+
+
+@pytest.mark.asyncio
+async def test_update_solana_tracker_keys_missing_env_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "engine.provisioning.env_path_for", lambda name: tmp_path / ".env.nope"
+    )
+    with pytest.raises(ProvisioningError, match="No .env file"):
+        await update_solana_tracker_keys("nope", "new-sampling", "new-discovery")
+
+
+@pytest.mark.asyncio
+async def test_update_solana_tracker_keys_rewrites_env_and_restarts_only_that_account(
+    monkeypatch, tmp_path
+):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text(
+        "OTHER_VAR=unrelated\n"
+        "SOLANA_TRACKER_API_KEY=old-sampling\n"
+        "SOLANA_TRACKER_API_KEY_DISCOVERY=old-discovery\n"
+    )
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    await update_solana_tracker_keys("second", "new-sampling", "new-discovery")
+
+    rewritten = env_file.read_text()
+    assert "SOLANA_TRACKER_API_KEY=new-sampling" in rewritten
+    assert "SOLANA_TRACKER_API_KEY_DISCOVERY=new-discovery" in rewritten
+    assert "OTHER_VAR=unrelated" in rewritten
+    run_mock.assert_awaited_once_with(
+        "systemctl", "--user", "restart", "s1wave-bot-second.service"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_solana_tracker_keys_can_clear_a_key(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("SOLANA_TRACKER_API_KEY=old-sampling\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    monkeypatch.setattr("engine.provisioning._run", AsyncMock(return_value=""))
+
+    await update_solana_tracker_keys("second", "", "")
+
+    rewritten = env_file.read_text()
+    assert "SOLANA_TRACKER_API_KEY=\n" in rewritten
