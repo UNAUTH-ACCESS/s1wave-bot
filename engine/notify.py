@@ -44,6 +44,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.logging import get_logger
+from config.settings import settings
 from models.orm import ConfluenceNotification
 from workers.telegram_alerts import send_alert
 
@@ -85,7 +86,7 @@ async def notify(
     if event in TELEGRAM_PUSH_EVENTS:
         try:
             emoji = _LEVEL_EMOJI.get(level, "")
-            text = f"{emoji} <b>S1Wave — {_esc(event.replace('_', ' ').upper())}</b>\n\n{_esc(message)}"
+            text = f"{emoji} <b>{_esc(settings.S1WAVE_ACCOUNT_NAME)} — {_esc(event.replace('_', ' ').upper())}</b>\n\n{_esc(message)}"
             await send_alert(text)
         except Exception:
             log.error("notify.telegram_push_failed", notification_event=event, exc_info=True)

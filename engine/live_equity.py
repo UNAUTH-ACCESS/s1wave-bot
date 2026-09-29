@@ -70,9 +70,22 @@ from config.settings import settings
 # found the displayed all_time_realized_pnl_usd (-$1.21 at the time)
 # massively understated the real loss — the honest number is
 # current_wallet_usd - DEPOSIT_USD, not a sum of per-trade pnl_usd fields.
-# Update this if the wallet is ever topped up again.
-DEPOSIT_LAMPORTS = 92_774_730
-DEPOSIT_SOL_PRICE_USD_AT_DEPOSIT = Decimal("114.75")  # nearest real heartbeat.ok reading to the deposit's block time
+#
+# Read from settings (2026-09-29, multi-account support) rather than
+# hardcoded directly, so each S1Wave account (see scripts/create-account.sh)
+# can carry its OWN real deposit instead of every account's dashboard
+# showing this original wallet's number. Defaults below are this original
+# account's real, RPC-confirmed figures — unchanged behavior for it. A new
+# account's real deposit can only be known AFTER funding + an on-chain
+# confirmation (the same forensic process used for this one originally),
+# so CONFLUENCE_LIVE_DEPOSIT_LAMPORTS/_SOL_PRICE_USD_AT_DEPOSIT belong in
+# that account's .env once that's done — until then its dashboard's
+# deposit/gap figures are informational placeholders, not the real
+# account's own confirmed deposit (the halt-override baseline, not this
+# constant, is what actually protects real money either way — see
+# engine/halt_override.py).
+DEPOSIT_LAMPORTS = settings.CONFLUENCE_LIVE_DEPOSIT_LAMPORTS
+DEPOSIT_SOL_PRICE_USD_AT_DEPOSIT = Decimal(str(settings.CONFLUENCE_LIVE_DEPOSIT_SOL_PRICE_USD))
 DEPOSIT_USD = (Decimal(DEPOSIT_LAMPORTS) / Decimal("1e9")) * DEPOSIT_SOL_PRICE_USD_AT_DEPOSIT
 
 

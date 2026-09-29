@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     # knobs.
     CONFLUENCE_LIVE_ENABLED: bool = False                    # master kill switch — stays False until the user explicitly arms it
     CONFLUENCE_LIVE_WALLET_PRIVATE_KEY: str = ""             # dedicated wallet, isolated from WALLET_PRIVATE_KEY
+    # This account's one real deposit, in lamports + the real SOL price at
+    # deposit time (2026-09-29, multi-account support — see
+    # engine/live_equity.py's DEPOSIT_USD comment for the full reasoning).
+    # Defaults are the ORIGINAL account's real, RPC-confirmed figures.
+    # A new account (scripts/create-account.sh) should have these
+    # overridden in its own .env once its real deposit is confirmed
+    # on-chain after funding — until then they're just placeholders.
+    CONFLUENCE_LIVE_DEPOSIT_LAMPORTS: Annotated[int, Field(ge=0)] = 92_774_730
+    CONFLUENCE_LIVE_DEPOSIT_SOL_PRICE_USD: Annotated[float, Field(gt=0)] = 114.75
     # 2026-09-24: equity is now the LIVE on-chain wallet balance, not a
     # fixed stake figure — see engine/live_equity.py for the full model and
     # why (the user's own instruction: "$7 deposited -> trade with $7,
@@ -301,6 +310,13 @@ class Settings(BaseSettings):
     # ── API server ──────────────────────────────────────────────────────────
     API_HOST: str = "0.0.0.0"
     API_PORT: Annotated[int, Field(ge=1024, le=65535)] = 8000
+
+    # Multi-account support (2026-09-29) — a short label distinguishing
+    # which S1Wave account a Telegram alert (engine/notify.py) came from,
+    # since multiple accounts share one Telegram bot/chat by default.
+    # "S1Wave" (unset) is the original single-instance deployment;
+    # scripts/create-account.sh sets this per new account it provisions.
+    S1WAVE_ACCOUNT_NAME: str = "S1Wave"
 
     # ── Cross-field validation ───────────────────────────────────────────────
 
