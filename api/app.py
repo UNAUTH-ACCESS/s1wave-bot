@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -98,7 +99,13 @@ from models.orm import (
 log = get_logger(__name__)
 
 _START_TIME = datetime.now(timezone.utc)
-_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+# Reads the SAME S1WAVE_ENV_FILE override config/settings.py does
+# (2026-09-29, for multi-instance support — see that file's comment) —
+# without this, the dashboard's toggle-persistence would always write to
+# the base ".env" regardless of which account's .env this process
+# actually loaded its config from, corrupting whichever instance runs
+# from the same source checkout without S1WAVE_ENV_FILE set to match.
+_ENV_PATH = Path(__file__).resolve().parent.parent / os.environ.get("S1WAVE_ENV_FILE", ".env")
 
 
 def _persist_env_var(key: str, value: str) -> None:

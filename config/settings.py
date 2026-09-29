@@ -16,16 +16,28 @@ Usage
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Annotated
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# S1WAVE_ENV_FILE (2026-09-29) — lets multiple independent S1Wave accounts
+# (each its own wallet, database, and port) run from ONE shared codebase
+# instead of a separate directory/checkout per account. Set via the
+# systemd unit's Environment= line (e.g. `Environment=S1WAVE_ENV_FILE=
+# .env.instance2`); unset (the default) resolves to plain ".env",
+# identical to every existing deployment's behavior — this is purely
+# additive. api/app.py's _ENV_PATH (used by the dashboard's toggle-
+# persistence) reads the same variable, so both stay in sync — see that
+# file's comment for why that mattered.
+_ENV_FILE = os.environ.get("S1WAVE_ENV_FILE", ".env")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",

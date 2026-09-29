@@ -30,8 +30,17 @@ from pathlib import Path
 import structlog
 
 
-# Log directory — created next to main.py
-_LOG_DIR = Path("logs")
+# Log directory — created next to main.py. Suffixed per-instance
+# (2026-09-29, multi-account support — see config/settings.py's
+# S1WAVE_ENV_FILE comment) so two S1Wave accounts sharing one codebase
+# checkout (same WorkingDirectory, different .env files) don't interleave
+# their local log FILES — journalctl already separates them cleanly by
+# systemd unit regardless, this is just so `logs/` on disk stays readable
+# too. ".env" (the default, unset) keeps the original plain "logs" dir,
+# identical to every existing single-instance deployment.
+_env_file_name = os.environ.get("S1WAVE_ENV_FILE", ".env")
+_instance_suffix = f"-{_env_file_name.split('.env.', 1)[1]}" if _env_file_name.startswith(".env.") else ""
+_LOG_DIR = Path(f"logs{_instance_suffix}")
 _MAX_BYTES = 10 * 1024 * 1024   # 10 MB per file
 _BACKUP_COUNT = 5                # keep 5 rotated files → max ~50 MB
 
