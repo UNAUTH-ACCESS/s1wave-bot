@@ -54,7 +54,7 @@ PREFIX = "/panel"
 # own subdomain (a separate, lower-urgency step). Hardcoded rather than
 # derived, since there's no general way to know an account's public URL
 # (or whether it has one) from the registry alone.
-_PUBLIC_URLS = {"base": "https://s1wave-solana.duckdns.org/"}
+_PUBLIC_URLS = {"base": "https://s1wave-solana.duckdns.org/base/"}
 
 app = FastAPI(title="S1Wave Control Panel")
 
