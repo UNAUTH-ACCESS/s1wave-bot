@@ -21,7 +21,6 @@ Coverage:
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -229,11 +228,11 @@ async def test_never_touches_trading_tables(session):
 async def test_failure_inside_signal_does_not_break_shared_snapshot_write():
     """shared_snapshot.write_snapshot_and_notify wraps the momentum_signal
     call defensively -- a broken experiment must never break a real
-    snapshot write or the SnapshotEvent it produces."""
+    snapshot write. write_snapshot_and_notify itself must not raise even
+    though maybe_record_signal blows up."""
     from workers import shared_snapshot
 
     token = make_token()
-    s1_queue = asyncio.Queue()
     snap = dict(
         price_usd=Decimal("0.001"), liquidity_usd=Decimal("20000"),
         market_cap_usd=Decimal("100000"), volume_usd=Decimal("5000"),
@@ -249,9 +248,8 @@ async def test_failure_inside_signal_does_not_break_shared_snapshot_write():
          patch("workers.momentum_signal.maybe_record_signal", side_effect=RuntimeError("boom")):
         mock_gs.return_value.__aenter__ = AsyncMock(return_value=fake_session)
         mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-        count = await shared_snapshot.write_snapshot_and_notify(
-            token, snap, datetime.now(timezone.utc), is_observing=False, s1_queue=s1_queue,
+        await shared_snapshot.write_snapshot_and_notify(
+            token, snap, datetime.now(timezone.utc),
         )
 
-    assert count == 1
-    assert s1_queue.qsize() == 1  # SnapshotEvent still emitted despite the exception
+    assert shared_snapshot.is_fresh(token.mint_address, datetime.now(timezone.utc))

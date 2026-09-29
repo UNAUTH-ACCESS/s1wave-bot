@@ -6,9 +6,9 @@ Discovery/sampling request sync (2026-09-21).
 Coverage:
   1. workers.shared_snapshot.is_fresh() — the time-window logic sampling
      relies on to decide whether to skip its own API call for a mint.
-  2. write_snapshot_and_notify() bumps the ONE shared counter and marks a
-     mint fresh, and correctly withholds the SnapshotEvent for OBSERVING
-     tokens (same rule sampling_worker always applied).
+  2. write_snapshot_and_notify() marks a mint fresh and writes its
+     TokenSnapshot row regardless of which caller (discovery or sampling)
+     supplied the data.
   3. DiscoveryWorker only writes a snapshot for an already-promoted mint
      that reappears in its poll if that mint is currently WATCHING or
      OBSERVING — never for REJECTED/ENTERED/CLOSED.
@@ -61,11 +61,9 @@ def make_snap(**overrides) -> dict:
 
 @pytest.fixture(autouse=True)
 def _clean_shared_state():
-    """shared_snapshot's dicts are module-level — isolate each test."""
-    shared_snapshot._snapshot_counts.clear()
+    """shared_snapshot's dict is module-level — isolate each test."""
     shared_snapshot._covered_at.clear()
     yield
-    shared_snapshot._snapshot_counts.clear()
     shared_snapshot._covered_at.clear()
 
 
@@ -89,13 +87,11 @@ class TestIsFresh:
         now = t0 + timedelta(seconds=shared_snapshot.FRESHNESS_WINDOW_SECONDS + 1)
         assert shared_snapshot.is_fresh(mint, now) is False
 
-    def test_forget_clears_freshness_and_count(self):
+    def test_forget_clears_freshness(self):
         mint = "MintC"
         shared_snapshot._covered_at[mint] = datetime.now(timezone.utc)
-        shared_snapshot._snapshot_counts[mint] = 3
         shared_snapshot.forget(mint)
         assert mint not in shared_snapshot._covered_at
-        assert mint not in shared_snapshot._snapshot_counts
 
     def test_mark_covered_batch_marks_all_mints_fresh_atomically(self):
         """The race-condition fix (2026-09-21): a batch of mints must all
@@ -113,24 +109,21 @@ class TestIsFresh:
 class TestWriteSnapshotAndNotify:
 
     @pytest.mark.asyncio
-    async def test_increments_shared_counter_and_marks_fresh(self, session):
+    async def test_writes_snapshot_and_marks_fresh(self, session):
         token = make_token()
         session.add(token)
         await session.flush()
 
-        s1_queue = asyncio.Queue()
         now = datetime.now(timezone.utc)
 
         with patch("workers.shared_snapshot.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            count = await shared_snapshot.write_snapshot_and_notify(
-                token, make_snap(), now, is_observing=False, s1_queue=s1_queue,
+            await shared_snapshot.write_snapshot_and_notify(
+                token, make_snap(), now,
             )
 
-        assert count == 1
         assert shared_snapshot.is_fresh(token.mint_address, now) is True
-        assert s1_queue.qsize() == 1
 
         result = await session.execute(
             select(TokenSnapshot).where(TokenSnapshot.token_id == token.id)
@@ -138,27 +131,31 @@ class TestWriteSnapshotAndNotify:
         assert len(result.scalars().all()) == 1
 
     @pytest.mark.asyncio
-    async def test_observing_token_gets_no_s1_event(self, session):
+    async def test_writes_snapshot_for_observing_token_too(self, session):
+        """OBSERVING tokens still get a real snapshot written (they're the
+        confluence_entry_v1 control group) — only the removed S1Wave queue
+        push used to distinguish OBSERVING from WATCHING here."""
         token = make_token(status=TokenStatus.OBSERVING)
         session.add(token)
         await session.flush()
 
-        s1_queue = asyncio.Queue()
         with patch("workers.shared_snapshot.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
             await shared_snapshot.write_snapshot_and_notify(
                 token, make_snap(), datetime.now(timezone.utc),
-                is_observing=True, s1_queue=s1_queue,
             )
 
-        assert s1_queue.qsize() == 0
+        result = await session.execute(
+            select(TokenSnapshot).where(TokenSnapshot.token_id == token.id)
+        )
+        assert len(result.scalars().all()) == 1
 
     @pytest.mark.asyncio
-    async def test_counter_continues_across_calls_regardless_of_caller(self, session):
-        """The whole point of a SHARED counter: two calls for the same mint
-        (as if one came from discovery, one from sampling) must produce
-        sequential numbers, not both starting at 1."""
+    async def test_repeated_calls_for_same_mint_each_write_a_row(self, session):
+        """Two calls for the same mint (as if one came from discovery, one
+        from sampling) each produce their own TokenSnapshot row — no shared
+        counter to keep in sync between them anymore."""
         token = make_token()
         session.add(token)
         await session.flush()
@@ -166,14 +163,17 @@ class TestWriteSnapshotAndNotify:
         with patch("workers.shared_snapshot.get_session") as mock_gs:
             mock_gs.return_value.__aenter__ = AsyncMock(return_value=session)
             mock_gs.return_value.__aexit__ = AsyncMock(return_value=False)
-            c1 = await shared_snapshot.write_snapshot_and_notify(
-                token, make_snap(), datetime.now(timezone.utc), False, None,
+            await shared_snapshot.write_snapshot_and_notify(
+                token, make_snap(), datetime.now(timezone.utc),
             )
-            c2 = await shared_snapshot.write_snapshot_and_notify(
-                token, make_snap(), datetime.now(timezone.utc), False, None,
+            await shared_snapshot.write_snapshot_and_notify(
+                token, make_snap(), datetime.now(timezone.utc),
             )
 
-        assert (c1, c2) == (1, 2)
+        result = await session.execute(
+            select(TokenSnapshot).where(TokenSnapshot.token_id == token.id)
+        )
+        assert len(result.scalars().all()) == 2
 
 
 # ── 3: DiscoveryWorker only covers WATCHING/OBSERVING known mints ─────────
@@ -269,14 +269,14 @@ class TestDiscoveryCoversKnownTokens:
         seen_fresh_counts = []
         real_write = shared_snapshot.write_snapshot_and_notify
 
-        async def spying_write(db_token, snap, now, is_observing, s1_queue):
+        async def spying_write(db_token, snap, now):
             # Snapshot how many of the 3 mints are fresh RIGHT NOW, before
             # this particular mint's own write has even started — a
             # concurrently-running sampling tick would see this same view.
             seen_fresh_counts.append(
                 sum(shared_snapshot.is_fresh(t.mint_address, now) for t in tokens)
             )
-            return await real_write(db_token, snap, now, is_observing, s1_queue)
+            return await real_write(db_token, snap, now)
 
         with patch("workers.discovery_worker.get_session") as mock_gs, \
              patch("workers.shared_snapshot.get_session") as mock_gs2, \
@@ -311,7 +311,7 @@ class TestSamplingSkipsFreshMints:
         # discovery already covered fresh_token moments ago
         shared_snapshot._covered_at[fresh_token.mint_address] = datetime.now(timezone.utc)
 
-        worker = SamplingWorker(asyncio.Queue(), asyncio.Event())
+        worker = SamplingWorker(asyncio.Event())
         worker._fetch_batch = AsyncMock(side_effect=lambda client, chunk: {
             m: {
                 "price_usd": Decimal("0.001"), "liquidity_usd": Decimal("20000"),

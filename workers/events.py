@@ -36,25 +36,3 @@ class MarketEvent:
     price_change_1m: float
     price_change_5m: float
     sampled_at:      datetime
-
-
-@dataclass(frozen=True)
-class SnapshotEvent:
-    """
-    Signals that a snapshot has been written for a token.
-
-    Produced by: SamplingWorker (after every snapshot write)
-    Consumed by: S1WaveWorker
-
-    snapshot_number is 1-indexed. S1WaveWorker only acts on snapshot_number == 1.
-    All subsequent snapshots are passed through but ignored by S1WaveWorker.
-    """
-    mint:             str
-    symbol:           str | None
-    snapshot_number:  int        # 1 = first snapshot ever for this token
-    price_usd:        Decimal
-    buy_pressure:     Decimal
-    price_change_1m:  float
-    price_change_5m:  float
-    liquidity_usd:    Decimal
-    sampled_at:       datetime

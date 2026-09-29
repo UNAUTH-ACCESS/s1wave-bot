@@ -19,18 +19,19 @@ lets discovery's poll double as a snapshot source for young WATCHING/
 OBSERVING tokens, and lets sampling skip its own fetch for anything
 discovery already covered recently.
 
-Two pieces of shared state, both mint-keyed:
-  1. snapshot_counts — the per-mint sequence number SnapshotEvent carries
-     for S1WaveWorker. Must be ONE shared counter: if discovery and
-     sampling each kept their own counter, S1WaveWorker could see a
-     repeated or wrong snapshot_number depending on which source fired
-     more recently.
-  2. covered_at — timestamp of the last snapshot written for a mint,
-     regardless of source. SamplingWorker checks is_fresh() before
-     spending an API call: a mint discovery covered inside
-     FRESHNESS_WINDOW_SECONDS is skipped for that sampling cycle.
+Shared state, mint-keyed: covered_at — timestamp of the last snapshot
+written for a mint, regardless of source. SamplingWorker checks is_fresh()
+before spending an API call: a mint discovery covered inside
+FRESHNESS_WINDOW_SECONDS is skipped for that sampling cycle.
 
-Single process, single asyncio event loop — plain dicts, no lock needed.
+Single process, single asyncio event loop — a plain dict, no lock needed.
+
+(A second piece of shared state used to live here too — a per-mint
+snapshot counter feeding a SnapshotEvent queue for "S1WaveWorker," a
+scoring engine removed on 2026-09-23 along with the rest of that
+scorer/S1Wave pipeline. Nothing wired a queue into DiscoveryWorker or
+SamplingWorker after that removal, so the push was silent dead code —
+removed here on 2026-09-29 rather than left as unreachable scaffolding.)
 
 The trade-off this accepts (explicitly, per user confirmation): a young
 token (<30min old) that discovery covers gets its price refreshed on
@@ -52,7 +53,6 @@ from config.logging import get_logger
 from database.engine import get_session
 from models.orm import Token, TokenSnapshot
 from workers import momentum_signal
-from workers.events import SnapshotEvent
 
 log = get_logger(__name__)
 
@@ -62,13 +62,7 @@ log = get_logger(__name__)
 # aged out of discovery's 30-minute window.
 FRESHNESS_WINDOW_SECONDS = 55
 
-_snapshot_counts: dict[str, int] = {}
 _covered_at: dict[str, datetime] = {}
-
-
-def anchor_count(mint: str, count: int) -> None:
-    """Seed the shared counter from DB truth (called once at sampling startup)."""
-    _snapshot_counts[mint] = count
 
 
 def mark_covered_batch(mints: list[str], now: datetime) -> None:
@@ -95,7 +89,6 @@ def mark_covered_batch(mints: list[str], now: datetime) -> None:
 def forget(mint: str) -> None:
     """Called when a token leaves WATCHING/OBSERVING (aged out, entered, rejected)
     so stale state can't linger."""
-    _snapshot_counts.pop(mint, None)
     _covered_at.pop(mint, None)
 
 
@@ -108,15 +101,17 @@ async def write_snapshot_and_notify(
     token: Token,
     snap: dict,
     now: datetime,
-    is_observing: bool,
-    s1_queue,
-) -> int:
+) -> None:
     """
-    Write a TokenSnapshot row, bump the shared per-mint counter, mark the
-    mint as freshly covered, and push a SnapshotEvent to S1Wave (unless
-    OBSERVING — same rule sampling_worker always applied: OBSERVING tokens
-    were already rejected upstream, so there's no entry decision left to
-    make on them). Returns the new snapshot count.
+    Write a TokenSnapshot row, mark the mint as freshly covered, and hand
+    the same snapshot to momentum_signal.maybe_record_signal() — THE real
+    production entry trigger (2026-09-29 correction to the comment this
+    function used to carry): when >=2 of the 4 confluence rules co-fire,
+    that call writes a MomentumSignalEvent row, and confluence_live_worker
+    polls exactly those rows (n_rules_cofiring >= MIN_RULES_COFIRING) to
+    decide real trade entries — confluence_shadow_worker's paper-trade
+    benchmark reads the identical events. This is not an analysis-only
+    side channel; every real trade traces back to a snapshot written here.
     """
     volume_usd = snap["volume_usd"]
     liquidity_usd = snap["liquidity_usd"]
@@ -143,30 +138,12 @@ async def write_snapshot_and_notify(
             volume_mult=snap["volume_mult"],
         ))
 
-    count = _snapshot_counts.get(token.mint_address, 0) + 1
-    _snapshot_counts[token.mint_address] = count
     _covered_at[token.mint_address] = now
 
-    # Forward-tracking research experiment (analysis-only, never read by
-    # any production decision path) — see workers/momentum_signal.py.
-    # Wrapped defensively: a bug in an experimental observation layer
-    # must never break a real snapshot write.
+    # Wrapped defensively: a bug in signal recording must never break a
+    # real snapshot write — the snapshot itself (already committed above)
+    # is the thing every other worker depends on existing.
     try:
         await momentum_signal.maybe_record_signal(token, snap, now)
     except Exception as exc:
         log.warning("momentum_signal.record_error", mint=token.mint_address, error=str(exc))
-
-    if s1_queue is not None and not is_observing:
-        await s1_queue.put(SnapshotEvent(
-            mint=token.mint_address,
-            symbol=token.symbol,
-            snapshot_number=count,
-            price_usd=snap["price_usd"],
-            buy_pressure=snap["buy_pressure"],
-            price_change_1m=snap["price_change_1m"],
-            price_change_5m=snap["price_change_5m"],
-            liquidity_usd=snap["liquidity_usd"],
-            sampled_at=now,
-        ))
-
-    return count

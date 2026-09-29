@@ -3,14 +3,14 @@ workers/sampling_worker.py
 ==========================
 Sampling worker — SolanaTracker POST /tokens/multi
 
-Fires every SAMPLE_INTERVAL_SECONDS (default 60s). For each WATCHING token,
-fetches a fresh snapshot from SolanaTracker via a single batch call, writes
-a TokenSnapshot row, and signals the scoring worker.
-
-Price momentum signals from ST events replace the old volume_mult/baseline
-approach. The scorer still uses the same SnapshotWindow structure but now
-vm_p1/p2/p3 carry price_change_5m values across the rolling window, which
-is a more direct momentum signal than volume relative to an arbitrary baseline.
+Fires every SAMPLE_INTERVAL_SECONDS (default 60s). For each WATCHING/
+OBSERVING token, fetches a fresh snapshot from SolanaTracker via a single
+batch call, writes a TokenSnapshot row, and hands the snapshot to
+workers/momentum_signal.py — THE real entry trigger for both live and
+shadow trading (2026-09-29: this used to describe "the scoring worker," a
+system removed 2026-09-23; see workers/shared_snapshot.py's
+write_snapshot_and_notify() docstring for the current, accurate chain from
+here to a real trade).
 
 Request budget: 1 call per sampling cycle regardless of token count (batch),
 minus whatever DiscoveryWorker already covered — see below.
@@ -25,7 +25,7 @@ any mint workers.shared_snapshot.is_fresh() says was covered in the last
 FRESHNESS_WINDOW_SECONDS (~55s). Age-out logic still runs unconditionally
 for every WATCHING/OBSERVING token regardless of coverage source — only the
 fetch+write is skipped. See workers/shared_snapshot.py for the shared
-counter/freshness state and the write path both workers now call.
+freshness state and the write path both workers now call.
 
 Logging contract
 ----------------
@@ -57,7 +57,7 @@ from sqlalchemy import select
 from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
-from models.orm import Token, TokenSnapshot, TokenStatus, ShadowTrade
+from models.orm import Token, TokenStatus, ShadowTrade
 from workers import shared_snapshot
 from workers.http_queue import get_http_queue
 
@@ -83,25 +83,16 @@ class SamplingWorker:
     def __init__(
         self,
         shutdown_event: asyncio.Event,
-        s1_queue: asyncio.Queue | None = None,
     ) -> None:
         self._shutdown      = shutdown_event
-        self._s1_queue      = s1_queue
         self._interval      = settings.SAMPLE_INTERVAL_SECONDS
-        # Per-mint snapshot sequence numbers and "last covered at" timestamps
-        # now live in workers.shared_snapshot, shared with DiscoveryWorker —
-        # see that module's docstring for why a single shared counter is
-        # required once two pollers can both write a snapshot for the same
+        # "Last covered at" timestamps live in workers.shared_snapshot,
+        # shared with DiscoveryWorker — see that module's docstring for why
+        # a shared dict is needed once two pollers can both cover the same
         # mint.
 
     async def run(self) -> None:
         log.info("sampling_worker.started", interval=self._interval)
-
-        # Anchor snapshot counts to DB before first cycle.
-        # Any token already in WATCHING state with existing snapshots gets
-        # its real count here — prevents S1 from firing on snapshot N as if
-        # it were snapshot 1 after a restart.
-        await self._load_snapshot_counts_from_db()
 
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             while not self._shutdown.is_set():
@@ -120,35 +111,6 @@ class SamplingWorker:
                     pass
 
         log.info("sampling_worker.stopped")
-
-    async def _load_snapshot_counts_from_db(self) -> None:
-        """
-        Load real snapshot counts for all current WATCHING tokens from DB.
-        Called once at startup. Anchors the in-memory counter to DB truth
-        so a restart never causes S1WaveWorker to misfire on an old token.
-        """
-        from sqlalchemy import func as sa_func
-        async with get_session() as session:
-            # Get all WATCHING tokens with their snapshot counts
-            result = await session.execute(
-                select(
-                    Token.mint_address,
-                    sa_func.count(TokenSnapshot.id).label("snap_count"),
-                )
-                .join(TokenSnapshot, TokenSnapshot.token_id == Token.id, isouter=True)
-                .where(Token.status == TokenStatus.WATCHING)
-                .group_by(Token.mint_address)
-            )
-            rows = result.all()
-
-        for mint, count in rows:
-            shared_snapshot.anchor_count(mint, count)
-
-        log.info(
-            "sampling_worker.counts_anchored",
-            tokens=len(rows),
-            detail={mint: count for mint, count in rows} if rows else {},
-        )
 
     async def _sample_cycle(self, client: httpx.AsyncClient) -> None:
         watching = await self._load_watching_tokens()
@@ -235,8 +197,7 @@ class SamplingWorker:
                     continue
 
             if token.mint_address in covered_mints:
-                # Discovery's own poll already wrote a fresh snapshot (and
-                # bumped the shared counter / pushed the SnapshotEvent) for
+                # Discovery's own poll already wrote a fresh snapshot for
                 # this mint this cycle — age-out above still ran, but there
                 # is nothing left for sampling to fetch or write.
                 covered += 1
@@ -270,7 +231,7 @@ class SamplingWorker:
 
             try:
                 await shared_snapshot.write_snapshot_and_notify(
-                    token, snap_data, now, is_observing, self._s1_queue,
+                    token, snap_data, now,
                 )
                 sampled += 1
 

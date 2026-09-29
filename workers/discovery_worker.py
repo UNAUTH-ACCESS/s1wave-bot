@@ -139,11 +139,9 @@ class DiscoveryWorker:
         self,
         filter_queue: asyncio.Queue,
         shutdown_event: asyncio.Event,
-        s1_queue: asyncio.Queue | None = None,
     ) -> None:
         self._queue    = filter_queue
         self._shutdown = shutdown_event
-        self._s1_queue = s1_queue          # for covering known WATCHING tokens — see _cover_known_tokens
         self._promoted: set[str] = set()   # mints already forwarded downstream
 
         # Own rate-limited queue and own API key — isolated from sampling's
@@ -329,9 +327,8 @@ class DiscoveryWorker:
                 "price_change_1m": parsed["price_change_1m"],
                 "price_change_5m": price_5m,
             }
-            is_observing = db_token.status == TokenStatus.OBSERVING
             await shared_snapshot.write_snapshot_and_notify(
-                db_token, snap, now, is_observing, self._s1_queue,
+                db_token, snap, now,
             )
             covered += 1
             log.info(
