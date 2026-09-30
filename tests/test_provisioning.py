@@ -19,16 +19,20 @@ import pytest
 
 from engine.provisioning import (
     REPO_DIR,
+    TRADING_PARAMS,
     ProvisioningError,
     add_nginx_route,
     create_account,
     env_path_for,
     generate_dashboard_credentials,
     get_solana_tracker_keys,
+    get_trading_params,
     public_url_for,
     service_name_for,
     update_dashboard_credentials,
     update_solana_tracker_keys,
+    update_trading_params,
+    validate_trading_param,
 )
 
 
@@ -325,3 +329,110 @@ async def test_add_nginx_route_validation_failure_leaves_live_file_untouched(fak
 
     assert fake_nginx_conf.read_text() == original
     run_mock.assert_awaited_once()  # never reached the deploy step
+
+
+def test_validate_trading_param_accepts_valid_float_in_range():
+    assert validate_trading_param("CONFLUENCE_LIVE_EXPOSURE_PCT", "0.2") == "0.2"
+
+
+def test_validate_trading_param_rejects_out_of_range_float():
+    with pytest.raises(ProvisioningError, match="at most"):
+        validate_trading_param("CONFLUENCE_LIVE_EXPOSURE_PCT", "1.5")
+    with pytest.raises(ProvisioningError, match="at least"):
+        validate_trading_param("CONFLUENCE_LIVE_EXPOSURE_PCT", "0")
+
+
+def test_validate_trading_param_rejects_non_numeric():
+    with pytest.raises(ProvisioningError, match="not a valid number"):
+        validate_trading_param("CB_LOSS_COUNT", "three")
+
+
+def test_validate_trading_param_normalizes_bool():
+    assert validate_trading_param("CONFLUENCE_LIVE_ENABLED", "true") == "True"
+    assert validate_trading_param("CONFLUENCE_LIVE_ENABLED", "FALSE") == "False"
+    with pytest.raises(ProvisioningError, match="must be True or False"):
+        validate_trading_param("CONFLUENCE_LIVE_ENABLED", "yes")
+
+
+def test_validate_trading_param_rejects_unknown_key():
+    with pytest.raises(ProvisioningError, match="Unknown"):
+        validate_trading_param("NOT_A_REAL_PARAM", "1")
+
+
+def test_get_trading_params_missing_env_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: tmp_path / ".env.nope")
+    with pytest.raises(ProvisioningError, match="No .env file"):
+        get_trading_params("nope")
+
+
+def test_get_trading_params_falls_back_to_documented_defaults(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("OTHER_VAR=unrelated\n")  # none of the tunables set
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+
+    params = get_trading_params("second")
+
+    for key, spec in TRADING_PARAMS.items():
+        assert params[key] == spec["default"]
+
+
+def test_get_trading_params_reads_overridden_values(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("CONFLUENCE_LIVE_EXPOSURE_PCT=0.2\nCB_LOSS_COUNT=5\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+
+    params = get_trading_params("second")
+
+    assert params["CONFLUENCE_LIVE_EXPOSURE_PCT"] == "0.2"
+    assert params["CB_LOSS_COUNT"] == "5"
+    assert params["CONFLUENCE_LIVE_MAX_CONCURRENT"] == TRADING_PARAMS["CONFLUENCE_LIVE_MAX_CONCURRENT"]["default"]
+
+
+@pytest.mark.asyncio
+async def test_update_trading_params_rejects_unknown_key(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("OTHER_VAR=unrelated\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    with pytest.raises(ProvisioningError, match="Unknown trading parameter"):
+        await update_trading_params("second", {"NOT_A_REAL_PARAM": "1"})
+
+
+@pytest.mark.asyncio
+async def test_update_trading_params_missing_env_file_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: tmp_path / ".env.nope")
+    with pytest.raises(ProvisioningError, match="No .env file"):
+        await update_trading_params("nope", {"CB_LOSS_COUNT": "5"})
+
+
+@pytest.mark.asyncio
+async def test_update_trading_params_replaces_existing_line(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("OTHER_VAR=unrelated\nCONFLUENCE_LIVE_EXPOSURE_PCT=0.5\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    run_mock = AsyncMock(return_value="")
+    monkeypatch.setattr("engine.provisioning._run", run_mock)
+
+    await update_trading_params("second", {"CONFLUENCE_LIVE_EXPOSURE_PCT": "0.2"})
+
+    rewritten = env_file.read_text()
+    assert "CONFLUENCE_LIVE_EXPOSURE_PCT=0.2" in rewritten
+    assert "OTHER_VAR=unrelated" in rewritten
+    assert rewritten.count("CONFLUENCE_LIVE_EXPOSURE_PCT=") == 1
+    run_mock.assert_awaited_once_with("systemctl", "--user", "restart", "s1wave-bot-second.service")
+
+
+@pytest.mark.asyncio
+async def test_update_trading_params_appends_key_not_previously_in_env(monkeypatch, tmp_path):
+    """Real scenario (2026-09-30): none of these keys had ever been written
+    to .env before this feature existed — they were pure code defaults."""
+    env_file = tmp_path / ".env.second"
+    env_file.write_text("OTHER_VAR=unrelated\n")
+    monkeypatch.setattr("engine.provisioning.env_path_for", lambda name: env_file)
+    monkeypatch.setattr("engine.provisioning._run", AsyncMock(return_value=""))
+
+    await update_trading_params("second", {"CB_LOSS_COUNT": "5", "CB_PAUSE_MINUTES": "30"})
+
+    rewritten = env_file.read_text()
+    assert "CB_LOSS_COUNT=5" in rewritten
+    assert "CB_PAUSE_MINUTES=30" in rewritten
+    assert "OTHER_VAR=unrelated" in rewritten

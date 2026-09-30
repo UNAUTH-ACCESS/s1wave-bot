@@ -199,6 +199,149 @@ async def add_nginx_route(name: str, port: int) -> None:
     await _run("docker", "compose", "up", "-d", "--force-recreate", "nginx", cwd=_QUANTEDGE_DIR)
 
 
+# Tunable live-trading risk parameters (2026-09-30) — every one of these is
+# a real config/settings.py field, so editing it here + restarting the
+# account's service is the exact same effect as hand-editing .env and
+# restarting, just through the web app instead of a terminal. Deliberately
+# scoped to risk/exposure controls, NOT the research-backed entry-filter
+# thresholds in workers/entry_filters.py (buy_pressure floor, liquidity
+# ceiling) — those came from real backtested data and shouldn't be casually
+# nudged from a form; these are the knobs a human is expected to turn
+# themselves as circumstances change (capital size, risk tolerance, an
+# ongoing bad stretch). "default" below must be kept in sync with
+# config/settings.py by hand — there is no single source of truth shared
+# between a Pydantic field default and a plain dict literal.
+TRADING_PARAMS: dict[str, dict] = {
+    "CONFLUENCE_LIVE_ENABLED": {
+        "label": "Live trading enabled (kill switch)",
+        "type": "bool", "default": "True",
+        "help": "OFF stops all NEW entries immediately. Existing open positions are still "
+                "monitored and can still exit normally — this never abandons a position.",
+    },
+    "CONFLUENCE_LIVE_EXPOSURE_PCT": {
+        "label": "Exposure — % of equity at risk across ALL open positions",
+        "type": "float", "min": 0.01, "max": 1.0, "default": "0.5",
+        "help": "0.20 means at most 20% of your wallet balance can be tied up in open positions "
+                "at once, split across your concurrent slots below. Lower = smaller bets per trade, "
+                "survives a losing stretch longer. Raise this as capital grows if you want to.",
+    },
+    "CONFLUENCE_LIVE_MAX_POSITION_USD": {
+        "label": "Max position size — hard USD cap per trade",
+        "type": "float", "min": 0.01, "default": "50.0",
+        "help": "No single trade will ever exceed this dollar amount, no matter how big the "
+                "wallet gets. This is the ceiling; exposure % above is usually the binding limit "
+                "while capital is small.",
+    },
+    "CONFLUENCE_LIVE_MAX_CONCURRENT": {
+        "label": "Max concurrent open positions",
+        "type": "int", "min": 1, "default": "5",
+        "help": "How many trades can be open at the same time. Lower also limits how many "
+                "trades a single correlated burst of bad signals could open before anything "
+                "else (the circuit breaker, a human) can react.",
+    },
+    "CONFLUENCE_LIVE_DAILY_LOSS_LIMIT_PCT": {
+        "label": "Daily loss limit — % of today's starting equity",
+        "type": "float", "min": 0.01, "max": 1.0, "default": "0.5",
+        "help": "If today's realized losses reach this fraction of what the wallet started the "
+                "day with, live entries halt until UTC midnight.",
+    },
+    "CB_LOSS_COUNT": {
+        "label": "Circuit breaker — losses in a row before pausing",
+        "type": "int", "min": 1, "default": "3",
+        "help": "After this many LOSSES in a row (any win resets the count to 0), live entries "
+                "pause automatically. See CLAUDE.md's 2026-09-30 entry for the incident that made this real.",
+    },
+    "CB_PAUSE_MINUTES": {
+        "label": "Circuit breaker — pause duration (minutes)",
+        "type": "int", "min": 1, "default": "60",
+        "help": "How long entries stay paused after the circuit breaker trips, before "
+                "automatically resuming on their own.",
+    },
+}
+
+
+def get_trading_params(name: str) -> dict[str, str]:
+    """Current value of every TRADING_PARAMS key for one account — straight
+    from its .env where set, falling back to the documented default (NOT
+    to this process's own settings object, which reflects the CONTROL
+    PANEL's own .env, not necessarily this account's)."""
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+    current = {key: spec["default"] for key, spec in TRADING_PARAMS.items()}
+    for line in env_path.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key in TRADING_PARAMS:
+            current[key] = value
+    return current
+
+
+def validate_trading_param(key: str, raw_value: str) -> str:
+    """Coerce+bounds-check one raw form value against TRADING_PARAMS,
+    returning the normalized string to actually write to .env. Raises
+    ProvisioningError with a message safe to show directly in the form on
+    anything invalid — never writes a value that would fail Pydantic
+    validation on the next restart and crash the account's process."""
+    spec = TRADING_PARAMS.get(key)
+    if spec is None:
+        raise ProvisioningError(f"Unknown trading parameter: {key}")
+
+    if spec["type"] == "bool":
+        normalized = raw_value.strip().lower()
+        if normalized not in ("true", "false"):
+            raise ProvisioningError(f"{spec['label']}: must be True or False.")
+        return "True" if normalized == "true" else "False"
+
+    try:
+        num = float(raw_value) if spec["type"] == "float" else int(raw_value)
+    except (TypeError, ValueError):
+        raise ProvisioningError(f"{spec['label']}: '{raw_value}' is not a valid number.")
+
+    if "min" in spec and num < spec["min"]:
+        raise ProvisioningError(f"{spec['label']}: must be at least {spec['min']}.")
+    if "max" in spec and num > spec["max"]:
+        raise ProvisioningError(f"{spec['label']}: must be at most {spec['max']}.")
+
+    return str(num)
+
+
+async def update_trading_params(name: str, updates: dict[str, str]) -> None:
+    """
+    Rewrites one or more TRADING_PARAMS keys in an account's .env and
+    restarts its service — same per-account, never-touches-another-account
+    pattern as update_solana_tracker_keys()/update_dashboard_credentials().
+    Unlike those, these keys may not already be PRESENT in an existing
+    .env (they've always been pure code defaults until now), so this is an
+    upsert: replace the line if found, otherwise append a new one under a
+    clearly labeled block.
+    """
+    unknown = set(updates) - set(TRADING_PARAMS)
+    if unknown:
+        raise ProvisioningError(f"Unknown trading parameter(s): {', '.join(sorted(unknown))}")
+
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+
+    remaining = dict(updates)
+    lines = env_path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        key = line.partition("=")[0]
+        if key in remaining:
+            lines[i] = f"{key}={remaining.pop(key)}"
+    if remaining:
+        lines.append("")
+        lines.append("# ── Trading parameters (added by the control panel) ────────────────────────")
+        for key, value in remaining.items():
+            lines.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+    await _run("systemctl", "--user", "restart", service_name_for(name))
+
+
 def get_solana_tracker_keys(name: str) -> dict[str, str]:
     """Current SOLANA_TRACKER_API_KEY / _DISCOVERY values for an account,
     straight from its .env — shown prefilled in the control panel's edit

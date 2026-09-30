@@ -29,7 +29,7 @@ block (passes the full path through unchanged, no prefix-stripping).
 from __future__ import annotations
 
 import bcrypt
-from fastapi import APIRouter, FastAPI, Form, Request
+from fastapi import APIRouter, FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, select
 from starlette.middleware.sessions import SessionMiddleware
@@ -39,13 +39,17 @@ from config.settings import settings
 from control_panel.models import Base, ControlAccount, ControlUser
 from database.engine import get_engine, get_session
 from engine.provisioning import (
+    TRADING_PARAMS,
     ProvisioningError,
     create_account,
     generate_dashboard_credentials,
     get_solana_tracker_keys,
+    get_trading_params,
     public_url_for,
     update_dashboard_credentials,
     update_solana_tracker_keys,
+    update_trading_params,
+    validate_trading_param,
 )
 
 log = get_logger(__name__)
@@ -251,8 +255,112 @@ async def homepage(request: Request):
             <a href="{PREFIX}/logout">Log out ({user})</a>
         </div>
         <div class="card">{rows}</div>
-        <a class="btn" href="{PREFIX}/accounts/new">+ New Account</a>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <a class="btn" href="{PREFIX}/accounts/new">+ New Account</a>
+            <a class="btn btn-secondary" href="{PREFIX}/playbook">📘 Playbook — what to do when...</a>
+        </div>
     """))
+
+
+@router.get("/playbook", response_class=HTMLResponse)
+async def playbook(request: Request):
+    """
+    Plain-language operator runbook (2026-09-30) — built the day the
+    user's Claude subscription was about to lapse and they'd be running
+    this alone. Written FOR THE HUMAN OPERATOR, not for an AI picking up
+    the codebase — CLAUDE.md's "Resuming after a blind period" section
+    already covers that audience. This is the one page that should never
+    assume a terminal, SSH access, or reading source code is available.
+    """
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    def section(title, body):
+        return f'<div class="card"><div class="sub" style="margin-bottom:8px;font-size:15px;color:var(--bright)">{title}</div>{body}</div>'
+
+    body = f"""
+        <div class="topbar">
+            <h1 style="margin:0">Playbook</h1>
+            <a href="{PREFIX}/">&larr; All accounts</a>
+        </div>
+        <div class="sub">What to actually do, in plain terms, for the situations that come up.
+        Every action below is a page in this app — nothing here needs a terminal.</div>
+
+        {section("No new trades happening / bot seems idle", '''
+            <p>Open the account's own dashboard (Manage → the link near the top) and check the live feed.
+            The single most common cause: <b>the SolanaTracker sampling key ran out</b> — these are
+            free-tier keys with a lifetime cap, not a daily one, and once it's spent it's spent for good.</p>
+            <p><b>Fix:</b> get a fresh key from <a href="https://solanatracker.io" target="_blank">solanatracker.io</a>
+            (sign up, generate an API key), then go to Manage → SolanaTracker keys → paste it into the
+            <i>Sampling key</i> field → Save. The account restarts automatically and should start seeing
+            real data again within a minute — you'll know it worked when Telegram goes quiet on errors and
+            you start seeing normal activity again.</p>
+            <p>Discovery uses a SEPARATE key from sampling — if only ONE of the two is dead, replace just
+            that one field and leave the other alone.</p>
+        ''')}
+
+        {section("You got a 'circuit breaker tripped' Telegram alert", '''
+            <p>This means 3 real trades lost money in a row, and the bot has automatically PAUSED new
+            entries for 60 minutes (both numbers are adjustable — see below). This is a safety feature
+            working correctly, not an error.</p>
+            <p><b>Do nothing</b> and it resumes automatically once the cooldown passes (you'll get a
+            "circuit breaker resumed" alert). If you want to investigate first, use the Playbook section
+            below on checking recent trades, or just leave it — the pause itself is the protection.</p>
+            <p>If this is happening too often or not often enough, go to Manage → Trading parameters and
+            adjust <i>"losses in a row before pausing"</i> or <i>"pause duration"</i>.</p>
+        ''')}
+
+        {section("You want to reduce or increase exposure", '''
+            <p>Go to the account's Manage page → <b>Trading parameters</b>. The two numbers that matter most:</p>
+            <ul style="margin:8px 0;padding-left:20px;color:var(--text)">
+                <li><b>Exposure %</b> — the fraction of your wallet balance that can be tied up in open
+                positions at once. Lower = smaller bets, survives a bad stretch longer. This is usually
+                the number to change first.</li>
+                <li><b>Max concurrent positions</b> — how many trades can be open simultaneously. Lower
+                also limits how much damage a single burst of correlated bad signals can do before you
+                or the circuit breaker can react.</li>
+            </ul>
+            <p>As capital grows, raise <i>Max position size (USD)</i> too — that's a hard ceiling per
+            trade that doesn't move with exposure %.</p>
+            <p>Every change here restarts the account — takes a few seconds, doesn't touch open positions.</p>
+        ''')}
+
+        {section("You need to stop everything RIGHT NOW", '''
+            <p>Manage → Trading parameters → <b>"Live trading enabled"</b> → set to <b>False</b> → Save.
+            This stops all NEW entries immediately. Anything already open keeps being monitored and can
+            still exit normally (stop-loss, take-profit, etc.) — this never abandons a position with money
+            on the line.</p>
+            <p>The account's own dashboard also has a Pause/Resume toggle that does the same thing, if
+            you're already looking at it.</p>
+        ''')}
+
+        {section("You want to take profit out / withdraw", '''
+            <p>Go to the account's OWN dashboard (not this panel) → the "Withdraw funds" card near the
+            bottom. Enter an amount and a destination address. <b>This is real, on-chain, and
+            irreversible</b> — double-check the address before confirming, there is no undo.</p>
+        ''')}
+
+        {section("Understanding what you'll see on Telegram", '''
+            <p>You get a push for: entries and exits on every real trade, a permanent halt, a token marked
+            unsellable, a critical sell failure, a daily loss limit hit, a withdrawal going out, a filter
+            calibration warning, and (as of today) circuit breaker trips/resumes. Everything else stays
+            in-app only (visible on the dashboard) to avoid flooding your phone.</p>
+        ''')}
+
+        {section("Setting up a new account", '''
+            <p>Homepage → <b>+ New Account</b>. Comes up paused and unfunded on purpose — fund the wallet
+            address it gives you, add its own SolanaTracker keys (Manage page), then flip
+            "Live trading enabled" to True when you're ready. Every account is fully isolated: its own
+            database, wallet, keys, and dashboard login — nothing you do to one touches another.</p>
+        ''')}
+
+        {section("Checking on things without this panel", '''
+            <p>Each account's own dashboard (linked from its Manage page) shows live status, open positions,
+            trade history, and P&amp;L directly — Basic Auth protected, credentials visible on that
+            account's Manage page here if you've forgotten them.</p>
+        ''')}
+    """
+    return HTMLResponse(_layout("Playbook", body))
 
 
 @router.get("/accounts/new", response_class=HTMLResponse)
@@ -287,8 +395,33 @@ async def new_account_submit(request: Request, name: str = Form(...)):
     return RedirectResponse(PREFIX + "/", status_code=303)
 
 
+def _trading_param_field(key: str, spec: dict, value: str) -> str:
+    if spec["type"] == "bool":
+        checked_true = "selected" if value.strip().lower() == "true" else ""
+        checked_false = "selected" if value.strip().lower() == "false" else ""
+        input_html = (f'<select name="{key}">'
+                      f'<option value="True" {checked_true}>True (armed)</option>'
+                      f'<option value="False" {checked_false}>False (paused)</option>'
+                      f'</select>')
+    else:
+        step = "any" if spec["type"] == "float" else "1"
+        bounds = ""
+        if "min" in spec:
+            bounds += f' min="{spec["min"]}"'
+        if "max" in spec:
+            bounds += f' max="{spec["max"]}"'
+        input_html = f'<input type="number" step="{step}" name="{key}" value="{value}"{bounds}>'
+    return f"""
+        <label>{spec['label']}</label>
+        {input_html}
+        <div class="account-meta" style="margin-top:4px">{spec['help']}</div>"""
+
+
 @router.get("/accounts/{name}", response_class=HTMLResponse)
-async def manage_account(request: Request, name: str, saved: str | None = None, error: str | None = None):
+async def manage_account(
+    request: Request, name: str, saved: str | None = None, error: str | None = None,
+    for_: str | None = Query(default=None, alias="for"),
+):
     """
     Per-account management page (2026-09-29) — identity + config, no
     balance/financial data (that stays on the account's OWN dashboard,
@@ -312,11 +445,17 @@ async def manage_account(request: Request, name: str, saved: str | None = None, 
         keys = get_solana_tracker_keys(name)
     except ProvisioningError:
         keys = {"sampling": "", "discovery": ""}
+    try:
+        trading_params = get_trading_params(name)
+    except ProvisioningError:
+        trading_params = {key: spec["default"] for key, spec in TRADING_PARAMS.items()}
 
     saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new keys.</div>' if saved == "keys" else ""
     creds_saved_html = ('<div class="sub" style="color:var(--accent)">Password regenerated — the account restarted. '
                          'Copy it now, it won\'t be shown differently again.</div>') if saved == "creds" else ""
-    error_html = f'<div class="error">{error}</div>' if error else ""
+    params_saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new parameters.</div>' if saved == "params" else ""
+    error_html = f'<div class="error">{error}</div>' if error and for_ != "params" else ""
+    params_error_html = f'<div class="error">{error}</div>' if error and for_ == "params" else ""
     public_url = _dashboard_link_for(acct)
     dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
                        else "no public dashboard yet — reachable on its own port on this server")
@@ -347,6 +486,17 @@ async def manage_account(request: Request, name: str, saved: str | None = None, 
             {creds_saved_html}
         </div>
         <div class="card">
+            <div class="sub" style="margin-bottom:0">Trading parameters</div>
+            <div class="account-meta">Tune this account's own risk/exposure controls directly — no
+            server access needed. Saving restarts this account's service to apply them.</div>
+            <form method="post" action="{PREFIX}/accounts/{name}/trading-params">
+                {"".join(_trading_param_field(k, spec, trading_params[k]) for k, spec in TRADING_PARAMS.items())}
+                <button type="submit" style="margin-top:18px">Save &amp; restart account</button>
+                {params_saved_html}
+                {params_error_html}
+            </form>
+        </div>
+        <div class="card">
             <div class="sub" style="margin-bottom:0">SolanaTracker keys</div>
             <div class="account-meta">Add or replace this account's own discovery/sampling keys.
             Saving restarts this account's service to apply them — doesn't touch any other account.</div>
@@ -375,6 +525,19 @@ async def update_account_keys(
     except ProvisioningError as exc:
         return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
     return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=keys", status_code=303)
+
+
+@router.post("/accounts/{name}/trading-params")
+async def update_account_trading_params(request: Request, name: str):
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+    form = await request.form()
+    try:
+        validated = {key: validate_trading_param(key, form.get(key, "")) for key in TRADING_PARAMS}
+        await update_trading_params(name, validated)
+    except ProvisioningError as exc:
+        return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}&for=params", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=params", status_code=303)
 
 
 @router.post("/accounts/{name}/dashboard-credentials/regenerate")
