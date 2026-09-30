@@ -142,7 +142,8 @@ from engine.live_equity import (
 )
 from engine.trailing_stop import initial_floor, update_trailing_stop
 from models.orm import (
-    ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification, MomentumSignalEvent, Token,
+    CircuitBreakerState, ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification,
+    MomentumSignalEvent, Token,
 )
 from workers.entry_filters import is_buy_pressure_too_low, is_liquidity_too_high, is_wash_trading_rejected
 from workers.http_queue import RateLimitedQueue
@@ -772,10 +773,99 @@ class ConfluenceLiveWorker:
         if is_daily_halted(equity, today_pnl):
             return False
 
+        if await self._circuit_breaker_paused():
+            return False
+
         if await self._open_trade_count() >= settings.CONFLUENCE_LIVE_MAX_CONCURRENT:
             return False
 
         return True
+
+    async def _circuit_breaker_paused(self) -> bool:
+        """
+        True if a run of consecutive real losses has tripped the breaker
+        and the cooldown hasn't elapsed yet (2026-09-30 — real incident:
+        5 real trades fired within ~60 seconds, all LIQUIDITY_GUARD losses,
+        with nothing in the current pipeline able to stop it after the
+        3rd). CircuitBreakerState already existed in the schema for exactly
+        this — built for the pre-2026-09-23 pipeline, never ported over to
+        confluence_live_worker. Re-wired here rather than adding a new
+        table: same singleton row, same CB_LOSS_COUNT/CB_PAUSE_MINUTES
+        settings, same auto-resume-when-elapsed semantics as the original.
+        Loss counting itself happens in _record_trade_outcome() at exit.
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                select(CircuitBreakerState).where(CircuitBreakerState.id == 1).with_for_update()
+            )
+            cb = result.scalar_one_or_none()
+            if cb is None or not cb.is_paused:
+                return False
+
+            now = datetime.now(timezone.utc)
+            resume_at = cb.resume_at
+            if resume_at is not None and resume_at.tzinfo is None:
+                # Defensive, not just for SQLite-backed tests: never assume
+                # a datetime read back from the DB carries the tzinfo it was
+                # written with.
+                resume_at = resume_at.replace(tzinfo=timezone.utc)
+            if resume_at and now < resume_at:
+                return True
+
+            # Cooldown elapsed — auto-resume with a clean slate, exactly
+            # like the pre-2026-09-23 implementation did.
+            cb.is_paused = False
+            cb.resume_at = None
+            cb.consecutive_losses = 0
+            log.info("confluence_live.circuit_breaker_resumed")
+        await self._notify(
+            "info", "circuit_breaker_resumed",
+            f"Circuit breaker cooldown elapsed after {settings.CB_LOSS_COUNT} consecutive losses — "
+            "live entries resumed.",
+        )
+        return False
+
+    async def _record_trade_outcome_for_circuit_breaker(self, pnl_usd: Decimal | None) -> None:
+        """
+        Called once per real trade close, right after its final P&L is
+        known. Permissive-when-unknown (matching workers/entry_filters.py's
+        convention elsewhere in this pipeline): a trade whose P&L couldn't
+        be determined neither counts as a loss nor resets the streak.
+        """
+        if pnl_usd is None:
+            return
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(CircuitBreakerState).where(CircuitBreakerState.id == 1).with_for_update()
+            )
+            cb = result.scalar_one_or_none()
+            if cb is None:
+                return
+
+            if pnl_usd < 0:
+                cb.consecutive_losses += 1
+                if cb.consecutive_losses >= settings.CB_LOSS_COUNT and not cb.is_paused:
+                    now = datetime.now(timezone.utc)
+                    cb.is_paused = True
+                    cb.pause_started_at = now
+                    cb.resume_at = now + timedelta(minutes=settings.CB_PAUSE_MINUTES)
+                    log.warning("confluence_live.circuit_breaker_tripped",
+                                consecutive_losses=cb.consecutive_losses,
+                                resume_at=cb.resume_at.isoformat())
+                    tripped, resume_at = True, cb.resume_at
+                else:
+                    tripped, resume_at = False, None
+            else:
+                cb.consecutive_losses = 0
+                tripped, resume_at = False, None
+
+        if tripped:
+            await self._notify(
+                "critical", "circuit_breaker_tripped",
+                f"{settings.CB_LOSS_COUNT} losses in a row — live entries paused until "
+                f"{resume_at.strftime('%H:%M:%S UTC')} ({settings.CB_PAUSE_MINUTES} min cooldown).",
+            )
 
     async def _compute_position_usd(self) -> Decimal:
         """
@@ -1325,6 +1415,7 @@ class ConfluenceLiveWorker:
             display_pnl_usd = pnl_usd
             display_pnl_pct = pnl_pct
             verified_suffix = ""
+        await self._record_trade_outcome_for_circuit_breaker(display_pnl_usd)
         # LIQUIDITY_GUARD is always critical regardless of pnl sign — it
         # means the snapshot price this position was being monitored
         # against had already diverged from reality, which is worth

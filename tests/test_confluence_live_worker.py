@@ -44,8 +44,8 @@ from sqlalchemy import select
 from config.settings import settings
 from engine.execution import ExecutionResult
 from models.orm import (
-    ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification, MomentumSignalEvent,
-    Token, TokenEvaluation, TokenStatus, Trade,
+    CircuitBreakerState, ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceNotification,
+    MomentumSignalEvent, Token, TokenEvaluation, TokenStatus, Trade,
 )
 from workers.confluence_live_worker import ConfluenceLiveWorker
 
@@ -2762,3 +2762,112 @@ class TestInAppNotifications:
         stuck_rows = [r for r in rows if r.event == "exit_failed_critical"]
         assert len(stuck_rows) == 1
         assert stuck_rows[0].level == "critical"
+
+
+class TestCircuitBreaker:
+    """
+    2026-09-30 — real incident: 5 real trades fired within ~60 seconds, all
+    LIQUIDITY_GUARD losses, with nothing in the pipeline able to stop it
+    after the 3rd. CircuitBreakerState already existed in the schema (built
+    for the pre-2026-09-23 pipeline) but confluence_live_worker.py never
+    read or wrote it — re-wired here rather than building a new mechanism.
+    """
+
+    @pytest.mark.asyncio
+    async def test_trips_after_configured_consecutive_losses(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CB_LOSS_COUNT", 3)
+        monkeypatch.setattr(settings, "CB_PAUSE_MINUTES", 60)
+        session.add(CircuitBreakerState(id=1))
+        await session.flush()
+
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            for _ in range(2):
+                await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            assert await worker._circuit_breaker_paused() is False  # only 2 so far
+
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))  # 3rd
+            assert await worker._circuit_breaker_paused() is True
+        finally:
+            ctx.stop()
+
+        cb = (await session.execute(select(CircuitBreakerState).where(CircuitBreakerState.id == 1))).scalar_one()
+        assert cb.consecutive_losses == 3
+        assert cb.is_paused is True
+        assert cb.resume_at is not None
+
+    @pytest.mark.asyncio
+    async def test_a_win_resets_the_streak(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CB_LOSS_COUNT", 3)
+        session.add(CircuitBreakerState(id=1))
+        await session.flush()
+
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("+0.10"))  # win — resets
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            assert await worker._circuit_breaker_paused() is False  # only 1 since the win
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_pnl_does_not_affect_the_streak(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CB_LOSS_COUNT", 3)
+        session.add(CircuitBreakerState(id=1))
+        await session.flush()
+
+        worker = make_worker(session)
+        ctx = patched_session(session)
+        try:
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            await worker._record_trade_outcome_for_circuit_breaker(None)  # unknown pnl, permissive
+            await worker._record_trade_outcome_for_circuit_breaker(Decimal("-0.30"))
+            assert await worker._circuit_breaker_paused() is False  # still only 2 real losses
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_paused_worker_cannot_enter(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
+        session.add(CircuitBreakerState(
+            id=1, consecutive_losses=3, is_paused=True,
+            pause_started_at=datetime.now(timezone.utc),
+            resume_at=datetime.now(timezone.utc) + timedelta(minutes=60),
+        ))
+        await session.flush()
+
+        worker = make_worker(session)
+        mock_wallet_balance(worker, monkeypatch, equity_usd=10.0)
+        ctx = patched_session(session)
+        try:
+            assert await worker._safe_to_enter() is False
+        finally:
+            ctx.stop()
+
+    @pytest.mark.asyncio
+    async def test_auto_resumes_once_cooldown_has_elapsed(self, session, monkeypatch):
+        monkeypatch.setattr(settings, "CONFLUENCE_LIVE_ENABLED", True)
+        session.add(CircuitBreakerState(
+            id=1, consecutive_losses=3, is_paused=True,
+            pause_started_at=datetime.now(timezone.utc) - timedelta(minutes=61),
+            resume_at=datetime.now(timezone.utc) - timedelta(minutes=1),  # already elapsed
+        ))
+        await session.flush()
+
+        worker = make_worker(session)
+        mock_wallet_balance(worker, monkeypatch, equity_usd=10.0)
+        ctx = patched_session(session)
+        try:
+            assert await worker._circuit_breaker_paused() is False
+            assert await worker._safe_to_enter() is True
+        finally:
+            ctx.stop()
+
+        cb = (await session.execute(select(CircuitBreakerState).where(CircuitBreakerState.id == 1))).scalar_one()
+        assert cb.is_paused is False
+        assert cb.resume_at is None
+        assert cb.consecutive_losses == 0  # clean slate, matching the pre-2026-09-23 semantics
