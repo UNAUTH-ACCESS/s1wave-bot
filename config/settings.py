@@ -239,10 +239,11 @@ class Settings(BaseSettings):
 
     # ── Discovery ───────────────────────────────────────────────────────────
     DEXSCREENER_POLL_INTERVAL: Annotated[int, Field(ge=10, le=300)] = 60
-    # Realistic shadow fills (2026-10-01): shadow positions are priced with real
-    # Jupiter quotes at this notional instead of DexScreener snapshots alone.
+    # Realistic shadow fills (2026-10-01): shadow positions get a MODELED
+    # executable fill (engine/shadow_exec_model.py, no network calls).
     SHADOW_EXEC_ENABLED: bool = True
     SHADOW_EXEC_NOTIONAL_USD: float = 0.40          # ~ live's recent average position
+    SHADOW_EXEC_DEX_FEE_PCT: float = 0.005          # modeled pool fee per side
     SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE: int = 13_000  # live's measured avg network fee per side
 
     SAMPLE_INTERVAL_SECONDS: Annotated[int, Field(ge=10, le=300)] = 30

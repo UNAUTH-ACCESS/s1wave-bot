@@ -495,16 +495,17 @@ class ConfluenceShadowPosition(Base):
     # (floor = initial_floor(entry_price), hwm = entry_price).
     high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
-    # Executable ("realistic") fills, 2026-10-01 — see engine/jupiter_quotes.py.
+    # Modeled executable ("realistic") fills, 2026-10-01 — engine/shadow_exec_model.py.
     # exec_pnl_pct is net of estimated network fees; pnl_pct above stays the
     # DexScreener-snapshot figure (except LIQUIDITY_GUARD exits, where it is
-    # the executable P&L). exec_status: 'quoted' | 'no_quote' (fail-open,
+    # the executable P&L). exec_status: 'modeled' | 'no_quote' (no entry liquidity known;
     # filter these out of realism analysis).
     exec_status: Mapped[str | None] = mapped_column(String(16))
     exec_notional_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     exec_entry_lamports: Mapped[int | None] = mapped_column(BigInteger)
     exec_entry_tokens_raw: Mapped[int | None] = mapped_column(BigInteger)
-    exec_exit_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exec_exit_lamports: Mapped[int | None] = mapped_column(BigInteger)  # unused by the model
+    exec_entry_liq_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
     exec_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
 
     def __repr__(self) -> str:
@@ -512,9 +513,9 @@ class ConfluenceShadowPosition(Base):
 
 
 class ConfluenceShadowExecCheck(Base):
-    """One executable Jupiter quote taken for a shadow position
-    (kind: 'entry' | 'guard' | 'exit'). price_impact_raw is stored exactly as
-    Jupiter reported it so the "1" sentinel stays visible in the dataset."""
+    """One modeled executable-exit check for a shadow position
+    (kind: 'entry' | 'guard' | 'exit'). price_impact_raw holds the modeled
+    impact (a fraction) as a string."""
 
     __tablename__ = "confluence_shadow_exec_checks"
     __table_args__ = (Index("ix_confluence_shadow_exec_checks_position", "position_id", "checked_at"),)

@@ -16,6 +16,7 @@ GET /confluence/stream          — SSE: live status + open trades w/ live
 GET /confluence/shadow/stats    — paper-benchmark win rate, rug rate, etc.
 GET /confluence/shadow/positions — paper-only open/closed positions
 GET /confluence/shadow/curve    — cumulative pnl_pct series for a chart
+GET /confluence/live/performance — real-money curve, win rate, mean (on-chain-verified P&L where known)
 GET /confluence/summary         — one-shot plain-text report, e.g. `curl
                                    .../confluence/summary` from a phone
                                    terminal (2026-09-28)
@@ -1501,6 +1502,73 @@ def create_app() -> FastAPI:
                 "cum_pnl_pct_raw": round(cum_raw, 4),
             })
         return {"points": points}
+
+    @app.get("/confluence/live/performance", tags=["confluence"])
+    async def confluence_live_performance() -> dict:
+        """Real-money performance: cumulative P&L curve, win rate, mean/median.
+
+        Uses real_pnl_usd (read from the real transactions, only available
+        for trades closed since 2026-09-28) and falls back to the intended
+        pnl_usd for older trades, flagged per point (`verified`) — the older
+        figure understated real spend (see ConfluenceLiveTrade docs), so the
+        summary reports the verified-only numbers separately.
+        """
+        sol = Decimal(str(settings.SOL_PRICE_USD)) if settings.SOL_PRICE_USD else None
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(ConfluenceLiveTrade.exit_time, ConfluenceLiveTrade.pnl_usd,
+                       ConfluenceLiveTrade.position_usd, ConfluenceLiveTrade.real_pnl_usd,
+                       ConfluenceLiveTrade.entry_real_sol_lamports)
+                .where(ConfluenceLiveTrade.status == "closed", ConfluenceLiveTrade.exit_time.is_not(None))
+                .order_by(ConfluenceLiveTrade.exit_time.asc())
+            )).all()
+
+        points, cum, peak, max_dd = [], 0.0, 0.0, 0.0
+        for exit_time, pnl_usd, position_usd, real_pnl_usd, entry_lamports in rows:
+            verified = real_pnl_usd is not None
+            pnl = real_pnl_usd if verified else pnl_usd
+            if pnl is None:
+                continue
+            capital = position_usd
+            if verified and entry_lamports and sol:
+                capital = Decimal(str(abs(entry_lamports))) / Decimal("1e9") * sol
+            pct = float(pnl / capital * 100) if capital else None
+            cum += float(pnl)
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+            points.append({
+                "t": exit_time.isoformat(), "pnl_usd": round(float(pnl), 4),
+                "pnl_pct": round(pct, 2) if pct is not None else None,
+                "cum_usd": round(cum, 4), "verified": verified,
+            })
+
+        def summarize(pts: list[dict]) -> dict:
+            n = len(pts)
+            if not n:
+                return {"trades": 0}
+            usd = sorted(p["pnl_usd"] for p in pts)
+            pcts = sorted(p["pnl_pct"] for p in pts if p["pnl_pct"] is not None)
+            wins = [p for p in usd if p > 0]
+            losses = [p for p in usd if p < 0]
+            return {
+                "trades": n,
+                "win_rate": round(len(wins) / n, 4),
+                "total_usd": round(sum(usd), 4),
+                "mean_usd": round(sum(usd) / n, 4),
+                "median_usd": round(usd[n // 2], 4),
+                "mean_pct": round(sum(pcts) / len(pcts), 2) if pcts else None,
+                "median_pct": round(pcts[len(pcts) // 2], 2) if pcts else None,
+                "avg_win_usd": round(sum(wins) / len(wins), 4) if wins else None,
+                "avg_loss_usd": round(sum(losses) / len(losses), 4) if losses else None,
+                "best_usd": usd[-1], "worst_usd": usd[0],
+            }
+
+        return {
+            "points": points,
+            "all": summarize(points),
+            "verified_only": summarize([p for p in points if p["verified"]]),
+            "max_drawdown_usd": round(max_dd, 4),
+        }
 
     return app
 
