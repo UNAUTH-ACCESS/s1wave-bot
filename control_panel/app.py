@@ -28,9 +28,12 @@ block (passes the full path through unchanged, no prefix-stripping).
 
 from __future__ import annotations
 
+import asyncio
+
 import bcrypt
+import httpx
 from fastapi import APIRouter, FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -86,47 +89,199 @@ async def _on_startup() -> None:
     log.info("control_panel.started", port=settings.API_PORT)
 
 
-def _layout(title: str, body: str) -> str:
+# Design tokens adopted from the AnchorLedger web app (2026-10-01, per the
+# user's explicit request) — same palette/typography as that project's
+# frontend/src/lib/tokens.js, translated into plain CSS custom properties
+# since this app is server-rendered HTML, not React. Deliberately the SAME
+# values, not "inspired by" — green/red/violet/orange carry the exact
+# meanings AnchorLedger's NotificationCenter/status maps use them for.
+_TOKENS_CSS = """
+  :root {
+    --bg:#0A0A0F; --surface:#111118; --surface2:#16161F;
+    --border:#1E1E2E; --border2:#252538;
+    --text:#E8F4F8; --muted:#5A6478;
+    --green:#00D4AA; --red:#FF4D6D; --violet:#7B61FF; --orange:#FF8C00;
+    /* Back-compat aliases so every existing .card/.pill/form rule below
+       keeps working unchanged under the new palette. */
+    --accent:#00D4AA; --danger:#FF4D6D; --warn:#FF8C00; --bright:#E8F4F8;
+  }
+"""
+
+_NAV_ITEMS = [("/", "▦", "Accounts"), ("/playbook", "📘", "Playbook")]
+
+
+def _notification_bell_html() -> str:
+    return f"""
+      <div class="notif-wrap" id="notifWrap">
+        <button class="notif-bell" id="notifBell" onclick="s1wToggleNotifs()">
+          🔔<span class="notif-badge" id="notifBadge" hidden>0</span>
+        </button>
+        <div class="notif-panel" id="notifPanel" hidden>
+          <div class="notif-header">Notifications</div>
+          <div class="notif-list" id="notifList">
+            <div class="notif-empty">Loading…</div>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function() {{
+          const PREFIX = {PREFIX!r};
+          const LAST_SEEN_KEY = 's1wave_notif_last_seen';
+          const LEVEL_COLOR = {{critical:'var(--red)', warning:'var(--orange)', info:'var(--green)'}};
+
+          function timeAgo(iso) {{
+            const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+            if (diff < 60) return Math.floor(diff) + 's ago';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+          }}
+
+          function render(items) {{
+            let lastSeen = '1970-01-01T00:00:00Z';
+            try {{ lastSeen = localStorage.getItem(LAST_SEEN_KEY) || lastSeen; }} catch (e) {{}}
+            const unread = items.filter(n => n.created_at > lastSeen).length;
+            const badge = document.getElementById('notifBadge');
+            badge.hidden = unread === 0;
+            badge.textContent = unread > 99 ? '99+' : String(unread);
+
+            const list = document.getElementById('notifList');
+            if (!items.length) {{
+              list.innerHTML = '<div class="notif-empty">No notifications</div>';
+              return;
+            }}
+            list.innerHTML = items.map(n => `
+              <div class="notif-item">
+                <div class="notif-dot" style="background:${{LEVEL_COLOR[n.level] || 'var(--muted)'}}"></div>
+                <div class="notif-body">
+                  <div class="notif-title">[${{n.account}}] ${{n.event.replace(/_/g, ' ')}}</div>
+                  <div class="notif-msg">${{n.message}}</div>
+                  <div class="notif-time">${{timeAgo(n.created_at)}}</div>
+                </div>
+              </div>
+            `).join('');
+          }}
+
+          async function poll() {{
+            try {{
+              const res = await fetch(PREFIX + '/api/notifications');
+              if (!res.ok) return;
+              render(await res.json());
+            }} catch (e) {{}}
+          }}
+
+          window.s1wToggleNotifs = function() {{
+            const panel = document.getElementById('notifPanel');
+            panel.hidden = !panel.hidden;
+            if (!panel.hidden) {{
+              poll();
+              try {{ localStorage.setItem(LAST_SEEN_KEY, new Date().toISOString()); }} catch (e) {{}}
+              setTimeout(poll, 300); // re-render badge cleared after marking seen
+            }}
+          }};
+
+          document.addEventListener('click', function(e) {{
+            const wrap = document.getElementById('notifWrap');
+            if (wrap && !wrap.contains(e.target)) document.getElementById('notifPanel').hidden = true;
+          }});
+
+          poll();
+          setInterval(poll, 30000);
+        }})();
+      </script>"""
+
+
+def _layout(title: str, body: str, show_chrome: bool = True) -> str:
+    nav_html = ""
+    if show_chrome:
+        nav_links = "".join(
+            f'<a href="{PREFIX}{path}" class="nav-link">{icon} {label}</a>'
+            for path, icon, label in _NAV_ITEMS
+        )
+        nav_html = f"""
+        <div class="appbar">
+          <div class="appbar-brand">S1WAVE</div>
+          <nav class="appbar-nav">{nav_links}</nav>
+          {_notification_bell_html()}
+        </div>"""
+
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{title} — S1Wave</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  :root {{ --bg:#080C0B; --surface:#0E1512; --border:#1A2620; --accent:#00FF87;
-           --danger:#FF4444; --warn:#FFB800; --text:#C8DDD5; --bright:#E8F5EE; --muted:#5C7A6D; }}
+{_TOKENS_CSS}
   * {{ box-sizing:border-box; }}
-  body {{ background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif;
+  body {{ background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif;
           margin:0; min-height:100vh; }}
-  .wrap {{ max-width:720px; margin:0 auto; padding:32px 16px; }}
+  code, .mono {{ font-family:'JetBrains Mono',monospace; }}
+  .wrap {{ max-width:720px; margin:0 auto; padding:24px 16px 48px; }}
   h1 {{ color:var(--bright); font-size:22px; margin:0 0 4px; }}
   .sub {{ color:var(--muted); font-size:13px; margin-bottom:28px; }}
   .card {{ background:var(--surface); border:1px solid var(--border); border-radius:10px;
            padding:20px; margin-bottom:16px; }}
-  label {{ display:block; font-size:11px; letter-spacing:0.5px; text-transform:uppercase;
-           color:var(--muted); margin-bottom:6px; margin-top:14px; }}
-  input {{ width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px;
-           color:var(--bright); padding:10px 12px; font-size:14px; }}
-  input:focus {{ outline:none; border-color:var(--accent); }}
-  button, .btn {{ background:var(--accent); color:#052014; border:none; border-radius:6px;
+  label {{ display:block; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.06em;
+           text-transform:uppercase; color:var(--muted); margin-bottom:6px; margin-top:14px; }}
+  input, select {{ width:100%; background:var(--bg); border:1px solid var(--border2); border-radius:6px;
+           color:var(--bright); padding:10px 12px; font-size:14px; font-family:inherit; }}
+  input:focus, select:focus {{ outline:none; border-color:var(--green) !important; }}
+  button, .btn {{ background:var(--green); color:#04221c; border:none; border-radius:6px;
            padding:11px 18px; font-weight:700; font-size:14px; cursor:pointer; margin-top:18px;
            display:inline-block; text-decoration:none; }}
   button:hover, .btn:hover {{ filter:brightness(1.1); }}
-  .btn-secondary {{ background:transparent; border:1px solid var(--border); color:var(--text); }}
-  a {{ color:var(--accent); }}
-  .error {{ color:var(--danger); font-size:13px; margin-top:10px; }}
+  .btn-secondary {{ background:transparent; border:1px solid var(--border2); color:var(--text); }}
+  a {{ color:var(--green); }}
+  .error {{ color:var(--red); font-size:13px; margin-top:10px; }}
   .account-row {{ display:flex; justify-content:space-between; align-items:center;
            padding:14px 0; border-bottom:1px solid var(--border); gap:12px; flex-wrap:wrap; }}
   .account-row:last-child {{ border-bottom:none; }}
-  .account-name {{ font-weight:700; color:var(--bright); }}
+  .account-name {{ font-weight:700; color:var(--bright); font-family:'JetBrains Mono',monospace; }}
   .account-meta {{ font-size:12px; color:var(--muted); }}
-  .pill {{ font-size:11px; padding:3px 9px; border-radius:999px; font-weight:700; }}
-  .pill.armed {{ background:rgba(0,255,135,.15); color:var(--accent); }}
-  .pill.paused {{ background:rgba(255,184,0,.15); color:var(--warn); }}
-  .pill.halted {{ background:rgba(255,68,68,.15); color:var(--danger); }}
-  .pill.unknown {{ background:rgba(92,122,109,.2); color:var(--muted); }}
+  .pill {{ font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.04em;
+           padding:3px 9px; border-radius:999px; font-weight:700; text-transform:uppercase; }}
+  .pill.armed {{ background:rgba(0,212,170,.15); color:var(--green); }}
+  .pill.paused {{ background:rgba(255,140,0,.15); color:var(--orange); }}
+  .pill.halted {{ background:rgba(255,77,109,.15); color:var(--red); }}
+  .pill.unknown {{ background:rgba(90,100,120,.2); color:var(--muted); }}
   .topbar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }}
   .topbar a {{ color:var(--muted); font-size:13px; text-decoration:none; }}
+
+  /* App chrome — persistent nav + notification bell (2026-10-01) */
+  .appbar {{ display:flex; align-items:center; gap:18px; padding:12px 16px;
+             background:var(--surface); border-bottom:1px solid var(--border);
+             position:sticky; top:0; z-index:200; }}
+  .appbar-brand {{ font-family:'JetBrains Mono',monospace; font-weight:700; font-size:13px;
+                   letter-spacing:0.08em; color:var(--green); }}
+  .appbar-nav {{ display:flex; gap:4px; flex:1; }}
+  .nav-link {{ font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--muted);
+               text-decoration:none; padding:6px 10px; border-radius:6px; }}
+  .nav-link:hover {{ background:var(--surface2); color:var(--text); }}
+
+  .notif-wrap {{ position:relative; }}
+  .notif-bell {{ background:transparent; border:1px solid var(--border2); border-radius:6px;
+                 padding:6px 10px; margin:0; font-size:14px; position:relative; color:var(--muted); }}
+  .notif-bell:hover {{ filter:none; border-color:var(--green); color:var(--green); }}
+  .notif-badge {{ position:absolute; top:-6px; right:-6px; background:var(--red); color:#fff;
+                  font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700;
+                  padding:1px 5px; border-radius:8px; min-width:16px; text-align:center; }}
+  .notif-panel {{ position:absolute; top:40px; right:0; width:min(360px, 90vw); max-height:420px;
+                  background:var(--surface); border:1px solid var(--border2); border-radius:8px;
+                  box-shadow:0 8px 32px rgba(0,0,0,.6); overflow-y:auto; z-index:300; }}
+  .notif-header {{ padding:12px 16px; font-family:'JetBrains Mono',monospace; font-size:11px;
+                    font-weight:700; letter-spacing:0.04em; text-transform:uppercase;
+                    color:var(--muted); border-bottom:1px solid var(--border); }}
+  .notif-empty {{ padding:24px 16px; text-align:center; font-size:12px; color:var(--muted); }}
+  .notif-item {{ display:flex; gap:10px; padding:12px 16px; border-bottom:1px solid var(--border); }}
+  .notif-item:last-child {{ border-bottom:none; }}
+  .notif-dot {{ width:7px; height:7px; border-radius:50%; margin-top:5px; flex-shrink:0; }}
+  .notif-title {{ font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:600;
+                  color:var(--text); text-transform:uppercase; letter-spacing:0.02em; }}
+  .notif-msg {{ font-size:12px; color:var(--muted); margin-top:3px; line-height:1.4; }}
+  .notif-time {{ font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--muted); margin-top:4px; }}
 </style></head>
-<body><div class="wrap">{body}</div></body></html>"""
+<body>{nav_html}<div class="wrap">{body}</div></body></html>"""
 
 
 def _require_login(request: Request) -> str | None:
@@ -149,7 +304,7 @@ async def signup_form(request: Request):
             <button type="submit">Create account</button>
         </form>
         </div>
-    """))
+    """, show_chrome=False))
 
 
 @router.post("/signup")
@@ -186,7 +341,7 @@ async def login_form(request: Request, error: str | None = None):
             {error_html}
         </form>
         </div>
-    """))
+    """, show_chrome=False))
 
 
 @router.post("/login")
@@ -594,6 +749,52 @@ async def regenerate_dashboard_credentials(request: Request, name: str):
         acct.dashboard_auth_password = password
 
     return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=creds", status_code=303)
+
+
+async def _fetch_account_notifications(acct: ControlAccount, limit: int) -> list[dict]:
+    """One account's own /confluence/notifications, over HTTP on localhost
+    (same host, same box — no need to round-trip through the public nginx
+    domain) using its stored Basic Auth credentials. Never raises: one
+    account being briefly unreachable must not blank the whole bell for
+    every other account."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"http://127.0.0.1:{acct.port}/confluence/notifications",
+                params={"limit": limit},
+                auth=(acct.dashboard_auth_user, acct.dashboard_auth_password),
+            )
+            resp.raise_for_status()
+            items = resp.json()
+    except Exception as exc:
+        log.warning("control_panel.notifications_fetch_failed", account=acct.name, error=str(exc))
+        return []
+    for item in items:
+        item["account"] = acct.name
+    return items
+
+
+@router.get("/api/notifications")
+async def api_notifications(request: Request, limit: int = Query(default=10, ge=1, le=50)):
+    """
+    Notification bell's data source (2026-10-01, "adopt AnchorLedger's
+    notification/alert system") — aggregates every account's own
+    ConfluenceNotification feed (already existed, api/app.py's
+    /confluence/notifications) into one merged, sorted list. Never touches
+    a trading account's database directly, same boundary as every other
+    control-panel feature — this is an HTTP call to that account's own
+    API, exactly like a browser hitting its dashboard would.
+    """
+    if not _require_login(request):
+        return JSONResponse([], status_code=401)
+
+    async with get_session() as session:
+        accounts = (await session.execute(select(ControlAccount))).scalars().all()
+
+    results = await asyncio.gather(*(_fetch_account_notifications(a, limit) for a in accounts))
+    merged = [item for sub in results for item in sub]
+    merged.sort(key=lambda n: n["created_at"], reverse=True)
+    return JSONResponse(merged[:limit * 2])
 
 
 app.include_router(router)
