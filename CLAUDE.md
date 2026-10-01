@@ -279,3 +279,11 @@ Typography: `'Space Mono'` (21 occurrences — buttons, labels, the log, inputs,
 ## Where the rest of the history lives
 
 `/home/solana/NOTEBOOK.md` has the full narrative — every bug, every real number, every decision, in the order it happened, across this and every other project on this machine. This file is the orientation; that file is the record. Update both when you make a real change.
+
+### FIXED 2026-10-01 06:11Z: liquidity guard now judges executable proceeds
+`is_liquidity_crisis(impact, real_pnl_pct)` in `workers/confluence_live_worker.py`: crisis iff executable
+P&L (Jupiter `outAmount` for the exact held size vs cost) <= -30%, OR reported impact >= 35% AND P&L <= -10%.
+The `priceImpactPct == "1"` sentinel alone no longer liquidates. Every check logs
+`confluence_live.executable_liquidity_check` (out_sol, impact, real_pnl_pct). Prospective comparison:
+`PYTHONPATH=. python analysis/liquidity_guard_false_positives.py` (section "Prospective"); judge at n>=30 live.
+Rollback = revert this commit. Shadow stays optimistic (no fees/slippage).

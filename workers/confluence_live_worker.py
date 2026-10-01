@@ -194,6 +194,19 @@ CONFIRMATION_TOLERANCE = 0.5
 _LIQUIDITY_CHECK_INTERVAL_S = 60.0
 _LIQUIDITY_CRISIS_IMPACT_PCT = Decimal("0.35")     # >=35% impact on a full-size sell = pool has dried up
 _LIQUIDITY_CRISIS_PNL_FLOOR_PCT = Decimal("-0.30")  # real executable P&L already worse than any normal stop
+# 2026-10-01: Jupiter returns priceImpactPct == "1" as a sentinel on thin
+# pump.fun-style routes (564/575 firings) even while outAmount shows 95-99%
+# of the position recoverable, so impact alone is not a measurement. The
+# deciding number is executable proceeds for the exact held size; a high
+# impact reading only counts when proceeds are ALSO meaningfully down.
+_LIQUIDITY_IMPACT_CORROBORATION_PNL_PCT = Decimal("-0.10")
+
+
+def is_liquidity_crisis(price_impact_pct: Decimal, real_pnl_pct: Decimal) -> bool:
+    if real_pnl_pct <= _LIQUIDITY_CRISIS_PNL_FLOOR_PCT:
+        return True
+    return (price_impact_pct >= _LIQUIDITY_CRISIS_IMPACT_PCT
+            and real_pnl_pct <= _LIQUIDITY_IMPACT_CORROBORATION_PNL_PCT)
 
 # TRIED AND REMOVED, 2026-09-28: a 60s grace period before the liquidity
 # guard's first check on a brand-new position. Backstory: raising the
@@ -1108,8 +1121,9 @@ class ConfluenceLiveWorker:
         against, so it structurally cannot see this failure mode.
 
         Returns ("LIQUIDITY_GUARD", real_price) if a real Jupiter quote
-        for the full position size shows either >=35% price impact or an
-        already-worse-than-any-normal-stop real P&L. Returns (None, None)
+        for the full position size shows executable proceeds already
+        worse-than-any-normal-stop (<=-30%), or >=35% reported impact
+        corroborated by proceeds down >=10% (see is_liquidity_crisis). Returns (None, None)
         if the check isn't due yet for this trade, the quote failed (never
         treat a failed check as "safe"), or neither threshold is crossed.
 
@@ -1178,7 +1192,12 @@ class ConfluenceLiveWorker:
                 row.real_pnl_pct = real_pnl_pct * 100
                 row.real_price_checked_at = datetime.now(timezone.utc)
 
-        if quote["price_impact_pct"] >= _LIQUIDITY_CRISIS_IMPACT_PCT or real_pnl_pct <= _LIQUIDITY_CRISIS_PNL_FLOOR_PCT:
+        log.info("confluence_live.executable_liquidity_check", trade_id=str(trade_id),
+                 mint=trade["mint"], out_sol=str(Decimal(quote["out_lamports"]) / Decimal("1e9")),
+                 position_usd=str(position_usd), price_impact_pct=str(quote["price_impact_pct"]),
+                 real_pnl_pct=str(real_pnl_pct))
+
+        if is_liquidity_crisis(quote["price_impact_pct"], real_pnl_pct):
             # Informational only beyond this point: the real sell that
             # follows sizes itself from entry_token_lamports directly,
             # never from implied_price.

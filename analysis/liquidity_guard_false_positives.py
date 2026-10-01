@@ -162,6 +162,32 @@ async def shadow_vs_live() -> None:
     print()
 
 
+FIX_DEPLOYED = datetime(2026, 10, 1, 6, 11, tzinfo=timezone.utc)  # restart that shipped the fix
+
+
+async def prospective_since_fix() -> None:
+    """Live vs shadow for entries AFTER the executable-proceeds fix."""
+    print(f"=== Prospective: entries since fix ({FIX_DEPLOYED:%Y-%m-%d %H:%M}Z) ===")
+    async with get_session() as session:
+        sh = (await session.execute(text("""
+            SELECT COUNT(*) n, SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) wins, ROUND(AVG(pnl_pct),2) avg
+            FROM confluence_shadow_positions WHERE status='closed' AND entry_time >= :t"""),
+            {"t": FIX_DEPLOYED})).first()
+        lv = (await session.execute(text("""
+            SELECT COUNT(*) n, SUM(CASE WHEN COALESCE(real_pnl_usd,pnl_usd) > 0 THEN 1 ELSE 0 END) wins,
+                   ROUND(SUM(COALESCE(real_pnl_usd,pnl_usd)),4) usd
+            FROM confluence_live_trades WHERE status='closed' AND entry_time >= :t"""),
+            {"t": FIX_DEPLOYED})).first()
+        ex = (await session.execute(text("""
+            SELECT exit_reason, COUNT(*) n FROM confluence_live_trades
+            WHERE status='closed' AND entry_time >= :t GROUP BY 1 ORDER BY 2 DESC"""),
+            {"t": FIX_DEPLOYED})).all()
+    print(f"  shadow: n={sh.n} wins={sh.wins} avg_pnl_pct={sh.avg}")
+    print(f"  live:   n={lv.n} wins={lv.wins} real_pnl_usd={lv.usd}")
+    print(f"  live exits: {{{', '.join(f'{e.exit_reason}: {e.n}' for e in ex)}}}")
+    print("  (judge once n>=30 live; shadow remains optimistic - no fees/slippage)\n")
+
+
 async def _quote(client: httpx.AsyncClient, input_mint: str, output_mint: str, amount: int) -> dict:
     resp = await client.get(_JUP, params={
         "inputMint": input_mint, "outputMint": output_mint, "amount": amount,
@@ -208,6 +234,7 @@ async def main() -> None:
     await guard_firing_breakdown()
     await shadow_vs_live()
     await live_control_quote()
+    await prospective_since_fix()
     print("Suggested fix is described in this file's module docstring and is")
     print("deliberately NOT applied — live trading is unchanged by this script.")
 

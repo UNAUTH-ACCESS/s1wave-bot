@@ -790,6 +790,31 @@ class TestLiquidityGuard:
         assert price is not None
 
     @pytest.mark.asyncio
+    async def test_sentinel_impact_with_healthy_proceeds_does_not_fire(self, session, monkeypatch):
+        """Jupiter reports priceImpactPct "1" on thin routes while outAmount
+        shows ~97% recoverable — the proceeds are the measurement."""
+        monkeypatch.setattr(settings, "SOL_PRICE_USD", 116.0)
+        await self._setup(session)
+        lamports = int((Decimal("0.0388") / Decimal("116.0")) * Decimal("1e9"))  # -3%
+        self.worker._execution.get_sell_quote = AsyncMock(return_value={
+            "out_lamports": lamports, "price_impact_pct": Decimal("1"),
+        })
+        ctx = patched_session(session)
+        try:
+            reason, _ = await self.worker._check_liquidity_guard(self.trade)
+        finally:
+            ctx.stop()
+        assert reason is None
+
+    def test_is_liquidity_crisis_rules(self):
+        from workers.confluence_live_worker import is_liquidity_crisis as f
+        assert f(Decimal("1"), Decimal("-0.03")) is False
+        assert f(Decimal("1"), Decimal("-0.12")) is True      # corroborated
+        assert f(Decimal("0.05"), Decimal("-0.12")) is False  # low impact, mild loss
+        assert f(Decimal("0"), Decimal("-0.31")) is True      # floor alone
+        assert f(Decimal("0.4"), Decimal("0.27")) is False    # in profit
+
+    @pytest.mark.asyncio
     async def test_fires_on_bad_real_pnl_even_with_low_impact(self, session, monkeypatch):
         """A pool can show low reported price impact while still paying out
         far less than the position cost — the real-P&L floor catches what
