@@ -244,6 +244,7 @@ async def homepage(request: Request):
             <div style="display:flex;align-items:center;gap:10px">
                 {open_link}
                 <a class="btn btn-secondary" href="{PREFIX}/accounts/{acct.name}">Manage</a>
+                <a class="btn btn-secondary" href="{PREFIX}/accounts/{acct.name}/settings">⚙ Settings</a>
             </div>
         </div>"""
     if not rows:
@@ -291,7 +292,7 @@ async def playbook(request: Request):
             The single most common cause: <b>the SolanaTracker sampling key ran out</b> — these are
             free-tier keys with a lifetime cap, not a daily one, and once it's spent it's spent for good.</p>
             <p><b>Fix:</b> get a fresh key from <a href="https://solanatracker.io" target="_blank">solanatracker.io</a>
-            (sign up, generate an API key), then go to Manage → SolanaTracker keys → paste it into the
+            (sign up, generate an API key), then go to Settings → SolanaTracker keys → paste it into the
             <i>Sampling key</i> field → Save. The account restarts automatically and should start seeing
             real data again within a minute — you'll know it worked when Telegram goes quiet on errors and
             you start seeing normal activity again.</p>
@@ -306,12 +307,12 @@ async def playbook(request: Request):
             <p><b>Do nothing</b> and it resumes automatically once the cooldown passes (you'll get a
             "circuit breaker resumed" alert). If you want to investigate first, use the Playbook section
             below on checking recent trades, or just leave it — the pause itself is the protection.</p>
-            <p>If this is happening too often or not often enough, go to Manage → Trading parameters and
+            <p>If this is happening too often or not often enough, go to Settings → Trading parameters and
             adjust <i>"losses in a row before pausing"</i> or <i>"pause duration"</i>.</p>
         ''')}
 
         {section("You want to reduce or increase exposure", '''
-            <p>Go to the account's Manage page → <b>Trading parameters</b>. The two numbers that matter most:</p>
+            <p>Go to the account's Settings page → <b>Trading parameters</b>. The two numbers that matter most:</p>
             <ul style="margin:8px 0;padding-left:20px;color:var(--text)">
                 <li><b>Exposure %</b> — the fraction of your wallet balance that can be tied up in open
                 positions at once. Lower = smaller bets, survives a bad stretch longer. This is usually
@@ -326,7 +327,7 @@ async def playbook(request: Request):
         ''')}
 
         {section("You need to stop everything RIGHT NOW", '''
-            <p>Manage → Trading parameters → <b>"Live trading enabled"</b> → set to <b>False</b> → Save.
+            <p>Settings → Trading parameters → <b>"Live trading enabled"</b> → set to <b>False</b> → Save.
             This stops all NEW entries immediately. Anything already open keeps being monitored and can
             still exit normally (stop-loss, take-profit, etc.) — this never abandons a position with money
             on the line.</p>
@@ -349,7 +350,7 @@ async def playbook(request: Request):
 
         {section("Setting up a new account", '''
             <p>Homepage → <b>+ New Account</b>. Comes up paused and unfunded on purpose — fund the wallet
-            address it gives you, add its own SolanaTracker keys (Manage page), then flip
+            address it gives you, add its own SolanaTracker keys (Settings page), then flip
             "Live trading enabled" to True when you're ready. Every account is fully isolated: its own
             database, wallet, keys, and dashboard login — nothing you do to one touches another.</p>
         ''')}
@@ -357,7 +358,7 @@ async def playbook(request: Request):
         {section("Checking on things without this panel", '''
             <p>Each account's own dashboard (linked from its Manage page) shows live status, open positions,
             trade history, and P&amp;L directly — Basic Auth protected, credentials visible on that
-            account's Manage page here if you've forgotten them.</p>
+            account's Settings page here if you've forgotten them.</p>
         ''')}
     """
     return HTMLResponse(_layout("Playbook", body))
@@ -417,29 +418,71 @@ def _trading_param_field(key: str, spec: dict, value: str) -> str:
         <div class="account-meta" style="margin-top:4px">{spec['help']}</div>"""
 
 
-@router.get("/accounts/{name}", response_class=HTMLResponse)
-async def manage_account(
-    request: Request, name: str, saved: str | None = None, error: str | None = None,
-    for_: str | None = Query(default=None, alias="for"),
-):
-    """
-    Per-account management page (2026-09-29) — identity + config, no
-    balance/financial data (that stays on the account's OWN dashboard,
-    behind its own Basic Auth; see the homepage's docstring for why).
-    Currently just the SolanaTracker keys, since that's the one thing
-    that needed editing through the panel instead of the server directly
-    — more account-level settings can live here later without the
-    homepage ever needing to grow past a plain list.
-    """
-    if not _require_login(request):
-        return RedirectResponse(f"{PREFIX}/login", status_code=303)
-
+async def _load_account_or_redirect(name: str) -> ControlAccount | RedirectResponse:
     async with get_session() as session:
         acct = (await session.execute(
             select(ControlAccount).where(ControlAccount.name == name)
         )).scalar_one_or_none()
-    if acct is None:
-        return RedirectResponse(PREFIX + "/", status_code=303)
+    return acct if acct is not None else RedirectResponse(PREFIX + "/", status_code=303)
+
+
+@router.get("/accounts/{name}", response_class=HTMLResponse)
+async def manage_account(request: Request, name: str):
+    """
+    Per-account overview (2026-09-29, split from Settings on 2026-10-01 —
+    the user asked for a dedicated settings page per account once there
+    was enough to tune that cramming it alongside identity/wallet info
+    stopped making sense). Identity only, no balance/financial data (that
+    stays on the account's OWN dashboard, behind its own Basic Auth; see
+    the homepage's docstring for why) — everything editable lives at
+    /accounts/{name}/settings instead.
+    """
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    acct = await _load_account_or_redirect(name)
+    if isinstance(acct, RedirectResponse):
+        return acct
+
+    public_url = _dashboard_link_for(acct)
+    dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
+                       else "no public dashboard yet — reachable on its own port on this server")
+
+    return HTMLResponse(_layout(name, f"""
+        <div class="topbar">
+            <h1 style="margin:0">{name}</h1>
+            <a href="{PREFIX}/">&larr; All accounts</a>
+        </div>
+        <div class="card">
+            <label>Wallet address</label>
+            <div class="account-meta" style="word-break:break-all">{acct.wallet_pubkey}</div>
+            <label>Dashboard</label>
+            <div class="account-meta">{dashboard_link}</div>
+        </div>
+        <a class="btn" href="{PREFIX}/accounts/{name}/settings">⚙ Settings</a>
+    """))
+
+
+@router.get("/accounts/{name}/settings", response_class=HTMLResponse)
+async def account_settings(
+    request: Request, name: str, saved: str | None = None, error: str | None = None,
+    for_: str | None = Query(default=None, alias="for"),
+):
+    """
+    Everything tunable for one account, in one place (2026-10-01) — trading
+    risk parameters, SolanaTracker keys, dashboard credentials. Built the
+    day the user explicitly asked for "a settings page in each account I
+    can use to tune all these things," after a session spent reducing
+    exposure and building the circuit breaker by hand through me — the
+    whole point from here is that none of that should ever need an AI or a
+    terminal again.
+    """
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    acct = await _load_account_or_redirect(name)
+    if isinstance(acct, RedirectResponse):
+        return acct
 
     try:
         keys = get_solana_tracker_keys(name)
@@ -456,34 +499,11 @@ async def manage_account(
     params_saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new parameters.</div>' if saved == "params" else ""
     error_html = f'<div class="error">{error}</div>' if error and for_ != "params" else ""
     params_error_html = f'<div class="error">{error}</div>' if error and for_ == "params" else ""
-    public_url = _dashboard_link_for(acct)
-    dashboard_link = (f'<a href="{public_url}" target="_blank">{public_url}</a>' if public_url
-                       else "no public dashboard yet — reachable on its own port on this server")
 
-    return HTMLResponse(_layout(name, f"""
+    return HTMLResponse(_layout(f"{name} — Settings", f"""
         <div class="topbar">
-            <h1 style="margin:0">{name}</h1>
-            <a href="{PREFIX}/">&larr; All accounts</a>
-        </div>
-        <div class="card">
-            <label>Wallet address</label>
-            <div class="account-meta" style="word-break:break-all">{acct.wallet_pubkey}</div>
-            <label>Dashboard</label>
-            <div class="account-meta">{dashboard_link}</div>
-        </div>
-        <div class="card">
-            <div class="sub" style="margin-bottom:0">Dashboard login (Basic Auth)</div>
-            <div class="account-meta">This is what a browser asks for when opening this account's own
-            dashboard above — distinct per account, so one account's login can't open another's.</div>
-            <label>Username</label>
-            <input value="{acct.dashboard_auth_user}" readonly>
-            <label>Password</label>
-            <input value="{acct.dashboard_auth_password}" readonly>
-            <form method="post" action="{PREFIX}/accounts/{name}/dashboard-credentials/regenerate"
-                  onsubmit="return confirm('This immediately changes the dashboard password and restarts the account. Continue?')">
-                <button type="submit" class="btn-secondary" style="color:var(--warn);border-color:var(--warn)">Regenerate password</button>
-            </form>
-            {creds_saved_html}
+            <h1 style="margin:0">{name} — Settings</h1>
+            <a href="{PREFIX}/accounts/{name}">&larr; {name}</a>
         </div>
         <div class="card">
             <div class="sub" style="margin-bottom:0">Trading parameters</div>
@@ -510,6 +530,20 @@ async def manage_account(
                 {error_html}
             </form>
         </div>
+        <div class="card">
+            <div class="sub" style="margin-bottom:0">Dashboard login (Basic Auth)</div>
+            <div class="account-meta">This is what a browser asks for when opening this account's own
+            dashboard — distinct per account, so one account's login can't open another's.</div>
+            <label>Username</label>
+            <input value="{acct.dashboard_auth_user}" readonly>
+            <label>Password</label>
+            <input value="{acct.dashboard_auth_password}" readonly>
+            <form method="post" action="{PREFIX}/accounts/{name}/dashboard-credentials/regenerate"
+                  onsubmit="return confirm('This immediately changes the dashboard password and restarts the account. Continue?')">
+                <button type="submit" class="btn-secondary" style="color:var(--warn);border-color:var(--warn)">Regenerate password</button>
+            </form>
+            {creds_saved_html}
+        </div>
     """))
 
 
@@ -523,8 +557,8 @@ async def update_account_keys(
     try:
         await update_solana_tracker_keys(name, sampling_key, discovery_key)
     except ProvisioningError as exc:
-        return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
-    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=keys", status_code=303)
+        return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?error={exc}", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=keys", status_code=303)
 
 
 @router.post("/accounts/{name}/trading-params")
@@ -536,8 +570,8 @@ async def update_account_trading_params(request: Request, name: str):
         validated = {key: validate_trading_param(key, form.get(key, "")) for key in TRADING_PARAMS}
         await update_trading_params(name, validated)
     except ProvisioningError as exc:
-        return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}&for=params", status_code=303)
-    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=params", status_code=303)
+        return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?error={exc}&for=params", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=params", status_code=303)
 
 
 @router.post("/accounts/{name}/dashboard-credentials/regenerate")
@@ -555,11 +589,11 @@ async def regenerate_dashboard_credentials(request: Request, name: str):
         try:
             await update_dashboard_credentials(name, user, password)
         except ProvisioningError as exc:
-            return RedirectResponse(f"{PREFIX}/accounts/{name}?error={exc}", status_code=303)
+            return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?error={exc}", status_code=303)
         acct.dashboard_auth_user = user
         acct.dashboard_auth_password = password
 
-    return RedirectResponse(f"{PREFIX}/accounts/{name}?saved=creds", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=creds", status_code=303)
 
 
 app.include_router(router)

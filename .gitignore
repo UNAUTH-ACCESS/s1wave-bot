@@ -10,4 +10,5 @@ bot.log
 bot.log.*
 *.log
 logs/
+logs-*/
 *.bak

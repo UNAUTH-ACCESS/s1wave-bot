@@ -223,6 +223,15 @@ Covered by `tests/test_confluence_live_worker.py::TestCircuitBreaker` (5 tests: 
 
 **Known gap, not fixed today**: the circuit breaker's live state (`is_paused`, `resume_at`) isn't surfaced anywhere in the UI — only via Telegram push at the moment it trips/resumes, and a legacy `/balance` API field nobody looks at. If the user is checking the dashboard mid-pause without having seen the Telegram alert, there's no visual indicator why entries have stopped. Worth adding to the account's own dashboard if this comes up again.
 
+## Per-account page split: overview vs. Settings (2026-10-01)
+
+The user asked directly for "a settings page in each account I can use to tune all these things," after the previous day's manage page had accumulated wallet info + dashboard login + trading parameters + SolanaTracker keys all on one page. Split cleanly:
+- **`/panel/accounts/{name}`** (unchanged URL, trimmed content) — identity only: wallet address, dashboard link, a prominent "⚙ Settings" button. No forms.
+- **`/panel/accounts/{name}/settings`** (new) — everything editable: Trading parameters, SolanaTracker keys, Dashboard login/regenerate. All three POST handlers (`/keys`, `/trading-params`, `/dashboard-credentials/regenerate`) now redirect back here instead of the overview page.
+- Homepage account rows and the playbook's internal references updated to point at Settings specifically rather than the old generic "Manage" for anything that's actually editable.
+
+`_load_account_or_redirect(name)` factored out (both routes needed the identical "look up the account or bounce to the homepage" check). No new provisioning logic — this was purely a control-panel page-structure change, the underlying `TRADING_PARAMS`/key/credential functions from 2026-09-30 are unchanged.
+
 ## Where the rest of the history lives
 
 `/home/solana/NOTEBOOK.md` has the full narrative — every bug, every real number, every decision, in the order it happened, across this and every other project on this machine. This file is the orientation; that file is the record. Update both when you make a real change.
