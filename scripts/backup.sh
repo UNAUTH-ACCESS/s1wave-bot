@@ -16,7 +16,7 @@ set -uo pipefail
 BACKUP_DIR="/home/solana/backups"
 RETENTION_DAYS=14
 TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
-RCLONE_REMOTE="b2:${B2_BUCKET_NAME:-anchorledger-backups}"
+RCLONE_REMOTE="b2:${B2_BUCKET_NAME:-quantedge-backups}/s1wave"
 ROOT="/home/solana/s1wave-bot/solanabot"
 # tag:env-file
 ACCOUNTS=("base:.env" "second:.env.second" "efetobo:.env.efetobo")
