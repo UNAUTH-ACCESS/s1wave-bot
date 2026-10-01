@@ -359,6 +359,56 @@ def get_solana_tracker_keys(name: str) -> dict[str, str]:
     return keys
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_CHAT_RE = re.compile(r"^(-?\d{3,20}|@[A-Za-z0-9_]{4,32})$")
+
+
+def get_notification_contacts(name: str) -> dict[str, str]:
+    """This account's email and Telegram chat id from its .env (never the bot token)."""
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+    out = {"email": "", "telegram_chat_id": ""}
+    for line in env_path.read_text().splitlines():
+        if line.startswith("NOTIFY_EMAIL="):
+            out["email"] = line.split("=", 1)[1].strip()
+        elif line.startswith("TELEGRAM_CHAT_ID="):
+            out["telegram_chat_id"] = line.split("=", 1)[1].strip()
+    return out
+
+
+def validate_notification_contacts(email: str, chat_id: str) -> tuple[str, str]:
+    email, chat_id = email.strip(), chat_id.strip()
+    if email and not _EMAIL_RE.match(email):
+        raise ProvisioningError("That doesn't look like an email address.")
+    if chat_id and not _CHAT_RE.match(chat_id):
+        raise ProvisioningError("Telegram chat id must be a number (or @channelname).")
+    return email, chat_id
+
+
+def _upsert_env(env_path: Path, updates: dict[str, str]) -> None:
+    remaining = dict(updates)
+    lines = env_path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        key = line.partition("=")[0]
+        if key in remaining:
+            lines[i] = f"{key}={remaining.pop(key)}"
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+
+async def update_notification_contacts(name: str, email: str, chat_id: str) -> None:
+    """Sets NOTIFY_EMAIL / TELEGRAM_CHAT_ID in the account's .env and restarts only that account."""
+    email, chat_id = validate_notification_contacts(email, chat_id)
+    env_path = env_path_for(name)
+    if not env_path.exists():
+        raise ProvisioningError(f"No .env file found for account '{name}'.")
+    _upsert_env(env_path, {"NOTIFY_EMAIL": email, "TELEGRAM_CHAT_ID": chat_id})
+    await _run("systemctl", "--user", "restart", service_name_for(name))
+
+
 def generate_dashboard_credentials(name: str) -> tuple[str, str]:
     """A fresh, distinct Basic Auth username/password for one account's own
     dashboard (2026-09-29) — every account used to inherit base's exact

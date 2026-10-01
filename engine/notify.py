@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.logging import get_logger
 from config.settings import settings
 from models.orm import ConfluenceNotification
+from engine.emailer import send_email
 from workers.telegram_alerts import send_alert
 
 log = get_logger(__name__)
@@ -66,6 +67,9 @@ TELEGRAM_PUSH_EVENTS = frozenset({
     "discovery_key_exhausted",
     "discovery_key_recovered",
 })
+
+# Email is for things that need a human, not per-trade chatter (that stays Telegram-only).
+EMAIL_EVENTS = TELEGRAM_PUSH_EVENTS - {"entry_filled", "exit_filled"}
 
 _LEVEL_EMOJI = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}
 
@@ -96,3 +100,13 @@ async def notify(
             await send_alert(text)
         except Exception:
             log.error("notify.telegram_push_failed", notification_event=event, exc_info=True)
+
+    if event in EMAIL_EVENTS and settings.NOTIFY_EMAIL:
+        try:
+            await send_email(
+                settings.NOTIFY_EMAIL,
+                f"[{settings.S1WAVE_ACCOUNT_NAME}] {event.replace('_', ' ')}",
+                message,
+            )
+        except Exception:
+            log.error("notify.email_push_failed", notification_event=event, exc_info=True)

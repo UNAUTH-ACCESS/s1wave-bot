@@ -29,6 +29,8 @@ block (passes the full path through unchanged, no prefix-stripping).
 from __future__ import annotations
 
 import asyncio
+import html as _html
+from urllib.parse import quote
 
 import bcrypt
 import httpx
@@ -41,15 +43,18 @@ from config.logging import get_logger
 from config.settings import settings
 from control_panel.models import Base, ControlAccount, ControlUser
 from database.engine import get_engine, get_session
+from engine.emailer import send_email
 from engine.provisioning import (
     TRADING_PARAMS,
     ProvisioningError,
     create_account,
     generate_dashboard_credentials,
+    get_notification_contacts,
     get_solana_tracker_keys,
     get_trading_params,
     public_url_for,
     update_dashboard_credentials,
+    update_notification_contacts,
     update_solana_tracker_keys,
     update_trading_params,
     validate_trading_param,
@@ -648,12 +653,19 @@ async def account_settings(
     except ProvisioningError:
         trading_params = {key: spec["default"] for key, spec in TRADING_PARAMS.items()}
 
+    try:
+        contacts = get_notification_contacts(name)
+    except ProvisioningError:
+        contacts = {"email": "", "telegram_chat_id": ""}
+    contacts_msg = {
+        "contacts": '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new contacts.</div>',
+        "emailed": '<div class="sub" style="color:var(--accent)">New login emailed to the notification address. It is not shown here.</div>',
+    }.get(saved or "", "")
+    contacts_error_html = f'<div class="error">{_html.escape(error)}</div>' if error and for_ == "contacts" else ""
     saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new keys.</div>' if saved == "keys" else ""
-    creds_saved_html = ('<div class="sub" style="color:var(--accent)">Password regenerated — the account restarted. '
-                         'Copy it now, it won\'t be shown differently again.</div>') if saved == "creds" else ""
     params_saved_html = '<div class="sub" style="color:var(--accent)">Saved — the account restarted with the new parameters.</div>' if saved == "params" else ""
-    error_html = f'<div class="error">{error}</div>' if error and for_ != "params" else ""
-    params_error_html = f'<div class="error">{error}</div>' if error and for_ == "params" else ""
+    error_html = f'<div class="error">{_html.escape(error)}</div>' if error and for_ not in ("params", "contacts") else ""
+    params_error_html = f'<div class="error">{_html.escape(error)}</div>' if error and for_ == "params" else ""
 
     return HTMLResponse(_layout(f"{name} — Settings", f"""
         <div class="topbar">
@@ -686,18 +698,29 @@ async def account_settings(
             </form>
         </div>
         <div class="card">
-            <div class="sub" style="margin-bottom:0">Dashboard login (Basic Auth)</div>
-            <div class="account-meta">This is what a browser asks for when opening this account's own
-            dashboard — distinct per account, so one account's login can't open another's.</div>
-            <label>Username</label>
-            <input value="{acct.dashboard_auth_user}" readonly>
-            <label>Password</label>
-            <input value="{acct.dashboard_auth_password}" readonly>
-            <form method="post" action="{PREFIX}/accounts/{name}/dashboard-credentials/regenerate"
-                  onsubmit="return confirm('This immediately changes the dashboard password and restarts the account. Continue?')">
-                <button type="submit" class="btn-secondary" style="color:var(--warn);border-color:var(--warn)">Regenerate password</button>
+            <div class="sub" style="margin-bottom:0">Notifications</div>
+            <div class="account-meta">Where this account sends alerts (halts, stuck positions, key exhaustion,
+            withdrawals) and where its dashboard login is delivered. Trade open/close alerts stay on Telegram only.</div>
+            <form method="post" action="{PREFIX}/accounts/{name}/contacts">
+                <label>Email</label>
+                <input name="email" type="email" value="{_html.escape(contacts['email'])}" placeholder="you@example.com">
+                <label>Telegram chat id</label>
+                <input name="telegram_chat_id" value="{_html.escape(contacts['telegram_chat_id'])}" placeholder="numeric chat id">
+                <button type="submit">Save &amp; restart account</button>
+                {contacts_msg if saved == "contacts" else ""}
+                {contacts_error_html}
             </form>
-            {creds_saved_html}
+        </div>
+        <div class="card">
+            <div class="sub" style="margin-bottom:0">Dashboard login</div>
+            <div class="account-meta">Username: <b>{_html.escape(acct.dashboard_auth_user)}</b>. The password is never
+            displayed. "Email me a new login" generates a fresh password and sends it only to the notification
+            email above; the old one stops working immediately.</div>
+            <form method="post" action="{PREFIX}/accounts/{name}/dashboard-credentials/regenerate"
+                  onsubmit="return confirm('This immediately changes the dashboard password, restarts the account and emails the new one. Continue?')">
+                <button type="submit" class="btn-secondary" style="color:var(--warn);border-color:var(--warn)">Email me a new login</button>
+            </form>
+            {contacts_msg if saved == "emailed" else ""}
         </div>
     """))
 
@@ -729,10 +752,37 @@ async def update_account_trading_params(request: Request, name: str):
     return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=params", status_code=303)
 
 
-@router.post("/accounts/{name}/dashboard-credentials/regenerate")
-async def regenerate_dashboard_credentials(request: Request, name: str):
+@router.post("/accounts/{name}/contacts")
+async def update_account_contacts(
+    request: Request, name: str, email: str = Form(default=""), telegram_chat_id: str = Form(default=""),
+):
     if not _require_login(request):
         return RedirectResponse(f"{PREFIX}/login", status_code=303)
+    try:
+        await update_notification_contacts(name, email, telegram_chat_id)
+    except ProvisioningError as exc:
+        return RedirectResponse(
+            f"{PREFIX}/accounts/{name}/settings?error={quote(str(exc))}&for=contacts", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=contacts", status_code=303)
+
+
+@router.post("/accounts/{name}/dashboard-credentials/regenerate")
+async def regenerate_dashboard_credentials(request: Request, name: str):
+    """Rotates the account's dashboard password and emails it to its notification address.
+    The new password is never put on a page. If no email is set or the send fails, the
+    rotation is not applied."""
+    if not _require_login(request):
+        return RedirectResponse(f"{PREFIX}/login", status_code=303)
+
+    def back(err: str):
+        return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?error={quote(err)}&for=contacts", status_code=303)
+
+    try:
+        email = get_notification_contacts(name)["email"]
+    except ProvisioningError as exc:
+        return back(str(exc))
+    if not email:
+        return back("Set a notification email first; the new login is only ever sent there.")
 
     async with get_session() as session:
         acct = (await session.execute(
@@ -741,14 +791,22 @@ async def regenerate_dashboard_credentials(request: Request, name: str):
         if acct is None:
             return RedirectResponse(PREFIX + "/", status_code=303)
         user, password = generate_dashboard_credentials(name)
+        link = public_url_for(name) if acct.nginx_configured else f"http://127.0.0.1:{acct.port}/"
+        sent = await send_email(
+            email, f"[{name}] your S1Wave dashboard login",
+            f"Dashboard: {link}\nUsername: {user}\nPassword: {password}\n\n"
+            "This replaces the previous password. Store it in a password manager and delete this email.",
+        )
+        if not sent:
+            return back("Could not send the email, so the password was not changed.")
         try:
             await update_dashboard_credentials(name, user, password)
         except ProvisioningError as exc:
-            return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?error={exc}", status_code=303)
+            return back(str(exc))
         acct.dashboard_auth_user = user
         acct.dashboard_auth_password = password
 
-    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=creds", status_code=303)
+    return RedirectResponse(f"{PREFIX}/accounts/{name}/settings?saved=emailed", status_code=303)
 
 
 async def _fetch_account_notifications(acct: ControlAccount, limit: int) -> list[dict]:

@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
 
+    # Where this account's email notifications and emailed dashboard
+    # credentials go. Blank = no email. The Resend key is read at send time
+    # from RESEND_API_KEY or, failing that, from RESEND_ENV_FILE (shared with
+    # the other projects on this box), so no per-account copy of the key exists.
+    NOTIFY_EMAIL: str = ""
+    RESEND_API_KEY: str = ""
+    RESEND_ENV_FILE: str = "/home/solana/quantedge/.env"
+    NOTIFY_EMAIL_FROM: str = "S1Wave <noreply@anchorledger.space>"
+
     # ── SolanaTracker ────────────────────────────────────────────────────────
     SOLANA_TRACKER_API_KEY: str = ""            # sampling + S1 Wave's price re-check
     # Discovery's own key/rate-limit lane, isolated from sampling's above.
