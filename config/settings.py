@@ -241,6 +241,7 @@ class Settings(BaseSettings):
     DEXSCREENER_POLL_INTERVAL: Annotated[int, Field(ge=10, le=300)] = 60
     # Realistic shadow fills (2026-10-01): shadow positions get a MODELED
     # executable fill (engine/shadow_exec_model.py, no network calls).
+    SHADOW_VARIANTS_ENABLED: bool = True
     SHADOW_EXEC_ENABLED: bool = True
     SHADOW_EXEC_NOTIONAL_USD: float = 0.40          # ~ live's recent average position
     SHADOW_EXEC_DEX_FEE_PCT: float = 0.005          # modeled pool fee per side

@@ -26,7 +26,7 @@ from sqlalchemy import func, select
 
 from database.engine import get_session
 from models.orm import (
-    ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceShadowExecCheck,
+    ConfluenceLiveObservation, ConfluenceLiveTrade, ConfluenceShadowExecCheck, ConfluenceShadowVariantPosition,
     ConfluenceShadowObservation, ConfluenceShadowPosition, MomentumSignalEvent,
     Token, TokenEvaluation, TokenSnapshot,
 )
@@ -42,6 +42,7 @@ TABLES = {
     "shadow_positions": (ConfluenceShadowPosition, "Paper trades (incl. skipped candidates)"),
     "shadow_observations": (ConfluenceShadowObservation, "1-second price series of paper trades"),
     "shadow_exec_checks": (ConfluenceShadowExecCheck, "Modeled executable-exit checks"),
+    "shadow_variants": (ConfluenceShadowVariantPosition, "Exit-rule variants riding on shadow positions"),
     "live_trades": (ConfluenceLiveTrade, "Real-money trades"),
     "live_observations": (ConfluenceLiveObservation, "Price checks on open real trades"),
 }
@@ -49,7 +50,7 @@ TABLES = {
 HANDOFF_FILES = [
     "CLAUDE.md", "CALIBRATION.md", "README.md", "models/orm.py",
     "workers/entry_filters.py", "workers/momentum_signal.py", "engine/trailing_stop.py",
-    "engine/shadow_exec_model.py", "engine/filter_calibration.py",
+    "engine/shadow_exec_model.py", "engine/exit_variants.py", "engine/filter_calibration.py",
 ]
 SAMPLE_ROWS = 300
 

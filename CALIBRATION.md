@@ -47,6 +47,7 @@ One Postgres DB per account (base, second, efetobo). Row counts are for the base
 | `confluence_shadow_positions` | Paper trades | 1.6k (532 closed) | `entry_*`, `exit_*`, `exit_reason`, `pnl_pct`, `status`; modeled fills: `exec_status` (`modeled`/`no_quote`), `exec_notional_usd`, `exec_entry_liq_usd`, `exec_pnl_pct` | Skips are rows too: `wash_skipped`, `high_liq_skip`, `low_bp_skip` (748/80/209). `status` is VARCHAR(16): keep new values short |
 | `confluence_shadow_observations` | 1-second price series of open shadow positions | 1.5M | `position_id`, `observed_at`, `price_usd` | Enables exit-rule replays |
 | `confluence_shadow_exec_checks` | Modeled guard/exit checks | 0 so far | `kind` (entry/guard/exit), `exec_pnl_pct`, `price_impact_raw` (modeled fraction) | Fills once signals fire again |
+| `confluence_shadow_variant_positions` | Exit-rule variants riding on each shadow position (same entry/ticks, own stop and hold rules, modeled fills) | 0 until signals fire | `variant`, `status`, `exit_reason`, `pnl_pct`, `exec_pnl_pct` | Compare with `analysis/variant_report.py live` |
 | `confluence_live_trades` | Real trades | 908 (109 closed) | everything in the hierarchy above, plus fees (`entry/exit_network_fee_lamports`, rent, `reclaim_*`), `exit_reason`, `error_detail` | Same skip statuses, plus `buy_failed` (38) |
 | `confluence_live_observations` | Per-check price record of open live trades | 103k | | Guard audit trail |
 | `confluence_notifications` | Alerts and events | 413 | `event` | Includes key exhaustion, guard exits, halts |
@@ -95,6 +96,14 @@ All are read-only. Outputs go to `analysis/output/` (large CSVs and Markdown sna
 6. **Decide with guardrails.** Change live parameters only when: n is adequate, the effect holds out-of-sample, the change is a narrow tested condition (template: `workers/entry_filters.py`), and the user approves. Thresholds are never auto-tuned; the calibration check only flags drift.
 7. **Deploy and watch rate limits**, not only correctness. Jupiter's free tier is one shared per-IP budget for all live trading; background checks have already starved it once.
 8. **Document** the finding, the regime start date, and how to reproduce it (script + command) in `CLAUDE.md`, and save a new `calibration_*.md`.
+
+### Parallel exit variants (2026-10-01)
+
+`engine/exit_variants.py` parameterises the live exit stack (`base` reproduces it exactly; tested). Each new shadow entry also opens one row per variant in `confluence_shadow_variant_positions` (wide_stop, tight_stop, fine_step, coarse_step, no_trail, hold_1h, hold_20m, tp_50), driven by the same ticks and modeled fills, so every day is a controlled experiment on exits. Add or change a variant by editing `variant_specs()`; old rows keep their name, so rename rather than redefine. Exit rules only: entry-filter variants would need price tracking of skipped candidates (not done).
+
+- `analysis/variant_report.py live`: paired difference vs base, bootstrap 95% CI, verdict (`candidate` only if n >= 30 paired and CI above 0). A flag for human review, never an auto-promotion.
+- `analysis/variant_report.py replay`: same variants over recorded 1s paths of closed positions. Available now but censored (paths end at the primary's exit), so trust the "resolved only" column and live mode.
+- Setting: `SHADOW_VARIANTS_ENABLED`.
 
 ## 7. Open calibration questions (highest value first)
 

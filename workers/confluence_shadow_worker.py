@@ -93,19 +93,22 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine import shadow_exec_model as sem
+from engine import exit_variants as xv
 from engine.trailing_stop import initial_floor, update_trailing_stop
 from models.orm import (
-    ConfluenceShadowExecCheck, ConfluenceShadowObservation, ConfluenceShadowPosition, MomentumSignalEvent, Token,
+    ConfluenceShadowExecCheck, ConfluenceShadowObservation, ConfluenceShadowPosition,
+    ConfluenceShadowVariantPosition, MomentumSignalEvent, Token,
 )
 from workers.confluence_live_worker import (
     _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT, _LIQUIDITY_CHECK_INTERVAL_FAST_S, _LIQUIDITY_CHECK_INTERVAL_S,
@@ -173,6 +176,8 @@ class ConfluenceShadowWorker:
         self._pending_tick: dict = {}
         # position id -> monotonic time of last executable guard quote
         self._last_exec_check: dict = {}
+        self._last_var_guard: dict = {}
+        self._specs = {sp.name: sp for sp in xv.variant_specs() if sp.name != "base"}
 
     async def run(self) -> None:
         log.info("confluence_shadow.started", poll_interval=self._poll_interval, started_at=self._started_at.isoformat())
@@ -197,10 +202,11 @@ class ConfluenceShadowWorker:
         await self._open_new_positions()
 
         open_positions = await self._load_open_positions()
-        if not open_positions:
+        var_hosts = await self._load_open_variants() if settings.SHADOW_VARIANTS_ENABLED else {}
+        if not open_positions and not var_hosts:
             return
 
-        mints = list(open_positions.keys())
+        mints = list(set(open_positions) | set(var_hosts))
         snapshots: dict[str, dict] = {}
         for i in range(0, len(mints), _MAX_MINTS_PER_REQUEST):
             chunk = mints[i:i + _MAX_MINTS_PER_REQUEST]
@@ -211,15 +217,35 @@ class ConfluenceShadowWorker:
                           exc_type=type(exc).__name__, chunk_size=len(chunk))
 
         now = datetime.now(timezone.utc)
+        accepted: dict = {}
         for mint, pos in open_positions.items():
             data = snapshots.get(mint)
             if data is None:
                 continue
             price = self._accept_price(pos, data["price_usd"])
+            accepted[pos["id"]] = price
             if price is None:
                 continue  # implausible tick held for confirmation — see module docstring
             await self._record_observation(pos["id"], price, now)
             await self._maybe_close(pos, price, now, data.get("liquidity_usd"))
+
+        for mint, host in var_hosts.items():
+            data = snapshots.get(mint)
+            if data is None:
+                continue
+            pid = host["pos"]["id"]
+            price = accepted[pid] if pid in accepted else self._accept_price(host["pos"], data["price_usd"])
+            if price is None:
+                continue
+            try:
+                await self._step_variants(host, price, now, data.get("liquidity_usd"))
+            except Exception as exc:
+                log.error("confluence_shadow.variant_error", error=str(exc), exc_info=True)
+
+        live_ids = {p["id"] for p in open_positions.values()} | {h["pos"]["id"] for h in var_hosts.values()}
+        for d in (self._last_accepted_price, self._pending_tick, self._last_exec_check, self._last_var_guard):
+            for k in [k for k in d if k not in live_ids]:
+                del d[k]
 
         elapsed_ms = round((time.monotonic() - t0) * 1000)
         log.info("confluence_shadow.cycle_complete", open_positions=len(mints), elapsed_ms=elapsed_ms)
@@ -387,6 +413,7 @@ class ConfluenceShadowWorker:
                     else:
                         exec_fields = dict(exec_status="no_quote")
                 pos_row = ConfluenceShadowPosition(
+                    id=uuid.uuid4(),
                     token_id=token_id,
                     experiment_version=EXPERIMENT_VERSION,
                     entry_price=entry_price,
@@ -396,6 +423,9 @@ class ConfluenceShadowWorker:
                     **exec_fields,
                 )
                 session.add(pos_row)
+                if settings.SHADOW_VARIANTS_ENABLED:
+                    for name in self._specs:
+                        session.add(ConfluenceShadowVariantPosition(position_id=pos_row.id, variant=name))
                 already_open.add(token_id)
                 log.info(
                     "confluence_shadow.opened",
@@ -474,9 +504,7 @@ class ConfluenceShadowWorker:
             if modeled is not None:
                 exec_gross = modeled[0]
                 notional = pos["exec_notional_usd"]
-                sol_price = Decimal(str(settings.SOL_PRICE_USD or settings.CONFLUENCE_LIVE_DEPOSIT_SOL_PRICE_USD))
-                fees_usd = Decimal(2 * settings.SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE) / Decimal("1e9") * sol_price
-                exec_pnl = (exec_gross * notional - notional - fees_usd) / notional
+                exec_pnl = self._exec_pnl(exec_gross, notional)
                 if guard is None:
                     await self._record_exec_check(pos, "exit", modeled)
 
@@ -505,15 +533,92 @@ class ConfluenceShadowWorker:
             row.exec_pnl_pct = exec_pnl
         if reason is None:
             return
-        self._last_accepted_price.pop(pos["id"], None)
-        self._pending_tick.pop(pos["id"], None)
-        self._last_exec_check.pop(pos["id"], None)
         log.info(
             "confluence_shadow.closed",
             position_id=str(pos["id"]), exit_reason=reason,
             pnl_pct=str(round(float((current_price - pos["entry_price"]) / pos["entry_price"]) * 100, 2)),
             hold_seconds=round((now - pos["entry_time"]).total_seconds()),
         )
+
+    @staticmethod
+    def _exec_pnl(gross: Decimal, notional: Decimal) -> Decimal:
+        sol_price = Decimal(str(settings.SOL_PRICE_USD or settings.CONFLUENCE_LIVE_DEPOSIT_SOL_PRICE_USD))
+        fees_usd = Decimal(2 * settings.SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE) / Decimal("1e9") * sol_price
+        return (gross * notional - notional - fees_usd) / notional
+
+    async def _load_open_variants(self) -> dict[str, dict]:
+        """{mint: {pos: {...}, variants: [{id, variant, floor, hwm}]}} for open variant rows."""
+        async with get_session() as session:
+            result = await session.execute(
+                select(
+                    Token.mint_address, ConfluenceShadowPosition.id,
+                    ConfluenceShadowPosition.entry_price, ConfluenceShadowPosition.entry_time,
+                    ConfluenceShadowPosition.exec_status, ConfluenceShadowPosition.exec_notional_usd,
+                    ConfluenceShadowPosition.exec_entry_liq_usd,
+                    ConfluenceShadowVariantPosition.id, ConfluenceShadowVariantPosition.variant,
+                    ConfluenceShadowVariantPosition.trailing_stop_floor,
+                    ConfluenceShadowVariantPosition.high_watermark_price,
+                )
+                .join(ConfluenceShadowPosition, ConfluenceShadowPosition.id == ConfluenceShadowVariantPosition.position_id)
+                .join(Token, Token.id == ConfluenceShadowPosition.token_id)
+                .where(ConfluenceShadowVariantPosition.status == "open")
+            )
+            hosts: dict[str, dict] = {}
+            for mint, pid, ep, et, xs, xn, xl, vid, name, floor, hwm in result.all():
+                h = hosts.setdefault(mint, dict(
+                    pos=dict(id=pid, mint=mint, entry_price=ep, entry_time=et,
+                             exec_status=xs, exec_notional_usd=xn, exec_entry_liq_usd=xl),
+                    variants=[],
+                ))
+                h["variants"].append(dict(id=vid, variant=name, floor=floor, hwm=hwm))
+            return hosts
+
+    async def _step_variants(self, host: dict, price: Decimal, now: datetime, liquidity_usd: Decimal | None) -> None:
+        """One tick for every open variant of one position. The modeled
+        liquidity guard is evaluated once per position at live's cadence and
+        applies to all variants."""
+        pos = host["pos"]
+        entry = pos["entry_price"]
+        modeled = self._model_exit(pos, price, liquidity_usd) if pos.get("exec_status") == "modeled" else None
+        crisis = False
+        if modeled is not None:
+            interval = _LIQUIDITY_CHECK_INTERVAL_S
+            if entry and (price - entry) / entry >= _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT:
+                interval = _LIQUIDITY_CHECK_INTERVAL_FAST_S
+            last = self._last_var_guard.get(pos["id"])
+            mono = time.monotonic()
+            if last is None or mono - last >= interval:
+                self._last_var_guard[pos["id"]] = mono
+                crisis = is_liquidity_crisis(modeled[1], modeled[0] - 1)
+
+        async with get_session() as session:
+            for v in host["variants"]:
+                spec = self._specs.get(v["variant"])
+                if spec is None:
+                    continue
+                if crisis:
+                    reason, floor, hwm = "LIQUIDITY_GUARD", v["floor"], v["hwm"]
+                else:
+                    reason, floor, hwm = xv.step_exit(spec, entry, pos["entry_time"], price, now, v["floor"], v["hwm"])
+                if reason is None:
+                    if floor != v["floor"] or hwm != v["hwm"]:
+                        await session.execute(update(ConfluenceShadowVariantPosition)
+                            .where(ConfluenceShadowVariantPosition.id == v["id"])
+                            .values(trailing_stop_floor=floor, high_watermark_price=hwm))
+                    continue
+                exit_price, pnl = price, (price - entry) / entry
+                exec_pnl = None
+                if modeled is not None:
+                    gross = modeled[0]
+                    exec_pnl = self._exec_pnl(gross, pos["exec_notional_usd"])
+                    if reason == "LIQUIDITY_GUARD":
+                        exit_price, pnl = entry * gross, gross - 1
+                await session.execute(update(ConfluenceShadowVariantPosition)
+                    .where(ConfluenceShadowVariantPosition.id == v["id"],
+                           ConfluenceShadowVariantPosition.status == "open")
+                    .values(status="closed", trailing_stop_floor=floor, high_watermark_price=hwm,
+                            exit_price=exit_price, exit_time=now, exit_reason=reason,
+                            pnl_pct=pnl, exec_pnl_pct=exec_pnl))
 
     def _model_exit(self, pos: dict, price: Decimal, liquidity_usd: Decimal | None):
         """(gross proceeds / cost, impact) from the pool model, or None."""

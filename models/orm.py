@@ -531,6 +531,32 @@ class ConfluenceShadowExecCheck(Base):
     price_impact_raw: Mapped[str | None] = mapped_column(String(40))
 
 
+class ConfluenceShadowVariantPosition(Base):
+    """One exit-rule variant (engine/exit_variants.py) riding on a shadow
+    position: same entry and price ticks, its own stop/hold rules. Analysis
+    only. exec_pnl_pct uses the same modeled-fill formula as the primary."""
+
+    __tablename__ = "confluence_shadow_variant_positions"
+    __table_args__ = (
+        UniqueConstraint("position_id", "variant", name="uq_shadow_variant_position"),
+        Index("ix_shadow_variant_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    position_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("confluence_shadow_positions.id", ondelete="CASCADE"), nullable=False
+    )
+    variant: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(8), nullable=False, default="open")  # open | closed
+    trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    exit_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exit_reason: Mapped[str | None] = mapped_column(String(32))
+    pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    exec_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+
+
 class ConfluenceShadowObservation(Base):
     """
     Raw 1-second price observation for a ConfluenceShadowPosition while

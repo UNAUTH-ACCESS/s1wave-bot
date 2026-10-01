@@ -346,3 +346,6 @@ Switch off: `SHADOW_EXEC_ENABLED=false` + restart. Migrations phase18 + phase19 
 
 ## Dataset export / AI handoff pack
 `api/export.py` (router included in `api/app.py`): `/export/index`, `/export/<table>.csv.gz`, `/export/handoff.zip`; dashboard card "Data export". The zip bundles the calibration report, schema, samples, docs and key code, never secrets. See CALIBRATION.md section 9.
+
+## Shadow exit variants
+`engine/exit_variants.py` + `confluence_shadow_variant_positions` (migration phase22, applied to all 3 DBs): exit-rule variants ride each shadow entry. Worker: `_load_open_variants` / `_step_variants`. Report: `analysis/variant_report.py live|replay`. Details in CALIBRATION.md. Live trading is untouched.
