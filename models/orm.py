@@ -495,9 +495,39 @@ class ConfluenceShadowPosition(Base):
     # (floor = initial_floor(entry_price), hwm = entry_price).
     high_watermark_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
     trailing_stop_floor: Mapped[Decimal | None] = mapped_column(Numeric(30, 12))
+    # Executable ("realistic") fills, 2026-10-01 — see engine/jupiter_quotes.py.
+    # exec_pnl_pct is net of estimated network fees; pnl_pct above stays the
+    # DexScreener-snapshot figure (except LIQUIDITY_GUARD exits, where it is
+    # the executable P&L). exec_status: 'quoted' | 'no_quote' (fail-open,
+    # filter these out of realism analysis).
+    exec_status: Mapped[str | None] = mapped_column(String(16))
+    exec_notional_usd: Mapped[Decimal | None] = mapped_column(Numeric(20, 6))
+    exec_entry_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exec_entry_tokens_raw: Mapped[int | None] = mapped_column(BigInteger)
+    exec_exit_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exec_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
 
     def __repr__(self) -> str:
         return f"<ConfluenceShadowPosition {self.experiment_version} token={self.token_id} status={self.status}>"
+
+
+class ConfluenceShadowExecCheck(Base):
+    """One executable Jupiter quote taken for a shadow position
+    (kind: 'entry' | 'guard' | 'exit'). price_impact_raw is stored exactly as
+    Jupiter reported it so the "1" sentinel stays visible in the dataset."""
+
+    __tablename__ = "confluence_shadow_exec_checks"
+    __table_args__ = (Index("ix_confluence_shadow_exec_checks_position", "position_id", "checked_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    position_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("confluence_shadow_positions.id", ondelete="CASCADE"), nullable=False
+    )
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    out_lamports: Mapped[int | None] = mapped_column(BigInteger)
+    exec_pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
+    price_impact_raw: Mapped[str | None] = mapped_column(String(40))
 
 
 class ConfluenceShadowObservation(Base):

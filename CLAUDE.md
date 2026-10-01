@@ -330,3 +330,11 @@ Rollback = revert this commit. Shadow stays optimistic (no fees/slippage).
 
 ### 2026-10-01: discovery poll interval 60s -> 300s
 `_POLL_INTERVAL` in `workers/discovery_worker.py`. Free SolanaTracker keys are lifetime-capped; 1/min burned ~1,440 calls/day. 5 min = ~288/day (5x longer key life); the 30-min look-back window still overlaps. Cost: up to 5 min later token discovery. Revert to 60 if a paid plan is bought. Key-exhaustion alerts now take ~25 min to trip (5 consecutive bad polls).
+
+### 2026-10-01: shadow positions now use executable Jupiter fills (`engine/jupiter_quotes.py`)
+Goal: a richer, realistic shadow dataset. Since ~10:58Z (restart), each NEW shadow position:
+- takes a real Jupiter **buy quote** at `SHADOW_EXEC_NOTIONAL_USD` (default $0.40, ~live's average size). No route -> status `no_route_skip` (live couldn't enter either). Rate-limited/error -> opens anyway with `exec_status='no_quote'` (fail-open; EXCLUDE these in realism analysis).
+- runs the **same liquidity guard as live** (`is_liquidity_crisis`, same 60s/30s cadence) on its quoted size; exit reason `LIQUIDITY_GUARD`, with `pnl_pct` = executable P&L for those exits.
+- at any exit takes a final sell quote -> `exec_exit_lamports`, `exec_pnl_pct` (net of `SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE`=13,000 x2, live's measured avg). `pnl_pct` otherwise remains the old DexScreener-snapshot figure; old rows have NULL exec_* columns.
+- every quote is logged in `confluence_shadow_exec_checks` (kind entry/guard/exit, raw `price_impact_raw` incl. the "1" sentinel).
+Switch off: `SHADOW_EXEC_ENABLED=false` in the account's env file + restart. Migration: `migrations/phase18_shadow_executable_fills.sql` (applied to all 3 account DBs; new accounts get the table via create_all but need the ALTER). Jupiter calls are serialized with a 0.5s gap (shared per-IP budget with live; watch for 429 / `no_quote` share). NOT modeled: ATA rent (reclaimed), latency between signal and fill, partial fills. Compare: `analysis/liquidity_guard_false_positives.py` ("Prospective" section). No new data until sampling keys work (no signals without sampling).

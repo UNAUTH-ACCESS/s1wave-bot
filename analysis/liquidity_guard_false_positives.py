@@ -165,6 +165,20 @@ async def shadow_vs_live() -> None:
 FIX_DEPLOYED = datetime(2026, 10, 1, 6, 11, tzinfo=timezone.utc)  # restart that shipped the fix
 
 
+async def session_exec():
+    async with get_session() as session:
+        return (await session.execute(text("""
+            SELECT COUNT(*) FILTER (WHERE status='closed' AND exec_status='quoted' AND exec_pnl_pct IS NOT NULL) n,
+                   COUNT(*) FILTER (WHERE status='closed' AND exec_status='quoted' AND exec_pnl_pct > 0) wins,
+                   ROUND(AVG(exec_pnl_pct) FILTER (WHERE status='closed' AND exec_status='quoted')*100, 2) avg,
+                   COUNT(*) FILTER (WHERE status='no_route_skip') skipped,
+                   COUNT(*) FILTER (WHERE exec_status='no_quote') nq
+            FROM confluence_shadow_positions WHERE entry_time >= :t"""), {"t": EXEC_SHADOW_START})).first()
+
+
+EXEC_SHADOW_START = datetime(2026, 10, 1, 10, 58, tzinfo=timezone.utc)  # adjust to shadow-exec deploy time
+
+
 async def prospective_since_fix() -> None:
     """Live vs shadow for entries AFTER the executable-proceeds fix."""
     print(f"=== Prospective: entries since fix ({FIX_DEPLOYED:%Y-%m-%d %H:%M}Z) ===")
@@ -183,6 +197,9 @@ async def prospective_since_fix() -> None:
             WHERE status='closed' AND entry_time >= :t GROUP BY 1 ORDER BY 2 DESC"""),
             {"t": FIX_DEPLOYED})).all()
     print(f"  shadow: n={sh.n} wins={sh.wins} avg_pnl_pct={sh.avg}")
+    xs = (await session_exec())
+    print(f"  shadow EXECUTABLE (quoted, net of fees): n={xs.n} wins={xs.wins} avg_exec_pnl_pct={xs.avg}"
+          f"  | no_route_skip={xs.skipped} no_quote(fail-open)={xs.nq}")
     print(f"  live:   n={lv.n} wins={lv.wins} real_pnl_usd={lv.usd}")
     print(f"  live exits: {{{', '.join(f'{e.exit_reason}: {e.n}' for e in ex)}}}")
     print("  (judge once n>=30 live; shadow remains optimistic - no fees/slippage)\n")

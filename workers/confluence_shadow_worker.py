@@ -102,9 +102,14 @@ from sqlalchemy import select
 from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
+from engine import jupiter_quotes as jq
 from engine.trailing_stop import initial_floor, update_trailing_stop
 from models.orm import (
-    ConfluenceShadowObservation, ConfluenceShadowPosition, MomentumSignalEvent, Token,
+    ConfluenceShadowExecCheck, ConfluenceShadowObservation, ConfluenceShadowPosition, MomentumSignalEvent, Token,
+)
+from workers.confluence_live_worker import (
+    _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT, _LIQUIDITY_CHECK_INTERVAL_FAST_S, _LIQUIDITY_CHECK_INTERVAL_S,
+    is_liquidity_crisis,
 )
 from workers.http_queue import RateLimitedQueue
 from workers.dexscreener_client import _DEXSCREENER_BASE, _best_pair
@@ -166,6 +171,8 @@ class ConfluenceShadowWorker:
         # implausible tick awaiting a second look next cycle.
         self._last_accepted_price: dict = {}
         self._pending_tick: dict = {}
+        # position id -> monotonic time of last executable guard quote
+        self._last_exec_check: dict = {}
 
     async def run(self) -> None:
         log.info("confluence_shadow.started", poll_interval=self._poll_interval, started_at=self._started_at.isoformat())
@@ -369,14 +376,48 @@ class ConfluenceShadowWorker:
                     )
                     continue
 
-                session.add(ConfluenceShadowPosition(
+                exec_fields, entry_quote = {}, None
+                sol_price = Decimal(str(settings.SOL_PRICE_USD))
+                if settings.SHADOW_EXEC_ENABLED and sol_price > 0:
+                    notional = Decimal(str(settings.SHADOW_EXEC_NOTIONAL_USD))
+                    lamports = int(notional / sol_price * Decimal("1e9"))
+                    qr = await jq.quote_buy(token.mint_address, lamports)
+                    if qr.reason == "no_route":
+                        # Live cannot enter without a route either.
+                        session.add(ConfluenceShadowPosition(
+                            token_id=token_id, experiment_version=EXPERIMENT_VERSION,
+                            entry_price=entry_price, entry_time=entry_time,
+                            n_rules_cofiring=n_cofiring, status="no_route_skip",
+                        ))
+                        already_open.add(token_id)
+                        log.info("confluence_shadow.entry_no_route_skipped",
+                                 token_id=str(token_id), symbol=token.symbol)
+                        continue
+                    if qr.quote is not None:
+                        entry_quote = qr.quote
+                        exec_fields = dict(
+                            exec_status="quoted", exec_notional_usd=notional,
+                            exec_entry_lamports=qr.quote.in_amount,
+                            exec_entry_tokens_raw=qr.quote.out_amount,
+                        )
+                    else:
+                        exec_fields = dict(exec_status="no_quote")
+                pos_row = ConfluenceShadowPosition(
                     token_id=token_id,
                     experiment_version=EXPERIMENT_VERSION,
                     entry_price=entry_price,
                     entry_time=entry_time,
                     n_rules_cofiring=n_cofiring,
                     status="open",
-                ))
+                    **exec_fields,
+                )
+                session.add(pos_row)
+                if entry_quote is not None:
+                    await session.flush()
+                    session.add(ConfluenceShadowExecCheck(
+                        position_id=pos_row.id, kind="entry",
+                        price_impact_raw=entry_quote.price_impact_raw[:40],
+                    ))
                 already_open.add(token_id)
                 log.info(
                     "confluence_shadow.opened",
@@ -392,14 +433,17 @@ class ConfluenceShadowWorker:
                     Token.mint_address, ConfluenceShadowPosition.id,
                     ConfluenceShadowPosition.entry_price, ConfluenceShadowPosition.entry_time,
                     ConfluenceShadowPosition.trailing_stop_floor, ConfluenceShadowPosition.high_watermark_price,
+                    ConfluenceShadowPosition.exec_status, ConfluenceShadowPosition.exec_entry_lamports,
+                    ConfluenceShadowPosition.exec_entry_tokens_raw,
                 )
                 .join(Token, Token.id == ConfluenceShadowPosition.token_id)
                 .where(ConfluenceShadowPosition.status == "open")
             )
             return {
-                mint: dict(id=pid, entry_price=ep, entry_time=et,
-                           trailing_stop_floor=floor, high_watermark_price=hwm)
-                for mint, pid, ep, et, floor, hwm in result.all()
+                mint: dict(id=pid, mint=mint, entry_price=ep, entry_time=et,
+                           trailing_stop_floor=floor, high_watermark_price=hwm,
+                           exec_status=xs, exec_entry_lamports=xl, exec_entry_tokens_raw=xt)
+                for mint, pid, ep, et, floor, hwm, xs, xl, xt in result.all()
             }
 
     # ── exit — layered stop (2026-09-23) ────────────────────────────────
@@ -437,9 +481,28 @@ class ConfluenceShadowWorker:
     async def _maybe_close(self, pos: dict, current_price: Decimal, now: datetime) -> None:
         current_floor = pos.get("trailing_stop_floor") or initial_floor(pos["entry_price"])
         current_hwm = pos.get("high_watermark_price") or pos["entry_price"]
-        reason, new_floor, new_hwm = self._check_exit(
-            pos["entry_price"], pos["entry_time"], current_price, now, current_floor, current_hwm,
-        )
+        exec_quote = None  # a sell Quote for the exact entry size, if one was taken this cycle
+        guard = await self._check_exec_guard(pos, current_price)
+        if guard is not None:
+            exec_quote = guard[0]
+        if guard is not None and guard[1]:
+            reason, new_floor, new_hwm = "LIQUIDITY_GUARD", current_floor, current_hwm
+        else:
+            reason, new_floor, new_hwm = self._check_exit(
+                pos["entry_price"], pos["entry_time"], current_price, now, current_floor, current_hwm,
+            )
+
+        exec_exit_lamports = exec_pnl = None
+        if reason is not None and pos.get("exec_status") == "quoted":
+            if exec_quote is None:
+                qr = await jq.quote_sell(pos["mint"], int(pos["exec_entry_tokens_raw"]))
+                exec_quote = qr.quote
+                if exec_quote is not None:
+                    await self._record_exec_check(pos, "exit", exec_quote)
+            if exec_quote is not None:
+                exec_exit_lamports = exec_quote.out_amount
+                fees = 2 * settings.SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE
+                exec_pnl = Decimal(exec_exit_lamports - pos["exec_entry_lamports"] - fees) / Decimal(pos["exec_entry_lamports"])
 
         async with get_session() as session:
             result = await session.execute(
@@ -453,21 +516,59 @@ class ConfluenceShadowWorker:
             if reason is None:
                 return
             pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+            if reason == "LIQUIDITY_GUARD" and exec_quote is not None:
+                # The snapshot is exactly what the guard distrusts: use the
+                # executable value, expressed in the same price units.
+                gross = Decimal(exec_quote.out_amount) / Decimal(pos["exec_entry_lamports"])
+                current_price = pos["entry_price"] * gross
+                pnl_pct = gross - 1
             row.status = "closed"
             row.exit_price = current_price
             row.exit_time = now
             row.exit_reason = reason
             row.pnl_pct = pnl_pct
+            row.exec_exit_lamports = exec_exit_lamports
+            row.exec_pnl_pct = exec_pnl
         if reason is None:
             return
         self._last_accepted_price.pop(pos["id"], None)
         self._pending_tick.pop(pos["id"], None)
+        self._last_exec_check.pop(pos["id"], None)
         log.info(
             "confluence_shadow.closed",
             position_id=str(pos["id"]), exit_reason=reason,
             pnl_pct=str(round(float((current_price - pos["entry_price"]) / pos["entry_price"]) * 100, 2)),
             hold_seconds=round((now - pos["entry_time"]).total_seconds()),
         )
+
+    async def _record_exec_check(self, pos: dict, kind: str, quote: "jq.Quote") -> Decimal | None:
+        entry = pos.get("exec_entry_lamports")
+        pnl = (Decimal(quote.out_amount) / Decimal(entry) - 1) if entry else None
+        async with get_session() as session:
+            session.add(ConfluenceShadowExecCheck(
+                position_id=pos["id"], kind=kind, out_lamports=quote.out_amount,
+                exec_pnl_pct=pnl, price_impact_raw=quote.price_impact_raw[:40],
+            ))
+        return pnl
+
+    async def _check_exec_guard(self, pos: dict, current_price: Decimal):
+        """Same executable-liquidity guard live uses, on the shadow's own
+        quoted size. Returns None if no check ran, else (quote, is_crisis)."""
+        if pos.get("exec_status") != "quoted" or not pos.get("exec_entry_tokens_raw"):
+            return None
+        interval = _LIQUIDITY_CHECK_INTERVAL_S
+        if pos["entry_price"] and (current_price - pos["entry_price"]) / pos["entry_price"] >= _LIQUIDITY_CHECK_FAST_THRESHOLD_PCT:
+            interval = _LIQUIDITY_CHECK_INTERVAL_FAST_S
+        last = self._last_exec_check.get(pos["id"])
+        now_mono = time.monotonic()
+        if last is not None and now_mono - last < interval:
+            return None
+        self._last_exec_check[pos["id"]] = now_mono
+        qr = await jq.quote_sell(pos["mint"], int(pos["exec_entry_tokens_raw"]))
+        if qr.quote is None:
+            return None
+        pnl = await self._record_exec_check(pos, "guard", qr.quote)
+        return qr.quote, bool(pnl is not None and is_liquidity_crisis(qr.quote.price_impact, pnl))
 
     async def _record_observation(self, position_id, price: Decimal, now: datetime) -> None:
         async with get_session() as session:
