@@ -260,6 +260,22 @@ This file already used CSS custom properties consistently (`:root { --bg; --surf
 
 Typography: `'Space Mono'` (21 occurrences — buttons, labels, the log, inputs, badges) → `'JetBrains Mono'`; `'Syne'` (body font) → `'Inter'`. Google Fonts `<link>` updated to match. Verified the swap was complete by grepping the whole file for every old hex literal and both old font family names afterward — zero remaining — then confirmed live via `curl` against the real dashboard (no restart needed; `FileResponse` re-reads this file from disk on every request, same as every other static-file change this session). The notification feed this dashboard already had (`.notif-row.info/.warning/.critical`) needed no new code, just picked up the new palette automatically.
 
+## ⚠ OPEN, UNFIXED: the liquidity guard is force-liquidating healthy positions (2026-10-01)
+
+**This is currently the single biggest reason live trading loses money, and it is deliberately NOT fixed yet** — the user explicitly said "don't change live trading yet... I don't want us to get bad reaction when the market is actually good." Read `analysis/liquidity_guard_false_positives.py` (read-only, reproduces everything below) before touching anything here.
+
+**What's wrong.** `_check_liquidity_guard()` exits on `price_impact_pct >= 0.35` OR `real_pnl_pct <= -0.30`. Jupiter's `priceImpactPct` comes back as the literal string **`"1"`** for pump.fun-style thin pools — **564 of 575 guard firings saw exactly `"1"`** — so the first condition is permanently satisfied and the guard closes essentially every live position within seconds of entry.
+
+**Two independent proofs it's not a real measurement:**
+1. **Internal contradiction at firing time.** The same quote reporting `price_impact_pct == 1` ("100% impact, the sell consumes the whole pool") simultaneously reported proceeds worth **95%–99.8%** of the position (logged `real_pnl_pct` of −0.2%..−5%). You cannot consume the entire pool and get ~96%+ of your money back. The proceeds number is sane; the impact field isn't.
+2. **Live control quote.** `SOL→USDC` (deep pool) returns `priceImpactPct: '0'` from the same endpoint — so the field IS a fraction and the `0.35` threshold reads the unit *correctly*. It's specifically the thin memecoin routes that return the clamped/sentinel `1`, while still returning a real route and real `outAmount`.
+
+**Cost, measured.** Of 48 guard-*closed* trades with a recorded real P&L: **17 (35%) were genuine crises** (real P&L ≤ −30%) and **31 (65%) were healthy** (real P&L > −10%) when they got liquidated. Critically — **all 17 genuine saves would still have been caught by the P&L-floor branch alone**, since being ≤ −30% is exactly that branch's condition. The impact branch contributes only the 31 false liquidations.
+
+**Controlled comparison already in the data** (same signals, same entry filters, same exit rules; shadow has no guard), entries since 2026-09-27: **shadow n=113, 96% win rate** (exits mostly TIME_EXIT) vs **live n=42, 7% win rate** (41/42 LIQUIDITY_GUARD). Note honestly: shadow's 96% is NOT achievable — it models zero fees/slippage and prices off DexScreener snapshots that can sit frozen on thin liquidity, which is the *exact* failure the guard was built for (see the BLK/Gavel incidents in the guard's own docstring). The true edge is unknown; it is simply not ~7%. **This also rules out the SolanaTracker sampling outage as the cause of this specific pattern — live went 0/10 during the 2026-09-29/30 window when sampling was fully healthy.**
+
+**Suggested fix, smallest-and-safest first (NOT applied):** keep the impact branch but require corroboration — treat high impact as a crisis only when `real_pnl_pct` is *also* meaningfully negative (e.g. ≤ −10%). That preserves every genuine save in the data while making a constant/sentinel impact value harmless. Alternatives: drop the impact branch entirely (the P&L branch is doing the real work), or treat the exact values `1` and `0` as non-measurements. **Whatever is chosen: ship it behind a real before/after measurement, because the guard does catch real rugs 35% of the time and removing it naively re-opens the BLK/Gavel failure mode.**
+
 ## Where the rest of the history lives
 
 `/home/solana/NOTEBOOK.md` has the full narrative — every bug, every real number, every decision, in the order it happened, across this and every other project on this machine. This file is the orientation; that file is the record. Update both when you make a real change.
