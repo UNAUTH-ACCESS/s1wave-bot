@@ -57,9 +57,11 @@ from sqlalchemy import select
 from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
+from engine.notify import notify as notify_shared
 from models.orm import Token, TokenStatus, ShadowTrade
 from workers import shared_snapshot
 from workers.http_queue import get_http_queue
+from workers.key_health import ExhaustionWatcher
 
 log = get_logger(__name__)
 
@@ -90,6 +92,7 @@ class SamplingWorker:
         # shared with DiscoveryWorker — see that module's docstring for why
         # a shared dict is needed once two pollers can both cover the same
         # mint.
+        self._key_watcher = ExhaustionWatcher()
 
     async def run(self) -> None:
         log.info("sampling_worker.started", interval=self._interval)
@@ -143,6 +146,7 @@ class SamplingWorker:
         # never blocks sampling or age-out for the rest.
         snapshots: dict[str, dict] = {}
         fetch_failed_mints: set[str] = set()
+        auth_error_this_cycle = False
         for i in range(0, len(to_fetch), _MAX_TOKENS_PER_REQUEST):
             chunk = to_fetch[i:i + _MAX_TOKENS_PER_REQUEST]
             try:
@@ -151,6 +155,8 @@ class SamplingWorker:
                 log.error("sampling_worker.fetch_error", error=str(exc),
                           exc_type=type(exc).__name__, chunk_size=len(chunk))
                 fetch_failed_mints.update(chunk)
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+                    auth_error_this_cycle = True
 
         sampled = errors = covered = 0
 
@@ -259,6 +265,38 @@ class SamplingWorker:
             errors=errors,
             elapsed_ms=elapsed_ms,
         )
+
+        # Key exhaustion alert (2026-10-01) — "bad" means an auth error
+        # actually occurred AND nothing got through at all this cycle; a
+        # single chunk 401/403 while the rest of the cycle succeeds is not
+        # the key being dead. See workers/key_health.py.
+        bad_cycle = auth_error_this_cycle and sampled == 0
+        transition = self._key_watcher.observe(bad_cycle)
+        if transition is not None:
+            await self._notify_key_health(transition)
+
+    async def _notify_key_health(self, transition: str) -> None:
+        """Never let a notification failure break the sampling cycle that
+        triggered it — same defensive convention as every other _notify in
+        this codebase."""
+        try:
+            if transition == "tripped":
+                level, event, message = (
+                    "critical", "sampling_key_exhausted",
+                    f"SOLANA_TRACKER_API_KEY (sampling) has returned 401/403 with zero successful "
+                    f"samples for {self._key_watcher.threshold}+ consecutive cycles — this looks like "
+                    "the key running out, not a network blip. Replace it via this account's Settings "
+                    "page (SolanaTracker keys) with a fresh one.",
+                )
+            else:
+                level, event, message = (
+                    "info", "sampling_key_recovered",
+                    "SOLANA_TRACKER_API_KEY (sampling) is successfully fetching data again.",
+                )
+            async with get_session() as session:
+                await notify_shared(session, level, event, message)
+        except Exception:
+            log.error("sampling_worker.key_health_notify_failed", transition=transition, exc_info=True)
 
     async def _fetch_batch(
         self,

@@ -61,6 +61,10 @@ TELEGRAM_PUSH_EVENTS = frozenset({
     "exit_filled",
     "circuit_breaker_tripped",
     "circuit_breaker_resumed",
+    "sampling_key_exhausted",
+    "sampling_key_recovered",
+    "discovery_key_exhausted",
+    "discovery_key_recovered",
 })
 
 _LEVEL_EMOJI = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}

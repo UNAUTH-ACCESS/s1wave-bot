@@ -63,9 +63,11 @@ from sqlalchemy import select
 from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
+from engine.notify import notify as notify_shared
 from models.orm import Token, TokenStatus
 from workers import shared_snapshot
 from workers.http_queue import RateLimitedQueue
+from workers.key_health import ExhaustionWatcher
 
 log = get_logger(__name__)
 
@@ -143,6 +145,7 @@ class DiscoveryWorker:
         self._queue    = filter_queue
         self._shutdown = shutdown_event
         self._promoted: set[str] = set()   # mints already forwarded downstream
+        self._key_watcher = ExhaustionWatcher()
 
         # Own rate-limited queue and own API key — isolated from sampling's
         # (and s1_wave's) shared get_http_queue() lane. Previously all three
@@ -170,6 +173,7 @@ class DiscoveryWorker:
             async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
                 while not self._shutdown.is_set():
                     t0 = time.monotonic()
+                    bad_poll = False
                     try:
                         await self._poll(client)
                     except Exception as exc:
@@ -178,6 +182,11 @@ class DiscoveryWorker:
                             exc_type=type(exc).__name__,
                             error=str(exc),
                         )
+                        bad_poll = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403)
+
+                    transition = self._key_watcher.observe(bad_poll)
+                    if transition is not None:
+                        await self._notify_key_health(transition)
 
                     elapsed = time.monotonic() - t0
                     try:
@@ -190,6 +199,29 @@ class DiscoveryWorker:
         finally:
             self._http.stop()
             log.info("discovery_worker.stopped")
+
+    async def _notify_key_health(self, transition: str) -> None:
+        """Never let a notification failure break the discovery loop that
+        triggered it — same defensive convention as every other _notify in
+        this codebase."""
+        try:
+            if transition == "tripped":
+                level, event, message = (
+                    "critical", "discovery_key_exhausted",
+                    f"SOLANA_TRACKER_API_KEY_DISCOVERY has returned 401/403 for "
+                    f"{self._key_watcher.threshold}+ consecutive polls — this looks like the key "
+                    "running out, not a network blip. Replace it via this account's Settings page "
+                    "(SolanaTracker keys) with a fresh one.",
+                )
+            else:
+                level, event, message = (
+                    "info", "discovery_key_recovered",
+                    "SOLANA_TRACKER_API_KEY_DISCOVERY is successfully fetching data again.",
+                )
+            async with get_session() as session:
+                await notify_shared(session, level, event, message)
+        except Exception:
+            log.error("discovery_worker.key_health_notify_failed", transition=transition, exc_info=True)
 
     async def _poll(self, client: httpx.AsyncClient) -> None:
         t0      = time.monotonic()
