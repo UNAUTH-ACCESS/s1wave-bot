@@ -2,7 +2,47 @@
 
 **If you are an AI model reading this cold: read this whole file before touching anything. This trades real money.**
 
-## Current standing orders (2026-09-24, from the user, still in force until told otherwise)
+## HANDOFF (2026-10-01) — the original Claude subscription has ended; the user now operates alone with a free Claude session
+
+**Read this section first, then the rest. You are likely a smaller-budget session: be economical, check things on demand, never start background monitors.**
+
+### Rules that always apply (user's standing instructions)
+1. **Never print, echo, or commit secrets** (`.env*` private keys, Basic Auth passwords, Telegram token, SolanaTracker keys). Don't `cat` env files or grep journals in a way that dumps them. This repo is PUBLIC on GitHub.
+2. **Don't change live trading logic without the user's explicit go-ahead.** Propose, explain the tradeoff, wait.
+3. **Before restarting any bot service: confirm no open positions** (`confluence_live_trades` where status in ('open','unsellable')) in that account's DB. Then restart, then verify the journal and a status endpoint.
+4. **Run the full suite before committing**: `cd /home/solana/s1wave-bot/solanabot && source .venv/bin/activate && python -m pytest -q` (~110s, 411 tests should pass).
+5. Never auto-arm an unfunded account. Never rewrite public git history without go-ahead.
+6. An auto-mode permission classifier sometimes blocks production-touching commands (journal reads, restarts, authenticated curls). Don't work around it; ask the user to run the command with `! <cmd>` and paste the output.
+
+### Layout
+- One codebase, one account per env file: base `.env` (port 8000, `s1wave-bot.service`), `.env.second` (8001, `s1wave-bot-second`), `.env.efetobo` (8002, `s1wave-bot-efetobo`). Control panel `.env.control` (port 9000, `s1wave-control-panel.service`). All are `systemctl --user` units; Linger is on, `Restart=on-failure`.
+- Public URL (single domain, nginx in the shared `/home/solana/quantedge` repo, `nginx/active.conf`): `https://s1wave-solana.duckdns.org/` = control panel (`/panel/`), accounts at `/base/`, `/second/`, `/efetobo/`. Credentials are per account; look them up in the control panel's account Settings page, never in files.
+- Run an account's scripts against its DB with `S1WAVE_ENV_FILE=.env.second PYTHONPATH=. .venv/bin/python ...`.
+- nginx changes: validate with an isolated `docker run --rm --add-host=host.docker.internal:host-gateway ... nginx -t` (see NOTEBOOK.md), apply with `docker compose up -d --force-recreate nginx` in `/home/solana/quantedge` (never reload). New accounts get their nginx route automatically via the control panel.
+- Backups: `scripts/backup.sh` runs daily 04:00 (cron). Certificates renew via cron. Disk was 76% full on 2026-10-01 — check `df -h /` and old backups/logs occasionally.
+
+### What the user does by hand (all in the web UI, no code needed)
+- **Tune**: control panel -> account -> Settings (exposure %, max position USD, max concurrent, daily loss limit, circuit-breaker count/pause, Live on/off). Lower exposure in bad regimes; raise it only as capital and results justify. The Playbook page explains each knob.
+- **Keys**: SolanaTracker discovery + sampling keys are edited in the same Settings page. They are free-tier and **lifetime-capped**; they WILL run out. Telegram alerts `sampling_key_exhausted` / `discovery_key_exhausted` fire when they do (and `..._recovered`). With no working key the bot sees no tokens and sits idle (safe, not a loss). Fix = paste a genuinely fresh key from a new SolanaTracker account.
+- **Create accounts**: control panel -> New account (fully automated: DB, env, systemd unit, nginx route, distinct creds). New accounts start unarmed.
+
+### Runbook: "when X happens, do Y"
+- **No trades for hours** -> check `/<account>/confluence/status` (or the dashboard) and Telegram for key-exhaustion alerts; most likely a dead SolanaTracker key. Also check circuit-breaker pause (Telegram `circuit_breaker_tripped`; it auto-resumes after `CB_PAUSE_MINUTES`) and `permanently_halted`.
+- **`permanently_halted: true`** -> the drawdown cap (`CONFLUENCE_LIVE_MAX_LOSS_PCT`, 30%) was hit against the baseline. Correct behavior, not a bug. Resume only deliberately via the dashboard's RESUME HALTED button after the user has decided to continue (it resets baselines).
+- **Losing streak** -> read the section below on the liquidity guard first, then run `PYTHONPATH=. python analysis/liquidity_guard_false_positives.py`. Reduce exposure in Settings before debugging.
+- **Service down/flapping** -> `systemctl --user status s1wave-bot` and `journalctl --user -u s1wave-bot -n 100`; fix cause, then restart (rule 3).
+- **Disk filling** -> prune old logs/backups; a full disk kills Postgres.
+- **Bad deploy** -> `git revert <commit>`, run tests, restart. The last live-logic change is `c722f55` (liquidity guard fix); reverting it restores the old guard.
+
+### Current state and open items (as of 2026-10-01 — verify, don't trust)
+- **Liquidity guard fix `c722f55` is live since 2026-10-01 06:11Z and UNPROVEN.** Judge it only after ~30 closed live trades since then: run `analysis/liquidity_guard_false_positives.py` (section "Prospective"). Success = live stops exiting almost everything via `LIQUIDITY_GUARD`. Shadow (no fees/slippage) stays optimistic, so don't expect live to match its 96%.
+- **Base sampling key was dead**; `second` and `efetobo` have NO discovery keys, so their alerts keep firing and they can't find tokens until keys are added.
+- `second` shows a misleading "permanently halted / real loss" message (inherited placeholder deposit baseline); `second` has 0 closed trades. Fix by re-baselining before it is ever funded.
+- Circuit-breaker state is only visible via Telegram, not the UI. No account-deletion feature. `MarketEvent` / `TradeMonitorWorker` / `TradeRiskWorker`, the `/balance` endpoint and `daily_loss_state` table look legacy/dead.
+- The old leaked dashboard password is still in public git history (already rotated, so harmless; scrubbing history needs the user's go-ahead).
+- Telegram push goes to the user's configured chat; events in `engine/notify.py::TELEGRAM_PUSH_EVENTS`.
+
+## Standing orders from 2026-09-24 (partly historical — the Sept 28 deadline has passed; the HANDOFF section above supersedes where they conflict)
 
 1. **S1Wave is the priority.** Claude usage resets Monday (2026-09-28) — until then, spend effort here before contentpipe or anything else.
 2. **Goal: make the account profitable and stable by Sept 28.** Not "keep it running" — actually improve the real numbers. Use the live dataset (shadow + live trades) to keep finding and shipping data-backed entry/exit improvements, the same way the wash-trading and liquidity-ceiling filters got built (see "How past improvements got made" below) — that pattern is the playbook, keep running it.
@@ -260,9 +300,9 @@ This file already used CSS custom properties consistently (`:root { --bg; --surf
 
 Typography: `'Space Mono'` (21 occurrences — buttons, labels, the log, inputs, badges) → `'JetBrains Mono'`; `'Syne'` (body font) → `'Inter'`. Google Fonts `<link>` updated to match. Verified the swap was complete by grepping the whole file for every old hex literal and both old font family names afterward — zero remaining — then confirmed live via `curl` against the real dashboard (no restart needed; `FileResponse` re-reads this file from disk on every request, same as every other static-file change this session). The notification feed this dashboard already had (`.notif-row.info/.warning/.critical`) needed no new code, just picked up the new palette automatically.
 
-## ⚠ OPEN, UNFIXED: the liquidity guard is force-liquidating healthy positions (2026-10-01)
+## Liquidity guard was force-liquidating healthy positions (2026-10-01) — FIXED same day, see the end of this file
 
-**This is currently the single biggest reason live trading loses money, and it is deliberately NOT fixed yet** — the user explicitly said "don't change live trading yet... I don't want us to get bad reaction when the market is actually good." Read `analysis/liquidity_guard_false_positives.py` (read-only, reproduces everything below) before touching anything here.
+**This was the biggest reason live trading lost money. It was analysed first without changing anything (the user said "don't change live trading yet... I don't want us to get bad reaction when the market is actually good"), then fixed on the user's go-ahead (see the FIXED note at the end). Read `analysis/liquidity_guard_false_positives.py` (read-only, reproduces everything below) before touching anything here.
 
 **What's wrong.** `_check_liquidity_guard()` exits on `price_impact_pct >= 0.35` OR `real_pnl_pct <= -0.30`. Jupiter's `priceImpactPct` comes back as the literal string **`"1"`** for pump.fun-style thin pools — **564 of 575 guard firings saw exactly `"1"`** — so the first condition is permanently satisfied and the guard closes essentially every live position within seconds of entry.
 
