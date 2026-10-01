@@ -2,6 +2,8 @@
 
 **If you are an AI model reading this cold: read this whole file before touching anything. This trades real money.**
 
+**Calibration work (what we measure, data catalog, standard analysis, open questions): read `CALIBRATION.md`, then run `analysis/calibration_report.py`.**
+
 ## HANDOFF (2026-10-01) — the original Claude subscription has ended; the user now operates alone with a free Claude session
 
 **Read this section first, then the rest. You are likely a smaller-budget session: be economical, check things on demand, never start background monitors.**
