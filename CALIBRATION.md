@@ -111,3 +111,9 @@ All are read-only. Outputs go to `analysis/output/` (large CSVs and Markdown sna
 - Prefer recording raw inputs over derived verdicts (the `inputs_json` pattern) so a later analysis can recompute rules.
 - Record skipped candidates as rows with a short status; they are the counterfactual that tells you whether a filter helps.
 - Never gate behavior on a new field until it has a prospective track record.
+
+## 9. Exporting the dataset (dashboard "Data export" card)
+
+- `GET /export/index` lists exportable tables with row counts. `GET /export/<table>.csv.gz` streams one table as gzip CSV (tokens, snapshots, evaluations, signals, shadow_positions, shadow_observations, shadow_exec_checks, live_trades, live_observations). Code: `api/export.py`.
+- `GET /export/handoff.zip` is the **AI handoff pack**: MANIFEST.md, a freshly generated calibration report, schema.json, 300-row samples of each table, CLAUDE.md, CALIBRATION.md, README.md, and the key code (`code/`, plus `code/analysis/`). It holds no env files, keys or notebook. Give it to a new AI first; pair it with the full `.csv.gz` files when it needs the raw data.
+- All routes sit behind the dashboard Basic Auth. Each account's dashboard exports its own DB.

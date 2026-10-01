@@ -343,3 +343,6 @@ Switch off: `SHADOW_EXEC_ENABLED=false` + restart. Migrations phase18 + phase19 
 
 ### Live performance panel
 `GET /confluence/live/performance` (auth required) + dashboard card "Live performance (real money)": cumulative real P&L curve, win rate, mean/median, avg win/loss, max drawdown. Uses `real_pnl_usd` (on-chain verified, since 2026-09-28) and falls back to intended `pnl_usd` for older trades (faded dots; those understated spend, so trust the "verified only" line).
+
+## Dataset export / AI handoff pack
+`api/export.py` (router included in `api/app.py`): `/export/index`, `/export/<table>.csv.gz`, `/export/handoff.zip`; dashboard card "Data export". The zip bundles the calibration report, schema, samples, docs and key code, never secrets. See CALIBRATION.md section 9.

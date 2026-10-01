@@ -325,6 +325,11 @@
     </div>
   </div>
 
+  <!-- Row 2z: Data export -->
+  <div class="row r1">
+    <div class="card" id="dataexport"><div class="ld"><div class="sp"></div>Loading</div></div>
+  </div>
+
   <!-- Row 3a: Live (real-money) performance -->
   <div class="row r1">
     <div class="card" id="liveperf"><div class="ld"><div class="sp"></div>Loading</div></div>
@@ -508,6 +513,24 @@ function loadGates(status) {
         : '✓ All clear — new entries permitted (subject to CONFLUENCE_LIVE_ENABLED).'}
     </div>
     ${!permHalt ? `<div class="baseline-note">Drawdown baseline set ${status.halt_override_acknowledged_at ? absoluteTime(status.halt_override_acknowledged_at) : 'at the original deposit'} — after a top-up or withdrawal, <a href="#" onclick="recalibrateBaseline(event)">recalibrate to the current balance</a>.</div>` : ''}
+  `;
+}
+
+let exportLoaded = false;
+async function loadExportOnce() { if (exportLoaded) return; exportLoaded = true; try { await loadExport(); } catch (e) { exportLoaded = false; throw e; } }
+
+async function loadExport() {
+  const el = document.getElementById('dataexport');
+  const { tables } = await get('/export/index');
+  const rows = tables.map(t => `
+    <div class="sr"><span class="sl">${t.name} <span style="color:var(--muted)">— ${t.description}</span></span>
+    <span class="sv">${t.rows.toLocaleString()} rows · <a href="/export/${t.name}.csv.gz" download>download .csv.gz</a></span></div>`).join('');
+  el.innerHTML = `
+    <div class="ctitle"><div class="dot"></div>Data export</div>
+    <div class="sr"><span class="sl"><b>AI handoff pack</b> <span style="color:var(--muted)">— docs, fresh calibration report, schema, data samples and code in one small zip. Give it to a new AI session to continue calibration.</span></span>
+    <span class="sv"><a class="btn" href="/export/handoff.zip" download style="text-decoration:none">⬇ handoff.zip</a></span></div>
+    <details style="margin-top:10px"><summary style="cursor:pointer;color:var(--muted)">Full datasets (gzip CSV, streamed — large tables take a while)</summary>${rows}</details>
+    <div class="note">Contains no keys, wallet secrets or env files. Open .csv.gz with any spreadsheet tool or <code>pandas.read_csv</code>.</div>
   `;
 }
 
@@ -1094,7 +1117,7 @@ async function loadAll() {
     const { status, shadow } = await loadStatusCards();
     loadPerf(shadow);
     loadGates(status);
-    await Promise.all([loadLivePerf(), loadCurve(), loadLiveTrades(), loadShadowTrades(), loadNotifications()]);
+    await Promise.all([loadExportOnce().catch(console.error), loadLivePerf(), loadCurve(), loadLiveTrades(), loadShadowTrades(), loadNotifications()]);
   } catch (e) {
     console.error(e);
   }

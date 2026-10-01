@@ -505,6 +505,9 @@ def create_app() -> FastAPI:
                 )
             return await call_next(request)
 
+    from api.export import router as export_router
+    app.include_router(export_router)
+
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
     @app.get("/", include_in_schema=False)

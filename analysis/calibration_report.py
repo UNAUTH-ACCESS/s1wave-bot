@@ -75,7 +75,8 @@ def live_pct(t) -> float | None:
     return float(pnl / t.position_usd) if pnl is not None and t.position_usd else None
 
 
-async def main() -> None:
+async def build_report() -> str:
+    out.clear()
     now = datetime.now(timezone.utc)
     async with get_session() as s:
         live = (await s.execute(select(ConfluenceLiveTrade).where(ConfluenceLiveTrade.status == "closed"))).scalars().all()
@@ -178,11 +179,15 @@ async def main() -> None:
             p(row(lab, stats(buckets[lab])))
         p()
 
-    text = "\n".join(out)
+    return "\n".join(out)
+
+
+async def main() -> None:
+    text = await build_report()
     print(text)
     d = Path(__file__).parent / "output"
     d.mkdir(exist_ok=True)
-    (d / f"calibration_{now:%Y%m%dT%H%M%SZ}.md").write_text(text)
+    (d / f"calibration_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.md").write_text(text)
 
 
 if __name__ == "__main__":
