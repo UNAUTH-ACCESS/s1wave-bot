@@ -327,3 +327,6 @@ The `priceImpactPct == "1"` sentinel alone no longer liquidates. Every check log
 `confluence_live.executable_liquidity_check` (out_sol, impact, real_pnl_pct). Prospective comparison:
 `PYTHONPATH=. python analysis/liquidity_guard_false_positives.py` (section "Prospective"); judge at n>=30 live.
 Rollback = revert this commit. Shadow stays optimistic (no fees/slippage).
+
+### 2026-10-01: discovery poll interval 60s -> 300s
+`_POLL_INTERVAL` in `workers/discovery_worker.py`. Free SolanaTracker keys are lifetime-capped; 1/min burned ~1,440 calls/day. 5 min = ~288/day (5x longer key life); the 30-min look-back window still overlaps. Cost: up to 5 min later token discovery. Revert to 60 if a paid plan is bought. Key-exhaustion alerts now take ~25 min to trip (5 consecutive bad polls).
