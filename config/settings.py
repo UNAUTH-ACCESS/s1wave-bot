@@ -256,6 +256,8 @@ class Settings(BaseSettings):
     SHADOW_EXEC_DEX_FEE_PCT: float = 0.005          # modeled pool fee per side
     SHADOW_EXEC_FEE_LAMPORTS_PER_SIDE: int = 13_000  # live's measured avg network fee per side
 
+    # Sample older / already-signaled tokens less often (workers/sampling_worker.sample_interval_s)
+    SAMPLE_TIERING_ENABLED: bool = True
     SAMPLE_INTERVAL_SECONDS: Annotated[int, Field(ge=10, le=300)] = 30
 
     # How long a Tier1-rejected or Scorer-discarded token stays in OBSERVING

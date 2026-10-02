@@ -58,7 +58,7 @@ from config.logging import get_logger
 from config.settings import settings
 from database.engine import get_session
 from engine.notify import notify as notify_shared
-from models.orm import Token, TokenStatus, ShadowTrade
+from models.orm import MomentumSignalEvent, Token, TokenStatus, ShadowTrade
 from workers import shared_snapshot
 from workers.http_queue import get_http_queue
 from workers.key_health import ExhaustionWatcher
@@ -71,6 +71,26 @@ _HTTP_TIMEOUT = httpx.Timeout(timeout=15.0, connect=5.0)
 # Confirmed live: POST /tokens/multi rejects anything over this with
 # {"error":"Maximum 20 tokens per request"} — a hard API limit, not tunable.
 _MAX_TOKENS_PER_REQUEST = 20
+
+
+def sample_interval_s(age_min: float, signaled: bool, observing: bool) -> int:
+    """Minimum seconds between API fetches of one token (0 = every cycle).
+
+    Why: 97% of entry signals fire within 15 min of a token starting to be
+    watched and 99.9% within 30 min (2026-09-24..10-02, n=3,800), and a token
+    can signal only once (unique token_id+experiment). Sampling a 6-hour-old
+    or already-signaled token every cycle spent most of a lifetime-capped
+    free key on tokens that almost never produce a trade.
+    """
+    if not settings.SAMPLE_TIERING_ENABLED or observing:
+        return 0
+    if signaled:
+        return 600
+    if age_min < 30:
+        return 0
+    if age_min < 120:
+        return 300
+    return 900
 
 
 def _best_pool(token_data: dict) -> dict | None:
@@ -93,6 +113,7 @@ class SamplingWorker:
         # a shared dict is needed once two pollers can both cover the same
         # mint.
         self._key_watcher = ExhaustionWatcher()
+        self._last_fetched: dict[str, datetime] = {}
 
     async def run(self) -> None:
         log.info("sampling_worker.started", interval=self._interval)
@@ -131,7 +152,23 @@ class SamplingWorker:
         # point spending a second API call 30s after discovery already
         # covered it for free. See workers/shared_snapshot.py.
         covered_mints = {m for m in mints if shared_snapshot.is_fresh(m, now)}
-        to_fetch = [m for m in mints if m not in covered_mints]
+
+        signaled_ids = await self._load_signaled_token_ids()
+        deferred: set[str] = set()
+        for t in watching:
+            if t.mint_address in covered_mints:
+                continue
+            anchor = t.watch_started_at or t.discovered_at
+            age_min = (now - anchor).total_seconds() / 60 if anchor else 0.0
+            gap = sample_interval_s(age_min, t.id in signaled_ids, t.status == TokenStatus.OBSERVING)
+            last = self._last_fetched.get(t.mint_address)
+            if gap and last is not None and (now - last).total_seconds() < gap:
+                deferred.add(t.mint_address)
+        to_fetch = [m for m in mints if m not in covered_mints and m not in deferred]
+        for m in to_fetch:
+            self._last_fetched[m] = now
+        for m in [m for m in self._last_fetched if m not in set(mints)]:
+            del self._last_fetched[m]
 
         # SolanaTracker's /tokens/multi hard-caps at 20 tokens per request
         # ("Maximum 20 tokens per request") — confirmed live after this
@@ -209,6 +246,9 @@ class SamplingWorker:
                 covered += 1
                 continue
 
+            if token.mint_address in deferred:
+                continue
+
             if token.mint_address in fetch_failed_mints:
                 # This token's own chunk request errored — distinct from a
                 # successful chunk that simply didn't list this mint
@@ -262,6 +302,8 @@ class SamplingWorker:
             watched=len(watching),
             sampled=sampled,
             covered_by_discovery=covered,
+            deferred=len(deferred),
+            requests=-(-len(to_fetch) // _MAX_TOKENS_PER_REQUEST),
             errors=errors,
             elapsed_ms=elapsed_ms,
         )
@@ -377,6 +419,11 @@ class SamplingWorker:
                 )
             )
             return list(result.scalars().all())
+
+    async def _load_signaled_token_ids(self) -> set:
+        async with get_session() as session:
+            rows = await session.execute(select(MomentumSignalEvent.token_id).distinct())
+            return {r[0] for r in rows}
 
     async def _age_out(self, mint: str, reason: str) -> None:
         async with get_session() as session:
