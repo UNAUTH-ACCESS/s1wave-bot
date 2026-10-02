@@ -74,7 +74,7 @@ log = get_logger(__name__)
 _ST_BASE        = "https://data.solanatracker.io"
 _GRADUATED_PATH = "/tokens/multi/graduated"
 _WINDOW_MS      = 30 * 60 * 1000   # 30 minutes look-back
-_POLL_INTERVAL  = 300               # seconds; 5 min stretches lifetime-capped free keys 5x (30-min window still overlaps)
+_POLL_INTERVAL  = 120               # seconds; was 60, then 300 (2026-10-01) to save the lifetime-capped free key; 120 = compromise, see CLAUDE.md
 _HTTP_TIMEOUT   = httpx.Timeout(timeout=15.0, connect=5.0)
 
 
